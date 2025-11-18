@@ -1,23 +1,23 @@
 // src/services/movements.service.ts
-import { Prisma, PrismaClient, MovementType } from '@prisma/client';
+import { Prisma, PrismaClient, MovementType } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
 /** Chuẩn hoá số lượng về Decimal (nhận string/number). */
 function toDecimal(n: string | number): Prisma.Decimal {
-  if (typeof n === 'number') return new Prisma.Decimal(n);
-  return new Prisma.Decimal((n ?? '0').toString().trim());
+  if (typeof n === "number") return new Prisma.Decimal(n);
+  return new Prisma.Decimal((n ?? "0").toString().trim());
 }
 
 /** ------------------------------------------------------------------
  * LIST movements (có include lines + item + fromLoc/toLoc để xem nhanh)
  * ------------------------------------------------------------------ */
-export async function listMovements(q = '', page = 1, pageSize = 20) {
+export async function listMovements(q = "", page = 1, pageSize = 20) {
   const where: Prisma.MovementWhereInput = q
     ? {
         OR: [
-          { refNo: { contains: q, mode: 'insensitive' } },
-          { note: { contains: q, mode: 'insensitive' } },
+          { refNo: { contains: q, mode: "insensitive" } },
+          { note: { contains: q, mode: "insensitive" } },
         ],
       }
     : {};
@@ -25,14 +25,13 @@ export async function listMovements(q = '', page = 1, pageSize = 20) {
   const [rows, total] = await Promise.all([
     prisma.movement.findMany({
       where,
-      orderBy: { createdAt: 'desc' },
+      orderBy: { createdAt: "desc" },
       skip: (page - 1) * pageSize,
       take: pageSize,
       include: {
         lines: {
           include: {
             item: true,
-            // ⬇️ Nếu schema dùng fromLocation/toLocation thì đổi 2 dòng dưới
             fromLoc: true,
             toLoc: true,
           },
@@ -47,7 +46,6 @@ export async function listMovements(q = '', page = 1, pageSize = 20) {
 
 /** ------------------------------------------------------------------
  * GET BY ID — chọn includeLines/includeInvoice bằng spread-conditional
- * (không dùng false để tránh lỗi kiểu)
  * ------------------------------------------------------------------ */
 export async function getMovementById(
   id: string,
@@ -60,7 +58,6 @@ export async function getMovementById(
         lines: {
           include: {
             item: true,
-            // ⬇️ Nếu schema dùng fromLocation/toLocation thì đổi 2 dòng dưới
             fromLoc: true,
             toLoc: true,
           },
@@ -88,7 +85,7 @@ export async function createDraft(
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const refNo =
-      attempt === 0 ? baseRef : `${baseRef}-${String(attempt).padStart(2, '0')}`;
+      attempt === 0 ? baseRef : `${baseRef}-${String(attempt).padStart(2, "0")}`;
 
     try {
       return await prisma.movement.create({
@@ -102,11 +99,11 @@ export async function createDraft(
     } catch (e: any) {
       if (
         e instanceof Prisma.PrismaClientKnownRequestError &&
-        e.code === 'P2002' &&
+        e.code === "P2002" &&
         Array.isArray(e.meta?.target) &&
-        e.meta.target.includes('refNo')
+        e.meta.target.includes("refNo")
       ) {
-        attempt += 1; // refNo trùng -> thử hậu tố mới
+        attempt += 1;
         continue;
       }
       throw e;
@@ -158,16 +155,16 @@ export async function updateLine(
     data.item = { connect: { id: patch.itemId } };
   }
 
-  // fromLocation
+  // fromLoc (theo schema mới)
   if (patch.fromLocationId !== undefined) {
-    data.fromLocation = patch.fromLocationId
+    data.fromLoc = patch.fromLocationId
       ? { connect: { id: patch.fromLocationId } }
       : { disconnect: true };
   }
 
-  // toLocation
+  // toLoc (theo schema mới)
   if (patch.toLocationId !== undefined) {
-    data.toLocation = patch.toLocationId
+    data.toLoc = patch.toLocationId
       ? { connect: { id: patch.toLocationId } }
       : { disconnect: true };
   }
@@ -189,8 +186,7 @@ export async function deleteLine(lineId: string) {
 }
 
 /** ------------------------------------------------------------------
- * Đăng (post) movement: tuỳ hệ thống có thể sinh bút toán tồn kho.
- * Ở đây đánh dấu posted=true; nếu bạn đã có logic ghi tồn, gọi tại đây.
+ * Đăng (post) movement.
  * ------------------------------------------------------------------ */
 export async function postMovement(movementId: string) {
   return prisma.movement.update({
@@ -200,7 +196,6 @@ export async function postMovement(movementId: string) {
       lines: {
         include: {
           item: true,
-          // ⬇️ Nếu schema dùng fromLocation/toLocation thì đổi 2 dòng dưới
           fromLoc: true,
           toLoc: true,
         },

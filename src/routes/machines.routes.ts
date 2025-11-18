@@ -1,9 +1,13 @@
+// src/routes/machines.routes.ts
 import { Router } from "express";
-import { PrismaClient, ItemKind } from "@prisma/client";
+import { PrismaClient, ItemKind, Prisma } from "@prisma/client";
 import { requireAuth } from "../middlewares/auth";
 
 const prisma = new PrismaClient();
 const r = Router();
+
+// hằng cho QueryMode để TS không chửi
+const MODE_INSENSITIVE: Prisma.QueryMode = "insensitive";
 
 // Bắt buộc đăng nhập cho toàn bộ route machines
 r.use(requireAuth);
@@ -68,15 +72,17 @@ r.post("/sync-from-items", async (_req, res, next) => {
 // ----------------------------------------------------
 r.get("/", async (req, res, next) => {
   try {
-    const q = String(req.query.q || "").trim();
+    const rawQ = String(req.query.q || "").trim();
+    const keyword = rawQ || undefined;
+
     const pageSize = Number(req.query.pageSize) || 50;
     const page = Number(req.query.page) || 1;
 
-    const where = q
+    const where: Prisma.MachineWhereInput = keyword
       ? {
           OR: [
-            { code: { contains: q, mode: "insensitive" } },
-            { name: { contains: q, mode: "insensitive" } },
+            { code: { contains: keyword, mode: MODE_INSENSITIVE } },
+            { name: { contains: keyword, mode: MODE_INSENSITIVE } },
           ],
         }
       : {};
