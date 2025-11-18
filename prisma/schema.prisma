@@ -1,0 +1,386 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============== Enums ==============
+enum UserRole {
+  staff
+  accountant
+  admin
+}
+
+enum MovementType {
+  IN
+  OUT
+  TRANSFER
+  ADJUST
+}
+
+enum InvoiceType {
+  PURCHASE
+  SALES
+}
+
+// ✅ NEW: Phân loại hàng hóa
+enum ItemKind {
+  PART      // linh kiện
+  MACHINE   // máy móc bán hàng
+}
+
+// ============== Auth / Users ==============
+model User {
+  id        String   @id @default(cuid())
+  username  String   @unique
+  password  String
+  role      UserRole @default(staff)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions           Session[]
+  auditLogs          AuditLog[]
+  deviceTok          DeviceToken[]
+  salesInvoices      Invoice[]     @relation("InvoiceSaleUser")
+  technicianInvoices Invoice[]     @relation("InvoiceTechUser")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
+
+// ============== Master data ==============
+model Location {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  name      String
+  kind      String   @default("warehouse")
+  parentId  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  parent   Location?  @relation("LocationToChildren", fields: [parentId], references: [id])
+  children Location[] @relation("LocationToChildren")
+
+  stocks           Stock[]
+  assetAssignments AssetAssignment[]
+  fromLines        MovementLine[]    @relation("FromLocation")
+  toLines          MovementLine[]    @relation("ToLocation")
+  stockCounts      StockCount[]
+
+  // ✅ NEW: nếu dùng serial và muốn biết serial đang nằm ở kho nào
+  itemSerials ItemSerial[]
+}
+
+model Item {
+  id        String   @id @default(cuid())
+  sku       String   @unique
+  name      String
+  unit      String   @default("pcs")
+  price     Decimal  @db.Decimal(18, 2)
+  sellPrice Decimal  @default(0) @db.Decimal(18, 2)
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ✅ NEW: phân loại & cờ quản lý serial
+  kind         ItemKind @default(PART)
+  isSerialized Boolean  @default(false)
+
+  stocks       Stock[]
+  moveLines    MovementLine[]
+  countLines   StockCountLine[]
+  invoiceLines InvoiceLine[]    @relation("ItemToInvoiceLines")
+
+  // ✅ NEW: danh sách serial nếu là máy móc
+  serials      ItemSerial[]
+  machineParts MachinePart[] @relation("ItemMachineParts")
+
+  @@index([kind])
+  @@index([isSerialized])
+}
+
+model Stock {
+  itemId     String
+  locationId String
+  qty        Decimal  @db.Decimal(18, 3)
+  updatedAt  DateTime @updatedAt
+
+  item     Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@id([itemId, locationId])
+  @@index([locationId])
+  @@index([itemId])
+}
+
+// ✅ NEW: Serial cho máy móc (tuỳ chọn dùng)
+model ItemSerial {
+  id         String   @id @default(cuid())
+  itemId     String
+  serialNo   String   @unique
+  status     String   @default("in_stock") // in_stock | reserved | sold | rma | ...
+  locationId String?                      // serial đang nằm ở kho nào (nếu muốn theo dõi)
+  note       String?
+  createdAt  DateTime @default(now())
+
+  item     Item      @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+
+  @@index([itemId])
+  @@index([locationId])
+  @@index([status])
+}
+
+//============== Assets (optional) ==============
+model Asset {
+  id        String   @id @default(cuid())
+  assetCode String   @unique
+  sku       String?
+  name      String
+  model     String?
+  serialNo  String?  @unique
+  status    String   @default("active")
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  assignments AssetAssignment[]
+}
+
+model AssetAssignment {
+  id         String   @id @default(cuid())
+  assetCode  String
+  locationId String
+  assignedAt DateTime @default(now())
+  note       String?
+
+  asset    Asset    @relation(fields: [assetCode], references: [assetCode], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([assetCode])
+  @@index([locationId])
+}
+
+// ============== Movements (phiếu) ==============
+model Movement {
+  id        String       @id @default(cuid())
+  type      MovementType
+  refNo     String?      @unique
+  note      String?
+  posted    Boolean      @default(false)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  // Link hóa đơn (tùy chọn)
+  invoiceId String?
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id])
+
+  lines MovementLine[]
+
+  @@index([type, createdAt])
+  @@index([invoiceId])
+}
+
+model MovementLine {
+  id             String  @id @default(cuid())
+  movementId     String
+  itemId         String
+  fromLocationId String?
+  toLocationId   String?
+  qty            Decimal @db.Decimal(18, 3)
+  note           String?
+
+  movement Movement @relation(fields: [movementId], references: [id])
+  item     Item     @relation(fields: [itemId], references: [id])
+
+  // MUST BE OPTIONAL because fromLocationId/toLocationId are optional
+  fromLoc Location? @relation("FromLocation", fields: [fromLocationId], references: [id])
+  toLoc   Location? @relation("ToLocation", fields: [toLocationId], references: [id])
+
+  @@index([movementId])
+  @@index([itemId])
+  @@index([fromLocationId])
+  @@index([toLocationId])
+}
+
+// ============== Stock Count (kiểm kê) ==============
+model StockCount {
+  id         String   @id @default(cuid())
+  locationId String
+  refNo      String   @unique
+  note       String?
+  status     String   @default("draft") // draft | posted
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  location Location         @relation(fields: [locationId], references: [id])
+  lines    StockCountLine[]
+}
+
+model StockCountLine {
+  id           String  @id @default(cuid())
+  stockCountId String
+  itemId       String
+  countedQty   Decimal @db.Decimal(18, 3)
+
+  stockCount StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+  item       Item       @relation(fields: [itemId], references: [id])
+
+  @@index([stockCountId])
+  @@index([itemId])
+}
+
+//============== Partner (NEW) ==============
+model Partner {
+  id        String   @id @default(cuid())
+  code      String?  @unique
+  name      String
+  taxCode   String?  @db.VarChar(20)
+  phone     String?  @db.VarChar(20)
+  email     String?
+  address   String?
+  type      String   @default("customer") // customer | supplier | both
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices Invoice[]
+}
+
+//============== Invoices (hóa đơn) ==============
+model Invoice {
+  id        String      @id @default(cuid())
+  code      String      @unique
+  type      InvoiceType
+  issueDate DateTime
+
+  // Liên kết đối tác (tùy chọn)
+  partnerId String?
+  partner   Partner? @relation(fields: [partnerId], references: [id])
+
+  // === Người phụ trách theo hóa đơn (không liên quan role) ===
+  saleUserId String?
+  saleUser   User?   @relation("InvoiceSaleUser", fields: [saleUserId], references: [id])
+
+  techUserId String?
+  techUser   User?   @relation("InvoiceTechUser", fields: [techUserId], references: [id])
+
+  // (tuỳ chọn) snapshot tên để report nhanh
+  saleUserName String?
+  techUserName String?
+  // Snapshot đóng băng tại thời điểm xuất hóa đơn
+  partnerName  String?
+  partnerTax   String?
+  partnerPhone String?
+  partnerAddr  String?
+
+  currency   String  @default("VND")
+  subtotal   Decimal @default(0) @db.Decimal(18, 2)
+  tax        Decimal @default(0) @db.Decimal(18, 2)
+  total      Decimal @default(0) @db.Decimal(18, 2)
+  note       String?
+  attachment String?
+
+  movements Movement[]
+  lines     InvoiceLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([partnerId, issueDate])
+  @@index([saleUserId])
+  @@index([techUserId])
+}
+
+model InvoiceLine {
+  id        String  @id @default(cuid())
+  invoiceId String
+  itemId    String
+  qty       Decimal @db.Decimal(18, 3)
+  price     Decimal @db.Decimal(18, 2)
+  amount    Decimal @db.Decimal(18, 2)
+  itemName  String?
+  itemSku   String?
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+  item    Item    @relation("ItemToInvoiceLines", fields: [itemId], references: [id])
+
+  @@index([invoiceId])
+  @@index([itemId])
+}
+
+//============== Logs & Device tokens ==============
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  entity    String
+  entityId  String?
+  meta      Json?
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([entity, createdAt])
+  @@index([userId])
+}
+
+model DeviceToken {
+  id        String   @id @default(cuid())
+  userId    String?
+  platform  String
+  token     String   @unique
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([platform])
+}
+
+
+model Machine {
+  id        String        @id @default(cuid())
+  code      String        @unique           // mã dòng máy, vd: "NJP-200I"
+  name      String                           // tên hiển thị
+  note      String?
+
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  parts     MachinePart[]
+}
+
+model MachinePart {
+  id        String   @id @default(cuid())
+
+  machineId String
+  itemId    String
+
+  qtyPerSet Int?
+  note      String?
+
+  machine   Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  // ĐỔI THÀNH DÒNG NÀY
+  item      Item    @relation("ItemMachineParts", fields: [itemId], references: [id], onDelete: Restrict)
+
+  @@index([machineId])
+  @@index([itemId])
+  @@unique([machineId, itemId])
+}
+
+model PeriodLock {
+  id          String   @id @default(cuid())
+  closedUntil DateTime
+  note        String?
+  createdAt   DateTime @default(now())
+}
