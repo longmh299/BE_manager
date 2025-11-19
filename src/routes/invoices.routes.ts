@@ -84,7 +84,13 @@ r.post(
     try {
       const data = await createInvoice(req.body);
       res.json({ ok: true, data });
-    } catch (e) {
+    } catch (e: any) {
+      // lỗi business (đã được service gắn statusCode) -> trả JSON luôn, không đẩy lên error middleware
+      if (e && (e as any).statusCode) {
+        return res
+          .status((e as any).statusCode)
+          .json({ ok: false, message: e.message });
+      }
       next(e);
     }
   }
@@ -101,7 +107,12 @@ r.put(
     try {
       const data = await updateInvoice(req.params.id, req.body);
       res.json({ ok: true, data });
-    } catch (e) {
+    } catch (e: any) {
+      if (e && (e as any).statusCode) {
+        return res
+          .status((e as any).statusCode)
+          .json({ ok: false, message: e.message });
+      }
       next(e);
     }
   }

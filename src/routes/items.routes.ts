@@ -19,12 +19,38 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 r.use(requireAuth);
 
-/** GET /items?q=&page=&pageSize= */
+/**
+ * GET /items?q=&page=&pageSize=
+ * => trả về:
+ * {
+ *   ok: true,
+ *   items: Item[],   // dùng cho autocomplete, item tổng...
+ *   data: Item[],    // alias, để các chỗ cũ dùng res.data.data vẫn chạy
+ *   total,
+ *   page,
+ *   pageSize
+ * }
+ *
+ * listItems ở service KHÔNG filter theo kind,
+ * nên kết quả đã bao gồm cả máy lẫn linh kiện.
+ */
 r.get("/", async (req, res, next) => {
   try {
     const { q, page = "1", pageSize = "20" } = req.query as any;
-    const data = await listItems(q, Number(page), Number(pageSize));
-    res.json({ ok: true, ...data });
+
+    const pageNum = Number(page) || 1;
+    const pageSizeNum = Number(pageSize) || 20;
+
+    const { data, total } = await listItems(q, pageNum, pageSizeNum);
+
+    res.json({
+      ok: true,
+      items: data,       // 👈 FE autocomplete / item tổng dùng cái này
+      data,              // 👈 alias cho các màn cũ (nếu có) đang dùng res.data.data
+      total,
+      page: pageNum,
+      pageSize: pageSizeNum,
+    });
   } catch (e) {
     next(e);
   }
@@ -60,7 +86,8 @@ r.delete("/:id", requireRole("admin"), async (req, res, next) => {
   }
 });
 
-/** IMPORT items (xlsx/csv) (accountant|admin)
+/**
+ * IMPORT items (xlsx/csv) (accountant|admin)
  * Cột hỗ trợ: sku|skud|mahang|code, name, unit?, price?, sellPrice?, note?, kind?
  */
 r.post(
@@ -69,7 +96,6 @@ r.post(
   upload.single("file"),
   async (req, res, next) => {
     try {
-      // TS không biết req.file, cast sang any cho gọn
       const file = (req as any).file as { buffer: Buffer } | undefined;
       if (!file) throw new Error('Missing file field "file"');
 
@@ -90,6 +116,7 @@ r.get(
       const items = await prisma.item.findMany({
         orderBy: { createdAt: "desc" },
       });
+
       const data = items.map((i) => ({
         sku: i.sku,
         name: i.name,
@@ -97,13 +124,15 @@ r.get(
         price: i.price.toString(),
         sellPrice: (i.sellPrice as any)?.toString?.() ?? "0",
         note: i.note ?? "",
-        // nếu bạn đã thêm cột kind trong prisma, có thể map thêm:
+        // nếu đã thêm cột kind trong Prisma thì có thể ghi thêm:
         // kind: (i as any).kind ?? '',
       }));
+
       const ws = XLSX.utils.json_to_sheet(data);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Items");
       const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+
       res.setHeader(
         "Content-Disposition",
         'attachment; filename="items.xlsx"'
