@@ -1,3 +1,4 @@
+// src/services/invoices.service.ts
 import { PrismaClient, InvoiceType, MovementType, Prisma } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -53,15 +54,66 @@ function toNum(
   return Number(d.toString());
 }
 
+/**
+ * Tính số tiền thuế dựa trên body:
+ * - Ưu tiên taxPercent (thuế %): tax = round(subtotal * taxPercent / 100)
+ * - Nếu không có taxPercent, mà có tax (số tiền tuyệt đối) thì dùng tax
+ * - Nếu cả 2 đều trống → tax = 0
+ */
+function calcTaxFromBody(subtotal: number, body: any): number {
+  if (body) {
+    const rawPercent =
+      body.taxPercent !== undefined && body.taxPercent !== null
+        ? body.taxPercent
+        : undefined;
+
+    if (rawPercent !== undefined && rawPercent !== "") {
+      const p = Number(rawPercent);
+      if (!isNaN(p) && p > 0) {
+        return Math.round((subtotal * p) / 100);
+      }
+    }
+
+    const rawTax =
+      body.tax !== undefined && body.tax !== null ? body.tax : undefined;
+
+    if (rawTax !== undefined && rawTax !== "") {
+      const t = Number(rawTax);
+      if (!isNaN(t)) return t;
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * Recompute subtotal / total cho một invoice:
+ * - subtotal = tổng amount của mọi dòng
+ * - GIỮ nguyên tax hiện có trên invoice
+ * - total = subtotal + tax
+ *
+ * Dùng cho các API chỉnh line đơn lẻ (add/update/delete line)
+ */
 async function recomputeInvoiceTotals(invoiceId: string) {
-  const lines = await prisma.invoiceLine.findMany({ where: { invoiceId } });
+  const [invoice, lines] = await Promise.all([
+    prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      select: { tax: true },
+    }),
+    prisma.invoiceLine.findMany({ where: { invoiceId } }),
+  ]);
+
+  if (!invoice) throw new Error("Invoice not found");
+
   const subtotal = lines.reduce((s, l) => s + toNum(l.amount), 0);
+  const tax = toNum(invoice.tax);
+  const total = subtotal + tax;
+
   return prisma.invoice.update({
     where: { id: invoiceId },
     data: {
       subtotal: new Prisma.Decimal(subtotal),
-      tax: new Prisma.Decimal(0),
-      total: new Prisma.Decimal(subtotal),
+      total: new Prisma.Decimal(total),
     },
   });
 }
@@ -190,6 +242,16 @@ export async function createInvoice(body: any) {
     );
   }
 
+  // Tính subtotal từ các dòng
+  const subtotal = validLines.reduce(
+    (s, l) => s + l.qty * l.price,
+    0
+  );
+
+  // Tính tax theo taxPercent / tax nếu FE gửi lên
+  const tax = calcTaxFromBody(subtotal, body);
+  const total = subtotal + tax;
+
   let created;
   try {
     // 1) Tạo hoá đơn
@@ -212,6 +274,10 @@ export async function createInvoice(body: any) {
         partnerAddr: body.partnerAddr ?? null,
 
         currency: body.currency ?? "VND",
+
+        subtotal: new Prisma.Decimal(subtotal),
+        tax: new Prisma.Decimal(tax),
+        total: new Prisma.Decimal(total),
       },
     });
   } catch (e) {
@@ -223,31 +289,31 @@ export async function createInvoice(body: any) {
 
   // 2) Tạo dòng hàng từ validLines
   for (const l of validLines) {
+    const amount = l.qty * l.price;
     await prisma.invoiceLine.create({
       data: {
         invoiceId: createdId,
         itemId: l.itemId,
         qty: new Prisma.Decimal(l.qty),
         price: new Prisma.Decimal(l.price),
-        amount: new Prisma.Decimal(l.qty * l.price),
+        amount: new Prisma.Decimal(amount),
         itemName: l.itemName || undefined,
         itemSku: l.itemSku || undefined,
       },
     });
   }
 
-  return prisma.invoice.findUnique({
-    where: { id: createdId },
-    include: { lines: true },
-  });
+  // 3) Trả về invoice đầy đủ
+  return getInvoiceById(createdId);
 }
 
 /**
  * Update invoice + thay toàn bộ lines bằng body.lines
+ * - Subtotal / tax / total được tính lại theo lines + taxPercent/tax gửi từ FE
  */
 export async function updateInvoice(id: string, body: any) {
   try {
-    // transaction: update header + replace lines
+    // transaction: update header + replace lines + update totals
     await prisma.$transaction(async (tx) => {
       const data: any = {};
 
@@ -276,6 +342,7 @@ export async function updateInvoice(id: string, body: any) {
       if (body.partnerTax !== undefined) data.partnerTax = body.partnerTax;
       if (body.partnerAddr !== undefined) data.partnerAddr = body.partnerAddr;
 
+      // Update header trước
       await tx.invoice.update({
         where: { id },
         data,
@@ -301,31 +368,47 @@ export async function updateInvoice(id: string, body: any) {
           );
         }
 
+        let subtotal = 0;
+
         for (const l of validLines) {
+          const amount = l.qty * l.price;
+          subtotal += amount;
+
           await tx.invoiceLine.create({
             data: {
               invoiceId: id,
               itemId: l.itemId,
               qty: new Prisma.Decimal(l.qty),
               price: new Prisma.Decimal(l.price),
-              amount: new Prisma.Decimal(l.qty * l.price),
+              amount: new Prisma.Decimal(amount),
               itemName: l.itemName || undefined,
               itemSku: l.itemSku || undefined,
             },
           });
         }
+
+        // Tính lại tax & total từ body (taxPercent / tax), nếu không có -> 0
+        const tax = calcTaxFromBody(subtotal, body);
+        const total = subtotal + tax;
+
+        await tx.invoice.update({
+          where: { id },
+          data: {
+            subtotal: new Prisma.Decimal(subtotal),
+            tax: new Prisma.Decimal(tax),
+            total: new Prisma.Decimal(total),
+          },
+        });
       }
+      // Nếu không gửi body.lines thì giữ nguyên subtotal/tax/total cũ
     });
   } catch (e: any) {
     // Nếu là lỗi business (đã có statusCode) thì ném lại luôn
     if (e && e.statusCode) throw e;
-
     // Nếu là lỗi trùng mã => 400
     handleUniqueInvoiceError(e);
   }
 
-  // tính lại subtotal / total
-  await recomputeInvoiceTotals(id);
   // trả về invoice đầy đủ
   return getInvoiceById(id);
 }
@@ -345,13 +428,14 @@ export async function deleteInvoice(id: string) {
 export async function addInvoiceLine(invoiceId: string, body: any) {
   const qty = Number(body.qty || 0);
   const price = Number(body.price || 0);
+  const amount = qty * price;
   const line = await prisma.invoiceLine.create({
     data: {
       invoiceId,
       itemId: body.itemId,
       qty: new Prisma.Decimal(qty),
       price: new Prisma.Decimal(price),
-      amount: new Prisma.Decimal(qty * price),
+      amount: new Prisma.Decimal(amount),
       itemName: body.itemName || undefined,
       itemSku: body.itemSku || undefined,
     },
@@ -366,13 +450,14 @@ export async function updateInvoiceLine(lineId: string, body: any) {
 
   const qty = body.qty != null ? Number(body.qty) : toNum(row.qty);
   const price = body.price != null ? Number(body.price) : toNum(row.price);
+  const amount = qty * price;
 
   const line = await prisma.invoiceLine.update({
     where: { id: lineId },
     data: {
       qty: new Prisma.Decimal(qty),
       price: new Prisma.Decimal(price),
-      amount: new Prisma.Decimal(qty * price),
+      amount: new Prisma.Decimal(amount),
       itemId: body.itemId || row.itemId,
       itemName: body.itemName || row.itemName || undefined,
       itemSku: body.itemSku || row.itemSku || undefined,
