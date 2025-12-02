@@ -1,5 +1,5 @@
 // src/services/stocks.service.ts
-import { PrismaClient, ItemKind } from '@prisma/client';
+import { PrismaClient, ItemKind } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
@@ -14,18 +14,11 @@ export type GetStocksParams = {
   page?: number;
   pageSize?: number;
   // Lọc theo loại hàng: PART / MACHINE (tuỳ chọn)
-  kind?: ItemKind | 'PART' | 'MACHINE';
+  kind?: ItemKind | "PART" | "MACHINE";
 };
 
 export async function getStocks(params: GetStocksParams) {
-  const {
-    itemId,
-    locationId,
-    q,
-    page = 1,
-    pageSize = 500,
-    kind,
-  } = params;
+  const { itemId, locationId, q, page = 1, pageSize = 500, kind } = params;
 
   const where: any = {};
 
@@ -42,8 +35,8 @@ export async function getStocks(params: GetStocksParams) {
     where.item = {
       ...(where.item || {}),
       OR: [
-        { sku: { contains: keyword, mode: 'insensitive' } },
-        { name: { contains: keyword, mode: 'insensitive' } },
+        { sku: { contains: keyword, mode: "insensitive" } },
+        { name: { contains: keyword, mode: "insensitive" } },
       ],
     };
   }
@@ -51,7 +44,7 @@ export async function getStocks(params: GetStocksParams) {
   // Lọc theo kind = PART / MACHINE
   if (kind) {
     const k =
-      typeof kind === 'string'
+      typeof kind === "string"
         ? (kind.toUpperCase() as ItemKind)
         : (kind as ItemKind);
     where.item = {
@@ -72,7 +65,7 @@ export async function getStocks(params: GetStocksParams) {
       },
       orderBy: {
         item: {
-          sku: 'asc',
+          sku: "asc",
         },
       },
       skip,
@@ -92,12 +85,12 @@ export async function getStocks(params: GetStocksParams) {
  *    + q: sku / tên
  *    + kind: PART / MACHINE
  * - Hỗ trợ phân trang page, pageSize
- * => Máy nào không có record Stock vẫn xuất hiện với totalQty = 0
+ * => Máy/LK nào không có record Stock vẫn xuất hiện với totalQty = 0
  */
 
 export type GetStockSummaryParams = {
   q?: string;
-  kind?: ItemKind | 'PART' | 'MACHINE';
+  kind?: ItemKind | "PART" | "MACHINE";
   page?: number;
   pageSize?: number;
 };
@@ -105,12 +98,7 @@ export type GetStockSummaryParams = {
 export async function getStockSummaryByItem(
   params: GetStockSummaryParams = {},
 ) {
-  const {
-    q,
-    kind,
-    page = 1,
-    pageSize = 50,
-  } = params;
+  const { q, kind, page = 1, pageSize = 50 } = params;
 
   const whereItem: any = {};
 
@@ -118,15 +106,15 @@ export async function getStockSummaryByItem(
   if (q && q.trim()) {
     const keyword = q.trim();
     whereItem.OR = [
-      { sku: { contains: keyword, mode: 'insensitive' } },
-      { name: { contains: keyword, mode: 'insensitive' } },
+      { sku: { contains: keyword, mode: "insensitive" } },
+      { name: { contains: keyword, mode: "insensitive" } },
     ];
   }
 
   // Lọc theo loại hàng: PART / MACHINE
   if (kind) {
     const k =
-      typeof kind === 'string'
+      typeof kind === "string"
         ? (kind.toUpperCase() as ItemKind)
         : (kind as ItemKind);
     whereItem.kind = k;
@@ -138,7 +126,7 @@ export async function getStockSummaryByItem(
   const [items, total] = await Promise.all([
     prisma.item.findMany({
       where: whereItem,
-      orderBy: { sku: 'asc' },
+      orderBy: { sku: "asc" },
       skip,
       take,
       include: {
@@ -150,7 +138,7 @@ export async function getStockSummaryByItem(
 
   const rows = items.map((item) => {
     const totalQty = (item.stocks || []).reduce(
-      (sum, s) => sum + Number(s.qty),
+      (sum, s) => sum + Number(s.qty || 0),
       0,
     );
 
@@ -160,6 +148,7 @@ export async function getStockSummaryByItem(
       name: item.name,
       unit: item.unit,
       kind: item.kind,
+      sellPrice: item.sellPrice, // 🔹 THÊM GIÁ BÁN TRẢ RA FE + EXPORT
       totalQty,
     };
   });
