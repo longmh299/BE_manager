@@ -1,4 +1,5 @@
-import { PrismaClient, ItemKind } from '@prisma/client';
+// src/services/stocks_import.service.ts
+import { PrismaClient, ItemKind, Item } from '@prisma/client';
 import * as XLSX from 'xlsx';
 
 const prisma = new PrismaClient();
@@ -21,10 +22,7 @@ function norm(s: string) {
  * Convert text kind trong file → enum ItemKind
  */
 function parseItemKind(raw?: string): ItemKind {
-  const t = (raw || '')
-    .toString()
-    .trim()
-    .toLowerCase();
+  const t = (raw || '').toString().trim().toLowerCase();
 
   if (!t) return 'PART';
 
@@ -33,6 +31,8 @@ function parseItemKind(raw?: string): ItemKind {
     t === 'máy' ||
     t === 'may' ||
     t === 'mm' ||
+    t === 'tủ' ||
+    t === 'tu' ||
     t === 'maymoc' ||
     t === 'máymóc'
   ) {
@@ -158,7 +158,7 @@ export async function importOpeningStocks(_p: PrismaClient, body: any) {
 // ---------- ONE-FILE importer (/opening-onefile) ----------
 export async function importOpeningOneFile(
   buf: Buffer,
-  opts: { mode: 'replace' | 'add' } = { mode: 'replace' }
+  opts: { mode: 'replace' | 'add' } = { mode: 'replace' },
 ) {
   const wb = XLSX.read(buf, { type: 'buffer' });
   const sheetName = wb.SheetNames[0];
@@ -194,6 +194,43 @@ export async function importOpeningOneFile(
   const whId = await getSingleWarehouseId();
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true }) as any[][];
 
+  // 🔧 NEW: Detect SKUs reused for many different names in the SAME file
+  // -> Excel kiểu "dùng chung mã máy FRD1000 cho nhiều linh kiện"
+  const rawSkuStats: Record<string, { count: number; names: Set<string> }> = {};
+  if (colSku !== undefined) {
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r] || [];
+      const rawSku = row[colSku];
+      const sku = String(rawSku ?? '').trim();
+      if (!sku) continue;
+
+      const name =
+        colName !== undefined ? String(row[colName] ?? '').trim() : '';
+
+      if (!rawSkuStats[sku]) {
+        rawSkuStats[sku] = { count: 0, names: new Set<string>() };
+      }
+      rawSkuStats[sku].count++;
+      if (name) rawSkuStats[sku].names.add(name);
+    }
+  }
+
+  const suspiciousSkuList = Object.entries(rawSkuStats)
+    .filter(([_, stat]) => stat.count > 1 && stat.names.size > 1)
+    .map(([sku]) => sku);
+
+  const suspiciousSkuSet = new Set(suspiciousSkuList);
+
+  let suspiciousExistingMap: Record<string, Item> = {};
+  if (suspiciousSkuList.length > 0) {
+    const existingSuspicious = await prisma.item.findMany({
+      where: { sku: { in: suspiciousSkuList } },
+    });
+    suspiciousExistingMap = Object.fromEntries(
+      existingSuspicious.map((it) => [it.sku, it]),
+    );
+  }
+
   let createdItems = 0;
   let updatedItems = 0;
   let affectedStocks = 0;
@@ -225,6 +262,22 @@ export async function importOpeningOneFile(
     }
 
     const prefix = kindToPrefixFromEnum(kindEnum);
+
+    // 🔧 NEW: Nếu SKU này bị dùng lặp lại cho nhiều tên khác nhau
+    // và dòng hiện tại là linh kiện (PART), trong khi DB chưa có
+    // hoặc đang có 1 Item MACHINE cùng SKU,
+    // => coi là đang dùng chung "mã máy" cho linh kiện, ta BỎ SKU gốc,
+    // tự sinh SKU riêng để tránh gộp tồn.
+    if (sku && suspiciousSkuSet.has(sku)) {
+      const existing = suspiciousExistingMap[sku];
+      const isPartRow = kindEnum === 'PART';
+      const existingIsMachine = existing && existing.kind === 'MACHINE';
+
+      if (isPartRow && (!existing || existingIsMachine)) {
+        const baseName = `${sku} ${name || ''}`.trim() || sku;
+        sku = await ensureUniqueSkuFromName(baseName, prefix);
+      }
+    }
 
     if (!sku && !name) continue;
     if (!sku) sku = await ensureUniqueSkuFromName(name || 'SP', prefix);
