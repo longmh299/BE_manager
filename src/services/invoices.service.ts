@@ -243,10 +243,7 @@ export async function createInvoice(body: any) {
   }
 
   // Tính subtotal từ các dòng
-  const subtotal = validLines.reduce(
-    (s, l) => s + l.qty * l.price,
-    0
-  );
+  const subtotal = validLines.reduce((s, l) => s + l.qty * l.price, 0);
 
   // Tính tax theo taxPercent / tax nếu FE gửi lên
   const tax = calcTaxFromBody(subtotal, body);
@@ -341,6 +338,20 @@ export async function updateInvoice(id: string, body: any) {
         data.partnerPhone = body.partnerPhone;
       if (body.partnerTax !== undefined) data.partnerTax = body.partnerTax;
       if (body.partnerAddr !== undefined) data.partnerAddr = body.partnerAddr;
+
+      // ✅ CẬP NHẬT NHÂN VIÊN PHỤ TRÁCH
+      if (body.saleUserId !== undefined) {
+        data.saleUserId =
+          body.saleUserId !== "" && body.saleUserId != null
+            ? body.saleUserId
+            : null;
+      }
+      if (body.techUserId !== undefined) {
+        data.techUserId =
+          body.techUserId !== "" && body.techUserId != null
+            ? body.techUserId
+            : null;
+      }
 
       // Update header trước
       await tx.invoice.update({

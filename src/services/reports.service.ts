@@ -7,7 +7,7 @@ export interface RevenueUserStat {
   userId: string;
   username: string;
   fullName?: string | null;
-  totalRevenue: number;
+  totalRevenue: number;   // doanh thu (tiền hàng, dùng subtotal)
   invoiceCount: number;
 }
 
@@ -23,7 +23,7 @@ export interface RevenueSummary {
   from: string; // yyyy-mm-dd
   to: string;   // yyyy-mm-dd
   currency: string;
-  totalRevenue: number;
+  totalRevenue: number;   // tổng doanh thu (subtotal, không VAT)
   invoiceCount: number;
   bySaleUser: RevenueUserStat[];
   byTechUser: RevenueUserStat[];
@@ -93,35 +93,38 @@ export async function getRevenueSummary(params: {
   }
 
   // 1. Tổng doanh thu + số hóa đơn
+  // ⚠️ Dùng subtotal thay vì total để loại VAT khỏi doanh thu
   const totalAgg = await prisma.invoice.aggregate({
     where: invoiceWhere,
-    _sum: { total: true },
+    _sum: { subtotal: true },
     _count: { _all: true },
   });
 
   const totalRevenue =
-    totalAgg._sum.total ? Number(totalAgg._sum.total.toString()) : 0;
+    totalAgg._sum.subtotal !== null && totalAgg._sum.subtotal !== undefined
+      ? Number(totalAgg._sum.subtotal.toString())
+      : 0;
   const invoiceCount = totalAgg._count._all || 0;
 
-  // 2. Doanh thu theo saleUser
+  // 2. Doanh thu theo saleUser (subtotal)
   const saleGroups = await prisma.invoice.groupBy({
     by: ["saleUserId"],
     where: {
       ...invoiceWhere,
       saleUserId: { not: null },
     },
-    _sum: { total: true },
+    _sum: { subtotal: true },
     _count: { _all: true },
   });
 
-  // 3. Doanh thu theo techUser
+  // 3. Doanh thu theo techUser (subtotal)
   const techGroups = await prisma.invoice.groupBy({
     by: ["techUserId"],
     where: {
       ...invoiceWhere,
       techUserId: { not: null },
     },
-    _sum: { total: true },
+    _sum: { subtotal: true },
     _count: { _all: true },
   });
 
@@ -149,8 +152,8 @@ export async function getRevenueSummary(params: {
     .map((g) => {
       const u = g.saleUserId ? userMap.get(g.saleUserId) : undefined;
       const total =
-        g._sum.total !== null && g._sum.total !== undefined
-          ? Number(g._sum.total.toString())
+        g._sum.subtotal !== null && g._sum.subtotal !== undefined
+          ? Number(g._sum.subtotal.toString())
           : 0;
       return {
         userId: g.saleUserId!,
@@ -167,8 +170,8 @@ export async function getRevenueSummary(params: {
     .map((g) => {
       const u = g.techUserId ? userMap.get(g.techUserId) : undefined;
       const total =
-        g._sum.total !== null && g._sum.total !== undefined
-          ? Number(g._sum.total.toString())
+        g._sum.subtotal !== null && g._sum.subtotal !== undefined
+          ? Number(g._sum.subtotal.toString())
           : 0;
       return {
         userId: g.techUserId!,
@@ -187,6 +190,7 @@ export async function getRevenueSummary(params: {
   }
 
   // 4. Top 10 sản phẩm theo doanh thu (InvoiceLine)
+  //    Ở đây vẫn dùng amount (tiền hàng) nên đã khớp với subtotal
   const topItemGroups = await prisma.invoiceLine.groupBy({
     by: ["itemId"],
     where: {
