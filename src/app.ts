@@ -1,3 +1,4 @@
+// src/app.ts
 import express, { Router } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -14,13 +15,40 @@ import invoiceRoutes from './routes/invoices.routes';
 import stockImportRoutes from './routes/stocks_import.routes';
 import partnersRoutes from './routes/partners.routes';
 import { reportsRouter } from './routes/reports.routes';
-import usersRoutes from "./routes/users.routes";
-import machinesRoutes from "./routes/machines.routes";
+import usersRoutes from './routes/users.routes';
+import machinesRoutes from './routes/machines.routes';
 import locksRoutes from './routes/locks.routes';
+
 const app = express();
 
-// Middlewares
-app.use(cors());
+// ================== CORS CONFIG (đơn giản) ==================
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://apibrother.id.vn',
+  'https://www.apibrother.id.vn',
+];
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Cho Postman/curl (không có Origin)
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.warn('Blocked by CORS:', origin);
+      return callback(new Error('Not allowed by CORS'));
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: false, // bạn dùng Bearer token, không dùng cookie
+  })
+);
+// ================== END CORS CONFIG ==================
+
+// Middlewares khác
 app.use(helmet());
 app.use(express.json());
 app.use(morgan('dev'));
@@ -30,7 +58,10 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/api/health', (_req, res) => res.json({ ok: true })); // tùy thích giữ thêm
 
 // Debug: log sớm
-app.use((req, _res, next) => { console.log('➡', req.method, req.url); next(); });
+app.use((req, _res, next) => {
+  console.log('➡', req.method, req.url);
+  next();
+});
 
 // ==== API v1 (prefix /api) ====
 const api = Router();
@@ -47,9 +78,11 @@ api.use('/invoices', invoiceRoutes);
 api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
 api.use('/reports', reportsRouter);
-app.use("/api/users", usersRoutes);
-app.use("/api/machines", machinesRoutes);
 api.use('/locks', locksRoutes);
+
+// 2 router này bạn đang mount trực tiếp, giữ nguyên
+app.use('/api/users', usersRoutes);
+app.use('/api/machines', machinesRoutes);
 
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
@@ -72,13 +105,22 @@ function listRoutes(router: any) {
   });
   return rts;
 }
-app.get('/api/__routes', (_req, res) => res.json({ base: listRoutes(app), api: listRoutes(api) }));
+
+app.get('/api/__routes', (_req, res) =>
+  res.json({ base: listRoutes(app), api: listRoutes(api) })
+);
 
 // Errors & 404
 app.use((err: any, _req: any, res: any, _next: any) => {
   console.error(err);
-  res.status(err.status || 500).json({ ok: false, message: err.message || 'Server error' });
+  res.status(err.status || 500).json({
+    ok: false,
+    message: err.message || 'Server error',
+  });
 });
-app.use((_req, res) => res.status(404).json({ ok: false, message: 'Not found' }));
+
+app.use((_req, res) =>
+  res.status(404).json({ ok: false, message: 'Not found' })
+);
 
 export default app;
