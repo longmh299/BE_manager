@@ -14,7 +14,11 @@ enum UserRole {
   accountant
   admin
 }
-
+enum PaymentStatus {
+  UNPAID   // Chưa thanh toán
+  PARTIAL  // Thanh toán một phần
+  PAID     // Đã thanh toán đủ
+}
 enum MovementType {
   IN
   OUT
@@ -84,8 +88,8 @@ model Location {
 
 model Item {
   id        String   @id @default(cuid())
-  sku       String   @unique
-  name      String
+  sku       String   
+  name      String   @unique
   unit      String   @default("pcs")
   price     Decimal  @db.Decimal(18, 2)
   sellPrice Decimal  @default(0) @db.Decimal(18, 2)
@@ -297,7 +301,8 @@ model Invoice {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
+  paymentStatus PaymentStatus @default(UNPAID)
+  paidAmount    Decimal       @default(0)    // số tiền đã thu
   @@index([partnerId, issueDate])
   @@index([saleUserId])
   @@index([techUserId])

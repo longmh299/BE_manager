@@ -1,4 +1,3 @@
-// src/services/reports.service.ts
 import { PrismaClient, InvoiceType } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -51,8 +50,13 @@ function parseDateOnly(d: string): Date {
 /**
  * Thống kê doanh thu:
  *  - chỉ type = SALES
+ *  - CHỈ hóa đơn:
+ *      + đã thanh toán đủ (paymentStatus = PAID)
+ *      + đã post tồn (có movement)
+ *      + có bán máy (ít nhất 1 dòng sản phẩm là máy)
  *  - from/to: khoảng thời gian
  *  - nếu có userId => chỉ lấy HĐ mà user đó là sale hoặc tech
+ *  - Doanh thu = subtotal (tiền hàng, không VAT)
  */
 export async function getRevenueSummary(params: {
   from?: string;
@@ -74,12 +78,23 @@ export async function getRevenueSummary(params: {
   const endExclusive = new Date(end);
   endExclusive.setDate(endExclusive.getDate() + 1);
 
-  // base filter theo loại + thời gian
+  // base filter theo loại + thời gian + trạng thái thanh toán + post tồn + có bán máy
   const baseWhere: any = {
     type: InvoiceType.SALES,
+    paymentStatus: "PAID",          // chỉ HĐ đã thanh toán đủ
     issueDate: {
       gte: start,
       lt: endExclusive,
+    },
+    // chỉ HĐ đã post tồn (có ít nhất 1 movement)
+    movements: { some: {} },
+    // chỉ HĐ có ít nhất 1 dòng là MÁY
+    lines: {
+      some: {
+        item: {
+          kind: "MACHINE",         // nếu dùng enum ItemKind thì đổi thành ItemKind.MACHINE
+        },
+      },
     },
   };
 
@@ -194,7 +209,10 @@ export async function getRevenueSummary(params: {
   const topItemGroups = await prisma.invoiceLine.groupBy({
     by: ["itemId"],
     where: {
-      invoice: invoiceWhere, // filter theo invoice (đã có userId nếu có)
+      invoice: invoiceWhere,           // filter theo invoice (đã có PAID + post tồn + có máy)
+      item: {
+        kind: "MACHINE",               // chỉ sản phẩm là máy
+      },
     },
     _sum: {
       amount: true,

@@ -38,11 +38,18 @@ export async function listItems(q?: string, page = 1, pageSize = 20) {
   return { data: rows, page, pageSize, total };
 }
 
+// === CHỈNH Ở ĐÂY ===
 async function ensureUniqueSku(baseName: string) {
   let seq = 1;
   while (true) {
     const candidate = buildSkuFrom(baseName || 'SP', seq++);
-    const found = await prisma.item.findUnique({ where: { sku: candidate } });
+
+    // dùng findFirst thay vì findUnique để không bị lỗi type
+    const found = await prisma.item.findFirst({
+      where: { sku: candidate },
+      select: { id: true },
+    });
+
     if (!found) return candidate;
   }
 }
@@ -88,6 +95,7 @@ export async function createItem(body: any) {
       e instanceof Prisma.PrismaClientKnownRequestError &&
       e.code === 'P2002'
     ) {
+      // trường hợp trùng unique field (vd sku nếu bạn để @unique)
       if (!body?.sku) {
         const newSku = await ensureUniqueSku(name || 'SP');
         const created = await prisma.item.create({

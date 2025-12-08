@@ -87,15 +87,17 @@ function toSlugBase(s: string) {
   );
 }
 
+// ⚙️ Giữ lại helper nhưng sửa dùng findFirst (sku không còn unique)
 async function ensureUniqueSkuFromName(
   name: string,
   prefix: "LK" | "MM"
 ): Promise<string> {
   const base = `${prefix}-${toSlugBase(name)}`;
   let n = 1;
+  // eslint-disable-next-line no-constant-condition
   while (true) {
     const sku = n === 1 ? base : `${base}-${n}`;
-    const found = await prisma.item.findUnique({ where: { sku } });
+    const found = await prisma.item.findFirst({ where: { sku } });
     if (!found) return sku;
     n++;
   }
@@ -133,7 +135,8 @@ export async function importOpeningStocks(_p: PrismaClient, body: any) {
     const qty = toNumber(r?.qty);
     if (!sku) continue;
 
-    const item = await prisma.item.findUnique({ where: { sku } });
+    // 🔁 sku không còn unique → dùng findFirst
+    const item = await prisma.item.findFirst({ where: { sku } });
     if (!item) continue;
 
     const key = { itemId: item.id, locationId };
@@ -218,7 +221,7 @@ export async function importOpeningOneFile(
   }) as any[][];
 
   let createdItems = 0;
-  let updatedItems = 0; // hiện tại sẽ luôn = 0 cho PART & MACHINE
+  let updatedItems = 0;
   let affectedStocks = 0;
 
   const hasKindColumn = colKind !== undefined;
@@ -251,61 +254,47 @@ export async function importOpeningOneFile(
       kindEnum = inferKindFromName(name);
     }
 
-    const prefix = kindToPrefixFromEnum(kindEnum);
-
     if (!sku && !name) continue;
 
-    // ====== CẢ PART & MACHINE: 1 dòng Excel = 1 Item, luôn gen SKU unique ======
-    let baseSku = sku;
+    const itemName = name || sku;
+    const prefix = kindToPrefixFromEnum(kindEnum);
 
-    if (kindEnum === "PART") {
-      // PART: ưu tiên gắn thêm slug tên vào sau sku
-      if (name) {
-        const slug = toSlugBase(name);
-        if (baseSku) {
-          baseSku = `${baseSku}-${slug}`;
-        } else {
-          baseSku = `${prefix}-${slug}`; // LK-...
-        }
-      }
-    } else {
-      // MACHINE: giữ mã máy làm gốc, nếu không có thì gen từ name
-      if (!baseSku && name) {
-        const slug = toSlugBase(name);
-        baseSku = `${prefix}-${slug}`; // MM-...
-      }
+    // 🔁 SKU mới: giữ nguyên mã trong file, chỉ gen thêm khi bị trống
+    if (!sku) {
+      sku = await ensureUniqueSkuFromName(itemName || "SP", prefix);
     }
+    const finalSku = sku;
 
-    if (!baseSku) {
-      // fallback cuối
-      baseSku = await ensureUniqueSkuFromName(name || "SP", prefix);
-    }
-
-    // Đảm bảo SKU duy nhất: base, nếu trùng -> base-2, base-3, ...
-    let finalSku = baseSku;
-    let counter = 1;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const exists = await prisma.item.findUnique({
-        where: { sku: finalSku },
-      });
-      if (!exists) break;
-      counter++;
-      finalSku = `${baseSku}-${counter}`;
-    }
-
-    const item = await prisma.item.create({
-      data: {
-        sku: finalSku,
-        name: name || finalSku,
-        unit: "pcs",
-        price: 0 as any,
-        sellPrice: sell as any,
-        note: note,
-        kind: kindEnum,
-      } as any,
+    // 🔁 ĐỔI LOGIC: 1 Item theo name, nếu tồn tại thì update, không tạo mới trùng
+    let item = await prisma.item.findFirst({
+      where: { name: itemName },
     });
-    createdItems++;
+
+    if (item) {
+      item = await prisma.item.update({
+        where: { id: item.id },
+        data: {
+          sku: finalSku,
+          sellPrice: sell as any,
+          note: note,
+          kind: kindEnum,
+        } as any,
+      });
+      updatedItems++;
+    } else {
+      item = await prisma.item.create({
+        data: {
+          sku: finalSku,
+          name: itemName,
+          unit: "pcs",
+          price: 0 as any,
+          sellPrice: sell as any,
+          note: note,
+          kind: kindEnum,
+        } as any,
+      });
+      createdItems++;
+    }
 
     const key = { itemId: item.id, locationId: whId };
     const old = await prisma.stock.findUnique({

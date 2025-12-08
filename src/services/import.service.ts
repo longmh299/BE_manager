@@ -1,3 +1,4 @@
+// import.service.ts
 import * as XLSX from 'xlsx';
 import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
@@ -17,11 +18,23 @@ export async function importItemsFromBuffer(buf: Buffer) {
     const price = String(r.price || '0').trim();
     const note = String(r.note || '').trim();
 
-    const up = await prisma.item.upsert({
-      where: { sku },
-      update: { name, unit, price, note },
-      create: { sku, name, unit, price, note }
+    // 🔁 ĐỔI LOGIC: check tồn tại theo name (không dùng sku unique nữa)
+    const existing = await prisma.item.findFirst({
+      where: { name },
     });
+
+    let up;
+    if (existing) {
+      up = await prisma.item.update({
+        where: { id: existing.id },
+        data: { sku, unit, price, note },
+      });
+    } else {
+      up = await prisma.item.create({
+        data: { sku, name, unit, price, note },
+      });
+    }
+
     results.push({ sku: up.sku, id: up.id });
   }
   return { count: results.length, items: results };

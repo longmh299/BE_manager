@@ -1,5 +1,10 @@
 // src/services/invoices.service.ts
-import { PrismaClient, InvoiceType, MovementType, Prisma } from "@prisma/client";
+import {
+  PrismaClient,
+  InvoiceType,
+  Prisma,
+  PaymentStatus,
+} from "@prisma/client";
 
 const prisma = new PrismaClient();
 
@@ -157,6 +162,7 @@ export async function listInvoices(
     techUserId?: string;
     from?: Date;
     to?: Date;
+    paymentStatus?: PaymentStatus;
   }
 ) {
   const where: Prisma.InvoiceWhereInput = {};
@@ -178,6 +184,9 @@ export async function listInvoices(
     where.issueDate = {};
     if (filter.from) (where.issueDate as any).gte = filter.from;
     if (filter.to) (where.issueDate as any).lte = filter.to;
+  }
+  if (filter?.paymentStatus) {
+    where.paymentStatus = filter.paymentStatus;
   }
 
   const [total, rows] = await Promise.all([
@@ -249,6 +258,18 @@ export async function createInvoice(body: any) {
   const tax = calcTaxFromBody(subtotal, body);
   const total = subtotal + tax;
 
+  // Thanh toán
+  const paidAmount =
+    body.paidAmount != null ? Number(body.paidAmount) || 0 : 0;
+
+  const paymentStatus: PaymentStatus =
+    body.paymentStatus ??
+    (paidAmount <= 0
+      ? "UNPAID"
+      : paidAmount >= total
+      ? "PAID"
+      : "PARTIAL");
+
   let created;
   try {
     // 1) Tạo hoá đơn
@@ -275,6 +296,9 @@ export async function createInvoice(body: any) {
         subtotal: new Prisma.Decimal(subtotal),
         tax: new Prisma.Decimal(tax),
         total: new Prisma.Decimal(total),
+
+        paymentStatus,
+        paidAmount: new Prisma.Decimal(paidAmount),
       },
     });
   } catch (e) {
@@ -339,18 +363,19 @@ export async function updateInvoice(id: string, body: any) {
       if (body.partnerTax !== undefined) data.partnerTax = body.partnerTax;
       if (body.partnerAddr !== undefined) data.partnerAddr = body.partnerAddr;
 
-      // ✅ CẬP NHẬT NHÂN VIÊN PHỤ TRÁCH
-      if (body.saleUserId !== undefined) {
-        data.saleUserId =
-          body.saleUserId !== "" && body.saleUserId != null
-            ? body.saleUserId
-            : null;
+      // nhân viên
+      if (body.saleUserId !== undefined)
+        data.saleUserId = body.saleUserId || null;
+      if (body.techUserId !== undefined)
+        data.techUserId = body.techUserId || null;
+
+      // thanh toán: cho phép FE truyền thẳng lên
+      if (body.paymentStatus) {
+        data.paymentStatus = body.paymentStatus as PaymentStatus;
       }
-      if (body.techUserId !== undefined) {
-        data.techUserId =
-          body.techUserId !== "" && body.techUserId != null
-            ? body.techUserId
-            : null;
+      if (body.paidAmount !== undefined) {
+        const paid = Number(body.paidAmount) || 0;
+        data.paidAmount = new Prisma.Decimal(paid);
       }
 
       // Update header trước
@@ -402,12 +427,33 @@ export async function updateInvoice(id: string, body: any) {
         const tax = calcTaxFromBody(subtotal, body);
         const total = subtotal + tax;
 
+        // Nếu body không gửi paidAmount mới thì giữ nguyên giá trị cũ
+        const invoiceOld = await tx.invoice.findUnique({
+          where: { id },
+          select: { paidAmount: true, paymentStatus: true },
+        });
+
+        let paidAmount =
+          body.paidAmount !== undefined
+            ? Number(body.paidAmount) || 0
+            : toNum(invoiceOld?.paidAmount ?? 0);
+
+        let paymentStatus: PaymentStatus =
+          (body.paymentStatus as PaymentStatus | undefined) ??
+          (paidAmount <= 0
+            ? "UNPAID"
+            : paidAmount >= total
+            ? "PAID"
+            : "PARTIAL");
+
         await tx.invoice.update({
           where: { id },
           data: {
             subtotal: new Prisma.Decimal(subtotal),
             tax: new Prisma.Decimal(tax),
             total: new Prisma.Decimal(total),
+            paidAmount: new Prisma.Decimal(paidAmount),
+            paymentStatus,
           },
         });
       }
@@ -529,7 +575,8 @@ export async function postInvoiceToStock(
 
   for (const [itemId, d] of desiredMap.entries()) {
     if (d > 0) adjustIn.push({ itemId, qty: d, locationId: warehouse.id });
-    if (d < 0) adjustOut.push({ itemId, qty: Math.abs(d), locationId: warehouse.id });
+    if (d < 0)
+      adjustOut.push({ itemId, qty: Math.abs(d), locationId: warehouse.id });
   }
 
   // tạo movement IN / OUT và update stock trong transaction
@@ -798,6 +845,7 @@ export async function aggregateRevenue(params: {
   saleUserId?: string;
   techUserId?: string;
   q?: string;
+  paymentStatus?: PaymentStatus;
 }) {
   const where: Prisma.InvoiceWhereInput = {};
   if (params.type) where.type = params.type;
@@ -814,6 +862,9 @@ export async function aggregateRevenue(params: {
       { partnerName: { contains: params.q, mode: "insensitive" } },
     ];
   }
+  if (params.paymentStatus) {
+    where.paymentStatus = params.paymentStatus;
+  }
 
   const rows = await prisma.invoice.findMany({
     where,
@@ -822,6 +873,8 @@ export async function aggregateRevenue(params: {
       code: true,
       issueDate: true,
       total: true,
+      paidAmount: true,
+      paymentStatus: true,
       saleUserId: true,
       saleUserName: true,
       techUserId: true,
@@ -830,7 +883,11 @@ export async function aggregateRevenue(params: {
     orderBy: { issueDate: "asc" },
   });
 
-  const grandTotal = rows.reduce((s, r) => s + toNum(r.total), 0);
+  // Doanh thu thực tế = số tiền đã thu
+  const grandTotal = rows.reduce(
+    (s, r) => s + toNum(r.paidAmount ?? 0),
+    0
+  );
 
   const bySale = new Map<
     string,
@@ -842,6 +899,8 @@ export async function aggregateRevenue(params: {
   >();
 
   for (const r of rows) {
+    const amount = toNum(r.paidAmount ?? 0);
+
     const saleKey = r.saleUserId || r.saleUserName || "UNKNOWN";
     const saleName = r.saleUserName || r.saleUserId || "UNKNOWN";
     const s0 =
@@ -851,7 +910,7 @@ export async function aggregateRevenue(params: {
         total: 0,
         count: 0,
       };
-    s0.total += toNum(r.total);
+    s0.total += amount;
     s0.count += 1;
     bySale.set(saleKey, s0);
 
@@ -864,7 +923,7 @@ export async function aggregateRevenue(params: {
         total: 0,
         count: 0,
       };
-    t0.total += toNum(r.total);
+    t0.total += amount;
     t0.count += 1;
     byTech.set(techKey, t0);
   }
