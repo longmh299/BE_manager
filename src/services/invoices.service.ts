@@ -579,6 +579,61 @@ export async function postInvoiceToStock(
       adjustOut.push({ itemId, qty: Math.abs(d), locationId: warehouse.id });
   }
 
+  /**
+   * ================ CHẶN TỒN ÂM KHI HOÁ ĐƠN LÀ SALES =================
+   * - Chỉ check với hoá đơn BÁN HÀNG (SALES)
+   * - Với mỗi item OUT:
+   *    + Nếu tồn hiện tại <= 0  => báo "hết hàng"
+   *    + Nếu tồn hiện tại < qty => báo "không đủ tồn"
+   */
+  if (invoice.type === "SALES" && adjustOut.length) {
+    const itemIds = adjustOut.map((l) => l.itemId);
+
+    const [stocks, items] = await Promise.all([
+      prisma.stock.findMany({
+        where: {
+          locationId: warehouse.id,
+          itemId: { in: itemIds },
+        },
+      }),
+      prisma.item.findMany({
+        where: { id: { in: itemIds } },
+        select: { id: true, name: true, sku: true },
+      }),
+    ]);
+
+    const stockMap = new Map<string, number>();
+    stocks.forEach((s) => {
+      stockMap.set(s.itemId, toNum(s.qty));
+    });
+
+    const nameMap = new Map<string, string>();
+    items.forEach((it) => {
+      nameMap.set(it.id, it.name || it.sku || it.id);
+    });
+
+    const errors: string[] = [];
+
+    for (const l of adjustOut) {
+      const current = stockMap.get(l.itemId) ?? 0;
+      const name = nameMap.get(l.itemId) ?? l.itemId;
+
+      if (current <= 0) {
+        errors.push(`Sản phẩm "${name}" đã hết hàng trong kho.`);
+      } else if (current < l.qty) {
+        errors.push(
+          `Sản phẩm "${name}" không đủ tồn kho (còn ${current}, cần ${l.qty}).`
+        );
+      }
+    }
+
+    if (errors.length) {
+      // lỗi business, statusCode = 400 => routes/error middleware có thể trả JSON đẹp cho FE
+      throw httpError(400, errors.join(" "));
+    }
+  }
+  // ========================= END CHECK ========================= //
+
   // tạo movement IN / OUT và update stock trong transaction
   await prisma.$transaction(async (tx) => {
     if (adjustIn.length) {
