@@ -4,10 +4,42 @@ import { buildSkuFrom } from '../utils/sku';
 
 const prisma = new PrismaClient();
 
+/**
+ * ✅ SEARCH CHUẨN:
+ * - Ưu tiên match SKU chính xác trước
+ * - Sau đó mới tìm gần đúng theo name + sku
+ * - Luôn ưu tiên MACHINE lên trước PART
+ */
 export async function listItems(q?: string, page = 1, pageSize = 20) {
+  const keyword = q?.trim();
+
+  // ===== 1. ƯU TIÊN MATCH SKU CHÍNH XÁC =====
+  if (keyword) {
+    const exactSku = await prisma.item.findMany({
+      where: {
+        sku: {
+          equals: keyword,
+          mode: 'insensitive',
+        },
+      },
+      orderBy: {
+        kind: 'desc', // ✅ MACHINE luôn đứng trên PART
+      },
+    });
+
+    if (exactSku.length > 0) {
+      return {
+        data: exactSku,
+        page: 1,
+        pageSize: exactSku.length,
+        total: exactSku.length,
+      };
+    }
+  }
+
+  // ===== 2. TÌM GẦN ĐÚNG THEO NAME + SKU =====
   const where: Prisma.ItemWhereInput = {};
 
-  const keyword = q?.trim();
   if (keyword) {
     where.OR = [
       {
@@ -28,7 +60,14 @@ export async function listItems(q?: string, page = 1, pageSize = 20) {
   const [rows, total] = await Promise.all([
     prisma.item.findMany({
       where,
-      orderBy: { createdAt: 'desc' },
+
+      // ✅ SORT ĐÚNG NGHIỆP VỤ
+      orderBy: [
+        { kind: 'desc' }, // ✅ MACHINE > PART
+        { sku: 'asc' },   // ✅ Ưu tiên mã
+        { name: 'asc' },  // ✅ Sau cùng theo tên
+      ],
+
       skip: (page - 1) * pageSize,
       take: pageSize,
     }),
@@ -38,7 +77,7 @@ export async function listItems(q?: string, page = 1, pageSize = 20) {
   return { data: rows, page, pageSize, total };
 }
 
-// === CHỈNH Ở ĐÂY ===
+// ===== ENSURE UNIQUE SKU =====
 async function ensureUniqueSku(baseName: string) {
   let seq = 1;
   while (true) {
@@ -54,6 +93,7 @@ async function ensureUniqueSku(baseName: string) {
   }
 }
 
+// ===== CREATE ITEM =====
 export async function createItem(body: any) {
   const name: string = (body?.name ?? '').toString().trim();
   let sku: string = (body?.sku ?? '').toString().trim();
@@ -120,6 +160,7 @@ export async function createItem(body: any) {
   }
 }
 
+// ===== UPDATE ITEM =====
 export async function updateItem(id: string, body: any) {
   const data: any = {};
 
@@ -156,6 +197,7 @@ export async function updateItem(id: string, body: any) {
   }
 }
 
+// ===== REMOVE ITEM =====
 export async function removeItem(id: string) {
   return prisma.item.delete({ where: { id } });
 }
