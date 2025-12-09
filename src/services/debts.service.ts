@@ -44,13 +44,23 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
 
   for (const inv of invoices) {
     const paidTotal = Number(inv.paidAmount ?? 0);
-    const total = Number(inv.total ?? 0);
-    const debtTotal = total - paidTotal;
+    // tổng tiền đã thu của HĐ, sẽ phân bổ dần cho từng dòng
+    let remainingPaid = paidTotal;
 
     for (const line of inv.lines) {
       const qty = Number(line.qty);
       const price = Number(line.price ?? 0);
-      const amount = Number(line.amount ?? qty * price);
+      const amount = Number(
+        line.amount != null ? line.amount : qty * price
+      );
+
+      // phân bổ tiền đã thanh toán cho dòng này (FIFO)
+      let linePaid = 0;
+      if (remainingPaid > 0 && amount > 0) {
+        linePaid = Math.min(amount, remainingPaid);
+        remainingPaid -= linePaid;
+      }
+      const lineDebt = amount - linePaid;
 
       rows.push({
         invoiceId: inv.id,
@@ -61,8 +71,8 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
         qty,
         unitPrice: price,
         amount,
-        paid: paidTotal,
-        debt: debtTotal,
+        paid: linePaid,       // ✅ đã thanh toán cho từng dòng
+        debt: lineDebt,       // ✅ nợ riêng từng dòng
         note: inv.note ?? "",
         saleUserId: inv.saleUserId ?? null,
         saleUserName:
@@ -142,7 +152,7 @@ export async function getDebtsSummaryBySale(
   return Object.values(map);
 }
 
-// ✅ THÊM HÀM NÀY: update ghi chú công nợ (lưu vào invoice.note)
+// ✅ update ghi chú công nợ (lưu vào invoice.note)
 export async function updateDebtNote(invoiceId: string, note: string) {
   const inv = await prisma.invoice.update({
     where: { id: invoiceId },
