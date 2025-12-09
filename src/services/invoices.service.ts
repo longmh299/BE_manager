@@ -221,7 +221,15 @@ export async function getInvoiceById(id: string) {
     },
   });
 }
+export async function updateInvoiceNote(id: string, note: string) {
+  const updated = await prisma.invoice.update({
+    where: { id },
+    data: { note },
+    select: { id: true, note: true },
+  });
 
+  return updated;
+}
 export async function createInvoice(body: any) {
   const issueDate = body.issueDate ? new Date(body.issueDate) : new Date();
 

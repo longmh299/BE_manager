@@ -18,6 +18,8 @@ import { reportsRouter } from './routes/reports.routes';
 import usersRoutes from './routes/users.routes';
 import machinesRoutes from './routes/machines.routes';
 import locksRoutes from './routes/locks.routes';
+import paymentsRoutes from './routes/payments.routes';
+import debtsRoutes from './routes/debts.routes';
 
 const app = express();
 
@@ -83,7 +85,8 @@ api.use('/locks', locksRoutes);
 // 2 router này bạn đang mount trực tiếp, giữ nguyên
 app.use('/api/users', usersRoutes);
 app.use('/api/machines', machinesRoutes);
-
+app.use("/api/payments", paymentsRoutes);
+app.use("/api/debts", debtsRoutes);
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
 

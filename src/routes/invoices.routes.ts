@@ -9,6 +9,8 @@ import {
   deleteInvoice,
   postInvoiceToStock,
   unpostInvoiceStock,
+  updateInvoiceNote,
+
 } from "../services/invoices.service";
 
 const r = Router();
@@ -168,5 +170,13 @@ r.post(
     }
   }
 );
-
+r.patch("/:id/note", requireAuth, async (req, res, next) => {
+  try {
+    const note = (req.body?.note ?? "") as string;
+    const invoice = await updateInvoiceNote(req.params.id, note);
+    res.json(invoice);
+  } catch (err) {
+    next(err);
+  }
+});
 export default r;
