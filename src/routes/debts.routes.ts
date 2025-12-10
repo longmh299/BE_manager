@@ -5,8 +5,9 @@ import {
   getDebtsBySale,
   getDebtsSummaryBySale,
   updateDebtNote,
+          // ⬅️ thêm
 } from "../services/debts.service";
-import ExcelJS from "exceljs"; // ✅ dùng exceljs thay vì xlsx
+import ExcelJS from "exceljs";
 
 const r = Router();
 
@@ -17,7 +18,7 @@ r.get("/ping", (req, res) => {
 });
 
 /**
- * Bảng công nợ chi tiết theo sale
+ * Bảng công nợ chi tiết theo sale (từng dòng hàng)
  */
 r.get("/by-sale", async (req, res, next) => {
   try {
@@ -50,8 +51,7 @@ r.get("/summary-by-sale", async (req, res, next) => {
 });
 
 /**
- * ✅ Xuất Excel công nợ theo sale – có màu mè, format đẹp
- * GET /api/debts/by-sale/export?from=&to=&saleUserId=
+ * ✅ Xuất Excel công nợ theo sale – từng dòng hàng
  */
 r.get("/by-sale/export", async (req, res, next) => {
   try {
@@ -63,7 +63,7 @@ r.get("/by-sale/export", async (req, res, next) => {
 
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Cong_no", {
-      views: [{ state: "frozen", ySplit: 1 }], // freeze hàng tiêu đề
+      views: [{ state: "frozen", ySplit: 1 }],
     });
 
     const headers = [
@@ -80,7 +80,6 @@ r.get("/by-sale/export", async (req, res, next) => {
       "Ghi chú",
     ];
 
-    // Cột + width
     sheet.columns = [
       { header: headers[0], key: "date", width: 12 },
       { header: headers[1], key: "customerCode", width: 14 },
@@ -95,7 +94,6 @@ r.get("/by-sale/export", async (req, res, next) => {
       { header: headers[10], key: "note", width: 28 },
     ];
 
-    // Header row style
     const headerRow = sheet.getRow(1);
     headerRow.values = headers;
     headerRow.height = 20;
@@ -105,7 +103,7 @@ r.get("/by-sale/export", async (req, res, next) => {
       cell.fill = {
         type: "pattern",
         pattern: "solid",
-        fgColor: { argb: "FF2563EB" }, // xanh dương
+        fgColor: { argb: "FF2563EB" },
       };
       cell.border = {
         top: { style: "thin", color: { argb: "FFCBD5F5" } },
@@ -115,17 +113,14 @@ r.get("/by-sale/export", async (req, res, next) => {
       };
     });
 
-    // Number format & alignment cho cột số
     [5, 6, 7, 8, 9].forEach((colIdx) => {
       const col = sheet.getColumn(colIdx);
       col.alignment = { horizontal: "right" };
       if (colIdx >= 6 && colIdx <= 8) {
-        // Đơn giá / Thành tiền / Thanh toán / Nợ = tiền
         col.numFmt = "#,##0;[Red]-#,##0";
       }
     });
 
-    // Thêm data rows
     let totalAmount = 0;
     let totalPaid = 0;
     let totalDebt = 0;
@@ -155,7 +150,6 @@ r.get("/by-sale/export", async (req, res, next) => {
         r.note ?? "",
       ]);
 
-      // Zebra stripe: dòng chẵn lẻ khác màu
       const isOdd = (index + 1) % 2 === 1;
       row.eachCell((cell, colNumber) => {
         cell.border = {
@@ -173,19 +167,17 @@ r.get("/by-sale/export", async (req, res, next) => {
           cell.fill = {
             type: "pattern",
             pattern: "solid",
-            fgColor: { argb: "FFF9FAFB" }, // xám rất nhẹ
+            fgColor: { argb: "FFF9FAFB" },
           };
         }
       });
 
-      // tô đỏ nhẹ cho cột Nợ
       const debtCell = row.getCell(9);
       if (debt > 0) {
         debtCell.font = { color: { argb: "FFDC2626" }, bold: true };
       }
     });
 
-    // Hàng tổng cuối
     const totalRow = sheet.addRow([
       "",
       "",
@@ -205,7 +197,7 @@ r.get("/by-sale/export", async (req, res, next) => {
         bold: true,
         color:
           colNumber === 9
-            ? { argb: "FFB91C1C" } // đỏ hơn cho tổng nợ
+            ? { argb: "FFB91C1C" }
             : { argb: "FF111827" },
       };
       cell.alignment = {
@@ -224,12 +216,6 @@ r.get("/by-sale/export", async (req, res, next) => {
         right: { style: "thin", color: { argb: "FF9CA3AF" } },
       };
     });
-
-    // Auto filter trên header
-    // sheet.autoFilter = {
-    //   from: { row: 1, column: 1 },
-    //   to: { row: 1, column: headers.length },
-    // };
 
     const buf = await workbook.xlsx.writeBuffer();
 

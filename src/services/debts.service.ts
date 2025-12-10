@@ -12,8 +12,10 @@ export type DebtsBySaleParams = {
 export async function getDebtsBySale(params: DebtsBySaleParams) {
   const { from, to, saleUserId } = params;
 
+  // ✅ chỉ lấy hóa đơn bán hàng đã lưu tồn (có ít nhất 1 movement)
   const whereInvoice: any = {
     type: InvoiceType.SALES,
+    movements: { some: {} },
   };
 
   if (from || to) {
@@ -37,6 +39,8 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
       partner: true,
       saleUser: true,
       lines: true,
+      // không cần include movements, chỉ cần dùng trong where là đủ
+      // movements: true,
     },
   });
 
@@ -71,8 +75,8 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
         qty,
         unitPrice: price,
         amount,
-        paid: linePaid,       // ✅ đã thanh toán cho từng dòng
-        debt: lineDebt,       // ✅ nợ riêng từng dòng
+        paid: linePaid, // ✅ đã thanh toán cho từng dòng
+        debt: lineDebt, // ✅ nợ riêng từng dòng
         note: inv.note ?? "",
         saleUserId: inv.saleUserId ?? null,
         saleUserName:
@@ -95,8 +99,10 @@ export async function getDebtsSummaryBySale(
 ) {
   const { from, to } = params;
 
+  // ✅ tổng hợp cũng chỉ lấy hóa đơn đã lưu tồn
   const whereInvoice: any = {
     type: InvoiceType.SALES,
+    movements: { some: {} },
   };
 
   if (from || to) {

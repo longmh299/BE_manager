@@ -550,6 +550,7 @@ export async function linkMovement(invoiceId: string, movementId: string) {
 
 /** ========================= Posting ========================= **/
 
+// ✅ VERSION MỚI: bấm Lưu tồn lần nữa sẽ tự rollback movement cũ + post lại
 export async function postInvoiceToStock(
   invoiceId: string,
   warehouseId?: string
@@ -560,90 +561,150 @@ export async function postInvoiceToStock(
   });
   if (!invoice) throw new Error("Invoice not found");
 
-  // nếu đã có movement thì coi như đã post, bắt user hủy trước
-  if (invoice.movements.length > 0) {
-    throw new Error(
-      "Hóa đơn này đã được post tồn rồi. Nếu muốn sửa, hãy HỦY post tồn trước."
-    );
-  }
-
   const warehouse = await ensureWarehouse(warehouseId);
 
-  // desired theo invoice lines
-  const desiredRows = invoice.lines.map((l) => ({
-    itemId: l.itemId,
-    qty: desiredSignedQty(invoice.type, toNum(l.qty)),
-  }));
-  const desiredMap = sumByItem(desiredRows);
+  const hadMovementsBefore = invoice.movements.length > 0;
+  let createdInCount = 0;
+  let createdOutCount = 0;
 
-  const adjustIn: Array<{ itemId: string; qty: number; locationId: string }> =
-    [];
-  const adjustOut: Array<{ itemId: string; qty: number; locationId: string }> =
-    [];
+  await prisma.$transaction(async (tx) => {
+    // 1️⃣ Nếu đã có movement cũ => rollback tồn + xoá movement cũ
+    if (hadMovementsBefore) {
+      const effectMap = new Map<string, number>(); // itemId -> signed qty
 
-  for (const [itemId, d] of desiredMap.entries()) {
-    if (d > 0) adjustIn.push({ itemId, qty: d, locationId: warehouse.id });
-    if (d < 0)
-      adjustOut.push({ itemId, qty: Math.abs(d), locationId: warehouse.id });
-  }
+      for (const mv of invoice.movements) {
+        for (const ml of mv.lines) {
+          let signed = 0;
 
-  /**
-   * ================ CHẶN TỒN ÂM KHI HOÁ ĐƠN LÀ SALES =================
-   * - Chỉ check với hoá đơn BÁN HÀNG (SALES)
-   * - Với mỗi item OUT:
-   *    + Nếu tồn hiện tại <= 0  => báo "hết hàng"
-   *    + Nếu tồn hiện tại < qty => báo "không đủ tồn"
-   */
-  if (invoice.type === "SALES" && adjustOut.length) {
-    const itemIds = adjustOut.map((l) => l.itemId);
+          if (mv.type === "IN" && ml.toLocationId === warehouse.id) {
+            signed = +toNum(ml.qty);
+          } else if (
+            mv.type === "OUT" &&
+            ml.fromLocationId === warehouse.id
+          ) {
+            signed = -toNum(ml.qty);
+          } else if (mv.type === "ADJUST") {
+            if (ml.toLocationId === warehouse.id) {
+              signed = +toNum(ml.qty);
+            }
+            if (ml.fromLocationId === warehouse.id) {
+              signed = -toNum(ml.qty);
+            }
+          }
 
-    const [stocks, items] = await Promise.all([
-      prisma.stock.findMany({
-        where: {
-          locationId: warehouse.id,
-          itemId: { in: itemIds },
-        },
-      }),
-      prisma.item.findMany({
-        where: { id: { in: itemIds } },
-        select: { id: true, name: true, sku: true },
-      }),
-    ]);
+          if (signed !== 0) {
+            effectMap.set(
+              ml.itemId,
+              (effectMap.get(ml.itemId) || 0) + signed
+            );
+          }
+        }
+      }
 
-    const stockMap = new Map<string, number>();
-    stocks.forEach((s) => {
-      stockMap.set(s.itemId, toNum(s.qty));
-    });
+      // rollback stock: delta = -signed
+      for (const [itemId, signed] of effectMap.entries()) {
+        if (signed === 0) continue;
+        const delta = -signed;
 
-    const nameMap = new Map<string, string>();
-    items.forEach((it) => {
-      nameMap.set(it.id, it.name || it.sku || it.id);
-    });
+        await tx.stock.upsert({
+          where: {
+            itemId_locationId: { itemId, locationId: warehouse.id },
+          },
+          create: {
+            itemId,
+            locationId: warehouse.id,
+            qty: new Prisma.Decimal(delta),
+          },
+          update: {
+            qty: { increment: new Prisma.Decimal(delta) },
+          },
+        });
+      }
 
-    const errors: string[] = [];
-
-    for (const l of adjustOut) {
-      const current = stockMap.get(l.itemId) ?? 0;
-      const name = nameMap.get(l.itemId) ?? l.itemId;
-
-      if (current <= 0) {
-        errors.push(`Sản phẩm "${name}" đã hết hàng trong kho.`);
-      } else if (current < l.qty) {
-        errors.push(
-          `Sản phẩm "${name}" không đủ tồn kho (còn ${current}, cần ${l.qty}).`
-        );
+      // xoá movementLine + movement cũ
+      const mvIds = invoice.movements.map((m) => m.id);
+      if (mvIds.length) {
+        await tx.movementLine.deleteMany({
+          where: { movementId: { in: mvIds } },
+        });
+        await tx.movement.deleteMany({ where: { id: { in: mvIds } } });
       }
     }
 
-    if (errors.length) {
-      // lỗi business, statusCode = 400 => routes/error middleware có thể trả JSON đẹp cho FE
-      throw httpError(400, errors.join(" "));
-    }
-  }
-  // ========================= END CHECK ========================= //
+    // 2️⃣ Tính lại ảnh hưởng cần ghi theo các dòng hiện tại của hoá đơn
+    const desiredRows = invoice.lines.map((l) => ({
+      itemId: l.itemId,
+      qty: desiredSignedQty(invoice.type, toNum(l.qty)),
+    }));
+    const desiredMap = sumByItem(desiredRows);
 
-  // tạo movement IN / OUT và update stock trong transaction
-  await prisma.$transaction(async (tx) => {
+    const adjustIn: Array<{ itemId: string; qty: number; locationId: string }> =
+      [];
+    const adjustOut: Array<{ itemId: string; qty: number; locationId: string }> =
+      [];
+
+    for (const [itemId, d] of desiredMap.entries()) {
+      if (d > 0) adjustIn.push({ itemId, qty: d, locationId: warehouse.id });
+      if (d < 0)
+        adjustOut.push({
+          itemId,
+          qty: Math.abs(d),
+          locationId: warehouse.id,
+        });
+    }
+
+    createdInCount = adjustIn.length;
+    createdOutCount = adjustOut.length;
+
+    // 3️⃣ CHẶN TỒN ÂM VỚI HÓA ĐƠN BÁN HÀNG (SALES)
+    if (invoice.type === "SALES" && adjustOut.length) {
+      const itemIds = adjustOut.map((l) => l.itemId);
+
+      const [stocks, items] = await Promise.all([
+        tx.stock.findMany({
+          where: {
+            locationId: warehouse.id,
+            itemId: { in: itemIds },
+          },
+        }),
+        tx.item.findMany({
+          where: { id: { in: itemIds } },
+          select: { id: true, name: true, sku: true },
+        }),
+      ]);
+
+      const stockMap = new Map<string, number>();
+      stocks.forEach((s) => {
+        stockMap.set(s.itemId, toNum(s.qty));
+      });
+
+      const nameMap = new Map<string, string>();
+      items.forEach((it) => {
+        nameMap.set(it.id, it.name || it.sku || it.id);
+      });
+
+      const errors: string[] = [];
+
+      for (const l of adjustOut) {
+        const current = stockMap.get(l.itemId) ?? 0;
+        const name = nameMap.get(l.itemId) ?? l.itemId;
+
+        if (current <= 0) {
+          errors.push(`Sản phẩm "${name}" đã hết hàng trong kho.`);
+        } else if (current < l.qty) {
+          errors.push(
+            `Sản phẩm "${name}" không đủ tồn kho (còn ${current}, cần ${l.qty}).`
+          );
+        }
+      }
+
+      if (errors.length) {
+        // lỗi business, sẽ bị rollback toàn bộ transaction
+        throw httpError(400, errors.join(" "));
+      }
+    }
+
+    // 4️⃣ Tạo movement mới + cập nhật tồn
     if (adjustIn.length) {
       await tx.movement.create({
         data: {
@@ -663,7 +724,10 @@ export async function postInvoiceToStock(
       for (const l of adjustIn) {
         await tx.stock.upsert({
           where: {
-            itemId_locationId: { itemId: l.itemId, locationId: l.locationId },
+            itemId_locationId: {
+              itemId: l.itemId,
+              locationId: l.locationId,
+            },
           },
           create: {
             itemId: l.itemId,
@@ -694,7 +758,10 @@ export async function postInvoiceToStock(
       for (const l of adjustOut) {
         await tx.stock.upsert({
           where: {
-            itemId_locationId: { itemId: l.itemId, locationId: l.locationId },
+            itemId_locationId: {
+              itemId: l.itemId,
+              locationId: l.locationId,
+            },
           },
           create: {
             itemId: l.itemId,
@@ -707,7 +774,11 @@ export async function postInvoiceToStock(
     }
   });
 
-  return { firstPost: true, adjustIn: adjustIn.length, adjustOut: adjustOut.length };
+  return {
+    firstPost: !hadMovementsBefore,
+    adjustIn: createdInCount,
+    adjustOut: createdOutCount,
+  };
 }
 
 /**
