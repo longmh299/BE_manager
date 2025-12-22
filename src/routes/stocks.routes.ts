@@ -7,9 +7,14 @@ import * as XLSX from "xlsx";
 const r = Router();
 r.use(requireAuth);
 
+// ✅ tránh 304 cache -> đôi khi browser báo CORS error dù BE vẫn chạy
+r.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
 /**
  * GET /stocks?q=&itemId=&locationId=&kind=&page=&pageSize=
- * Trả về danh sách tồn chi tiết theo kho (kèm item, location)
  */
 r.get("/", async (req, res, next) => {
   try {
@@ -35,7 +40,6 @@ r.get("/", async (req, res, next) => {
 
 /**
  * GET /stocks/export?q=&itemId=&locationId=&kind=
- * Xuất danh sách tồn (chi tiết theo kho) ra Excel
  */
 r.get("/export", async (req, res, next) => {
   try {
@@ -53,9 +57,10 @@ r.get("/export", async (req, res, next) => {
     const excelRows = rows.map((s: any) => ({
       sku: s.item?.sku ?? "",
       name: s.item?.name ?? "",
-      unit: s.item?.unit ?? "",
+      unit: s.item?.unit?.code ?? "pcs",
       location: s.location?.code ?? "",
       qty: (s.qty as any)?.toString?.() ?? "0",
+      avgCost: (s.avgCost as any)?.toString?.() ?? "0",
     }));
 
     const ws = XLSX.utils.json_to_sheet(excelRows);
@@ -63,13 +68,10 @@ r.get("/export", async (req, res, next) => {
     XLSX.utils.book_append_sheet(wb, ws, "Stocks");
     const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="stocks.xlsx"',
-    );
+    res.setHeader("Content-Disposition", 'attachment; filename="stocks.xlsx"');
     res.setHeader(
       "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
     res.send(buf);
   } catch (e) {
@@ -79,8 +81,6 @@ r.get("/export", async (req, res, next) => {
 
 /**
  * GET /stocks/summary-by-item?q=&kind=&page=&pageSize=
- * Tổng hợp tồn theo item (gộp nhiều kho, có phân trang)
- *  - kind: MACHINE | PART (tuỳ chọn)
  */
 r.get("/summary-by-item", async (req, res, next) => {
   try {
@@ -104,7 +104,6 @@ r.get("/summary-by-item", async (req, res, next) => {
 
 /**
  * GET /stocks/summary-by-item/export?q=&kind=
- * Xuất bảng tổng hợp tồn theo item ra Excel
  */
 r.get("/summary-by-item/export", async (req, res, next) => {
   try {
@@ -114,7 +113,7 @@ r.get("/summary-by-item/export", async (req, res, next) => {
       q: q || undefined,
       kind: (kind as any) || undefined,
       page: 1,
-      pageSize: 10_000, // lấy max cho export
+      pageSize: 10_000,
     });
 
     const exportRows = rows.map((r: any) => ({
@@ -122,9 +121,10 @@ r.get("/summary-by-item/export", async (req, res, next) => {
       name: r.name ?? "",
       unit: r.unit ?? "",
       kind: r.kind ?? "",
-      sellPrice:
-        r.sellPrice == null ? "" : (r.sellPrice as any)?.toString?.() ?? "",
+      sellPrice: r.sellPrice == null ? "" : (r.sellPrice as any)?.toString?.() ?? "",
       totalQty: (r.totalQty as any)?.toString?.() ?? "0",
+      avgCost: r.avgCost == null ? "" : String(r.avgCost),
+      stockValue: r.stockValue == null ? "" : String(r.stockValue),
     }));
 
     const ws = XLSX.utils.json_to_sheet(exportRows);
@@ -134,11 +134,11 @@ r.get("/summary-by-item/export", async (req, res, next) => {
 
     res.setHeader(
       "Content-Disposition",
-      'attachment; filename="stocks_summary_by_item.xlsx"',
+      'attachment; filename="stocks_summary_by_item.xlsx"'
     );
     res.setHeader(
       "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
     res.send(buf);
   } catch (e) {

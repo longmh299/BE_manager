@@ -5,13 +5,38 @@ import {
   getDebtsBySale,
   getDebtsSummaryBySale,
   updateDebtNote,
-          // ⬅️ thêm
 } from "../services/debts.service";
 import ExcelJS from "exceljs";
 
 const r = Router();
 
 r.use(requireAuth);
+
+function getUserId(req: any): string | undefined {
+  return req.user?.id || req.userId;
+}
+
+function getUserRole(req: any): string | undefined {
+  return req.user?.role || req.userRole;
+}
+
+function buildAuditMeta(req: any) {
+  return {
+    ip: req.ip,
+    userAgent: req.headers?.["user-agent"],
+    path: req.originalUrl || req.url,
+    method: req.method,
+  };
+}
+
+function requireUserOr401(req: any, res: any) {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(401).json({ ok: false, message: "Chưa đăng nhập." });
+    return null;
+  }
+  return { userId, userRole: getUserRole(req) };
+}
 
 r.get("/ping", (req, res) => {
   res.json({ ok: true, route: "debts", message: "debts router is mounted" });
@@ -113,10 +138,12 @@ r.get("/by-sale/export", async (req, res, next) => {
       };
     });
 
+    // ✅ FIX: format số tới cột 9 (Nợ) luôn
     [5, 6, 7, 8, 9].forEach((colIdx) => {
       const col = sheet.getColumn(colIdx);
       col.alignment = { horizontal: "right" };
-      if (colIdx >= 6 && colIdx <= 8) {
+      // cột 6-9 là các cột tiền/đơn giá/paid/debt
+      if (colIdx >= 6 && colIdx <= 9) {
         col.numFmt = "#,##0;[Red]-#,##0";
       }
     });
@@ -125,29 +152,29 @@ r.get("/by-sale/export", async (req, res, next) => {
     let totalPaid = 0;
     let totalDebt = 0;
 
-    rows.forEach((r: any, index: number) => {
-      const qty = Number(r.qty ?? 0);
-      const unitPrice = Number(r.unitPrice ?? 0);
-      const amount = Number(r.amount ?? 0);
-      const paid = Number(r.paid ?? 0);
-      const debt = Number(r.debt ?? 0);
+    rows.forEach((r0: any, index: number) => {
+      const qty = Number(r0.qty ?? 0);
+      const unitPrice = Number(r0.unitPrice ?? 0);
+      const amount = Number(r0.amount ?? 0);
+      const paid = Number(r0.paid ?? 0);
+      const debt = Number(r0.debt ?? 0);
 
       totalAmount += amount;
       totalPaid += paid;
       totalDebt += debt;
 
       const row = sheet.addRow([
-        r.date,
-        r.customerCode,
-        r.customerName,
-        r.itemName,
+        r0.date,
+        r0.customerCode,
+        r0.customerName,
+        r0.itemName,
         qty,
         unitPrice,
         amount,
         paid,
         debt,
-        r.saleUserName ?? "",
-        r.note ?? "",
+        r0.saleUserName ?? "",
+        r0.note ?? "",
       ]);
 
       const isOdd = (index + 1) % 2 === 1;
@@ -160,8 +187,7 @@ r.get("/by-sale/export", async (req, res, next) => {
         };
         cell.alignment = {
           vertical: "middle",
-          horizontal:
-            colNumber >= 5 && colNumber <= 9 ? "right" : "left",
+          horizontal: colNumber >= 5 && colNumber <= 9 ? "right" : "left",
         };
         if (isOdd) {
           cell.fill = {
@@ -195,10 +221,7 @@ r.get("/by-sale/export", async (req, res, next) => {
     totalRow.eachCell((cell, colNumber) => {
       cell.font = {
         bold: true,
-        color:
-          colNumber === 9
-            ? { argb: "FFB91C1C" }
-            : { argb: "FF111827" },
+        color: colNumber === 9 ? { argb: "FFB91C1C" } : { argb: "FF111827" },
       };
       cell.alignment = {
         vertical: "middle",
@@ -234,13 +257,22 @@ r.get("/by-sale/export", async (req, res, next) => {
 });
 
 /**
- * Lưu ghi chú công nợ
+ * Lưu ghi chú công nợ (MUTATE → CÓ AUDIT)
  */
 r.patch("/:invoiceId/note", async (req, res, next) => {
   try {
     const { invoiceId } = req.params;
     const { note } = req.body as { note?: string };
-    const updated = await updateDebtNote(invoiceId, note ?? "");
+
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
+
+    const updated = await updateDebtNote(invoiceId, note ?? "", {
+      userId: audit.userId,
+      userRole: audit.userRole,
+      meta: buildAuditMeta(req),
+    });
+
     res.json({ ok: true, data: updated });
   } catch (err) {
     next(err);

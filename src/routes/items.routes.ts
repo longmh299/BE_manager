@@ -2,16 +2,17 @@
 import { Router } from "express";
 import multer from "multer";
 import * as XLSX from "xlsx";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 
-import { requireAuth, requireRole } from "../middlewares/auth";
+import { requireAuth, requireRole, getUser } from "../middlewares/auth";
 import {
   listItems,
   createItem,
   updateItem,
+  updateItemMaster,
   removeItem,
 } from "../services/items.service";
-import { importItemsFromBuffer } from "../services/import.service";
+import { importItemsFromBuffer } from "../services/items_import.service";
 
 const r = Router();
 const prisma = new PrismaClient();
@@ -19,20 +20,25 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 r.use(requireAuth);
 
+function friendlyPrismaError(e: any) {
+  if (e instanceof Prisma.PrismaClientKnownRequestError) {
+    if (e.code === "P2002") {
+      const target = (e.meta as any)?.target;
+      if (Array.isArray(target) && target.includes("name")) {
+        const err: any = new Error("Tên sản phẩm đã tồn tại");
+        err.statusCode = 409;
+        return err;
+      }
+      const err: any = new Error("Dữ liệu bị trùng (unique constraint)");
+      err.statusCode = 409;
+      return err;
+    }
+  }
+  return e;
+}
+
 /**
- * GET /items?q=&page=&pageSize=
- * => trả về:
- * {
- *   ok: true,
- *   items: Item[],   // dùng cho autocomplete, item tổng...
- *   data: Item[],    // alias, để các chỗ cũ dùng res.data.data vẫn chạy
- *   total,
- *   page,
- *   pageSize
- * }
- *
- * listItems ở service KHÔNG filter theo kind,
- * nên kết quả đã bao gồm cả máy lẫn linh kiện.
+ * GET /api/items?q=&page=&pageSize=
  */
 r.get("/", async (req, res, next) => {
   try {
@@ -41,12 +47,14 @@ r.get("/", async (req, res, next) => {
     const pageNum = Number(page) || 1;
     const pageSizeNum = Number(pageSize) || 20;
 
-    const { data, total } = await listItems(q, pageNum, pageSizeNum);
+    // ✅ truyền actor để admin thấy price nếu FE cần
+    const actor = getUser(req);
+    const { data, total } = await listItems(q, pageNum, pageSizeNum, actor);
 
     res.json({
       ok: true,
-      items: data,       // 👈 FE autocomplete / item tổng dùng cái này
-      data,              // 👈 alias cho các màn cũ (nếu có) đang dùng res.data.data
+      items: data,
+      data,
       total,
       page: pageNum,
       pageSize: pageSizeNum,
@@ -56,27 +64,58 @@ r.get("/", async (req, res, next) => {
   }
 });
 
-/** POST /items (accountant|admin) */
+/**
+ * GET /api/items/units
+ * - dropdown đơn vị tính
+ */
+r.get("/units", async (_req, res, next) => {
+  try {
+    const units = await prisma.unit.findMany({
+      orderBy: { name: "asc" },
+      select: { id: true, code: true, name: true, note: true },
+    });
+    res.json({ ok: true, data: units });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/** POST /api/items (accountant|admin) */
 r.post("/", requireRole("accountant", "admin"), async (req, res, next) => {
   try {
-    const created = await createItem(req.body);
+    const actor = getUser(req);
+    const created = await createItem(req.body, actor);
     res.json({ ok: true, data: created });
   } catch (e) {
-    next(e);
+    next(friendlyPrismaError(e));
   }
 });
 
-/** PUT /items/:id (accountant|admin) */
-r.put("/:id", requireRole("accountant", "admin"), async (req, res, next) => {
+/**
+ * PATCH /api/items/:id/master (admin-only)
+ * - dành riêng cho UI admin sửa nhanh name + unit
+ */
+r.patch("/:id/master", requireRole("admin"), async (req, res, next) => {
   try {
-    const updated = await updateItem(req.params.id, req.body);
+    const updated = await updateItemMaster(req.params.id, req.body);
     res.json({ ok: true, data: updated });
   } catch (e) {
-    next(e);
+    next(friendlyPrismaError(e));
   }
 });
 
-/** DELETE /items/:id (admin) */
+/** PUT /api/items/:id (accountant|admin) */
+r.put("/:id", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const actor = getUser(req);
+    const updated = await updateItem(req.params.id, req.body, actor);
+    res.json({ ok: true, data: updated });
+  } catch (e) {
+    next(friendlyPrismaError(e));
+  }
+});
+
+/** DELETE /api/items/:id (admin) */
 r.delete("/:id", requireRole("admin"), async (req, res, next) => {
   try {
     const del = await removeItem(req.params.id);
@@ -88,7 +127,7 @@ r.delete("/:id", requireRole("admin"), async (req, res, next) => {
 
 /**
  * IMPORT items (xlsx/csv) (accountant|admin)
- * Cột hỗ trợ: sku|skud|mahang|code, name, unit?, price?, sellPrice?, note?, kind?
+ * Postman: form-data key = file
  */
 r.post(
   "/import",
@@ -96,11 +135,11 @@ r.post(
   upload.single("file"),
   async (req, res, next) => {
     try {
-      const file = (req as any).file as { buffer: Buffer } | undefined;
+      const file = req.file;
       if (!file) throw new Error('Missing file field "file"');
 
       const result = await importItemsFromBuffer(file.buffer);
-      res.json({ ok: true, ...result });
+      res.json(result);
     } catch (e) {
       next(e);
     }
@@ -108,44 +147,40 @@ r.post(
 );
 
 /** EXPORT items (xlsx) (accountant|admin) */
-r.get(
-  "/export",
-  requireRole("accountant", "admin"),
-  async (_req, res, next) => {
-    try {
-      const items = await prisma.item.findMany({
-        orderBy: { createdAt: "desc" },
-      });
+r.get("/export", requireRole("accountant", "admin"), async (_req, res, next) => {
+  try {
+    const items = await prisma.item.findMany({
+      orderBy: { createdAt: "desc" },
+      include: { unit: true },
+    });
 
-      const data = items.map((i) => ({
-        sku: i.sku,
-        name: i.name,
-        unit: i.unit,
-        price: i.price.toString(),
-        sellPrice: (i.sellPrice as any)?.toString?.() ?? "0",
-        note: i.note ?? "",
-        // nếu đã thêm cột kind trong Prisma thì có thể ghi thêm:
-        // kind: (i as any).kind ?? '',
-      }));
+    const data = items.map((i) => ({
+      sku: i.sku,
+      name: i.name,
+      unitCode: i.unit?.code ?? "",
+      unitName: i.unit?.name ?? "",
+      unitId: i.unitId,
+      price: i.price?.toString?.() ?? "0",
+      sellPrice: (i.sellPrice as any)?.toString?.() ?? "0",
+      note: i.note ?? "",
+      kind: (i as any).kind ?? "",
+      isSerialized: (i as any).isSerialized ?? false,
+    }));
 
-      const ws = XLSX.utils.json_to_sheet(data);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Items");
-      const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Items");
+    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 
-      res.setHeader(
-        "Content-Disposition",
-        'attachment; filename="items.xlsx"'
-      );
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      );
-      res.send(buf);
-    } catch (e) {
-      next(e);
-    }
+    res.setHeader("Content-Disposition", 'attachment; filename="items.xlsx"');
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.send(buf);
+  } catch (e) {
+    next(e);
   }
-);
+});
 
 export default r;

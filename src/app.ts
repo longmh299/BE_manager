@@ -20,7 +20,12 @@ import machinesRoutes from './routes/machines.routes';
 import locksRoutes from './routes/locks.routes';
 import paymentsRoutes from './routes/payments.routes';
 import debtsRoutes from './routes/debts.routes';
-
+import paymentAccountsRoutes from './routes/paymentAccounts.routes';
+import revenueRoutes from './routes/revenue.routes';
+import receivablesReportRoute from'./routes/receivables_report.route';
+import { errorHandler } from './middlewares/errorHandler';
+import meSalesDashboardRoutes from'./routes/me_sales_dashboard.routes'
+import auditLogsRouter from'./routes/auditLogs.routes'
 const app = express();
 
 // ================== CORS CONFIG (đơn giản) ==================
@@ -65,6 +70,7 @@ app.use((req, _res, next) => {
   next();
 });
 
+
 // ==== API v1 (prefix /api) ====
 const api = Router();
 
@@ -81,12 +87,18 @@ api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
 api.use('/reports', reportsRouter);
 api.use('/locks', locksRoutes);
+api.use("/payment-accounts", paymentAccountsRoutes);
 
 // 2 router này bạn đang mount trực tiếp, giữ nguyên
 app.use('/api/users', usersRoutes);
 app.use('/api/machines', machinesRoutes);
 app.use("/api/payments", paymentsRoutes);
 app.use("/api/debts", debtsRoutes);
+app.use("/api/revenue", revenueRoutes);
+app.use("/api/receivables_report", receivablesReportRoute);
+app.use("/api/me", meSalesDashboardRoutes);
+app.use("/api/audit-logs", auditLogsRouter);
+
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
 
@@ -125,5 +137,5 @@ app.use((err: any, _req: any, res: any, _next: any) => {
 app.use((_req, res) =>
   res.status(404).json({ ok: false, message: 'Not found' })
 );
-
+app.use(errorHandler);
 export default app;

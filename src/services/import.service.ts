@@ -1,41 +1,77 @@
-// import.service.ts
-import * as XLSX from 'xlsx';
-import { PrismaClient } from '@prisma/client';
+// src/services/import.service.ts
+import * as XLSX from "xlsx";
+import { PrismaClient } from "@prisma/client";
+import { importOpeningFromExcelBuffer } from "./stocks_import.service";
+
 const prisma = new PrismaClient();
 
-export async function importItemsFromBuffer(buf: Buffer) {
-  const wb = XLSX.read(buf, { type: 'buffer' });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json<any>(ws, { defval: '' });
+/**
+ * IMPORT OPENING STOCK (TỒN ĐẦU)
+ * - tạo ImportBatch
+ * - gọi core importer (stocks_import.service)
+ * - ghi ImportLog cho các dòng warning (nếu có)
+ *
+ * Dùng cho:
+ *  - upload Excel tồn đầu
+ *  - audit / trace lịch sử import
+ */
+export async function importOpeningStockExcel(
+  buf: Buffer,
+  fileName?: string
+) {
+  // 1️⃣ tạo batch
+  const batchId = `OPENING-${Date.now()}`;
 
-  const results: any[] = [];
-  for (const r of rows) {
-    const sku = String(r.sku || r.SKU || '').trim();
-    const name = String(r.name || r.ten || '').trim();
-    if (!sku || !name) continue;
+  await prisma.importBatch.create({
+    data: {
+      batchId,
+      fileName: fileName ?? null,
+      notes: "OPENING STOCK IMPORT (items + opening qty + base cost)",
+    },
+  });
 
-    const unit = String(r.unit || 'pcs').trim();
-    const price = String(r.price || '0').trim();
-    const note = String(r.note || '').trim();
+  // 2️⃣ gọi core importer
+  const result = await importOpeningFromExcelBuffer(buf, {
+    mode: "replace",
+    batchId,
+  });
 
-    // 🔁 ĐỔI LOGIC: check tồn tại theo name (không dùng sku unique nữa)
-    const existing = await prisma.item.findFirst({
-      where: { name },
+  // 3️⃣ ghi warning (KHÔNG fail import)
+  if (result.warningRows && result.warningRows.length > 0) {
+    await prisma.importLog.createMany({
+      data: result.warningRows.map((w) => ({
+        batchId,
+        rowIndex: w.row, // row excel (1-based)
+        status: "SKIPPED",
+        message: w.message,
+      })),
     });
-
-    let up;
-    if (existing) {
-      up = await prisma.item.update({
-        where: { id: existing.id },
-        data: { sku, unit, price, note },
-      });
-    } else {
-      up = await prisma.item.create({
-        data: { sku, name, unit, price, note },
-      });
-    }
-
-    results.push({ sku: up.sku, id: up.id });
   }
-  return { count: results.length, items: results };
+
+  // 4️⃣ trả kết quả
+  return {
+    ok: true,
+    batchId,
+    summary: result.summary,
+    warningCount: result.warningRows?.length ?? 0,
+  };
+}
+
+/**
+ * (OPTIONAL)
+ * IMPORT OPENING từ CSV (convert → Excel buffer)
+ * dùng chung logic, không copy code
+ */
+export async function importOpeningStockCsv(
+  csvText: string,
+  fileName?: string
+) {
+  if (!csvText.trim()) {
+    throw new Error("Empty CSV content");
+  }
+
+  const wb = XLSX.read(csvText, { type: "string" });
+  const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+
+  return importOpeningStockExcel(buf, fileName);
 }

@@ -15,10 +15,17 @@ enum UserRole {
   admin
 }
 
+enum InvoiceStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
 enum PaymentStatus {
-  UNPAID // Chưa thanh toán
-  PARTIAL // Thanh toán một phần
-  PAID // Đã thanh toán đủ
+  UNPAID
+  PARTIAL
+  PAID
 }
 
 enum MovementType {
@@ -31,17 +38,32 @@ enum MovementType {
 enum InvoiceType {
   PURCHASE
   SALES
+  PURCHASE_RETURN
+  SALES_RETURN
 }
 
 enum PaymentType {
-  RECEIPT // Phiếu thu - khách trả tiền cho mình
-  PAYMENT // Phiếu chi - mình trả tiền cho nhà cung cấp
+  RECEIPT
+  PAYMENT
 }
 
-// ✅ NEW: Phân loại hàng hóa
 enum ItemKind {
-  PART // linh kiện
-  MACHINE // máy móc bán hàng
+  PART
+  MACHINE
+}
+
+// ✅ NEW: loại tài khoản tiền
+enum AccountType {
+  CASH
+  BANK
+  EWALLET
+  OTHER
+}
+
+// ✅ NEW: phân loại khoản phân bổ thanh toán
+enum AllocationKind {
+  NORMAL        // thu/chi bình thường
+  WARRANTY_HOLD // thu/chi phần giữ lại bảo hành
 }
 
 // ============== Auth / Users ==============
@@ -56,9 +78,10 @@ model User {
   sessions           Session[]
   auditLogs          AuditLog[]
   deviceTok          DeviceToken[]
-  salesInvoices      Invoice[]     @relation("InvoiceSaleUser")
-  technicianInvoices Invoice[]     @relation("InvoiceTechUser")
-  createdPayments    Payment[]     @relation("UserCreatedPayments")
+  salesInvoices      Invoice[] @relation("InvoiceSaleUser")
+  technicianInvoices Invoice[] @relation("InvoiceTechUser")
+  approvedInvoices   Invoice[] @relation("InvoiceApprovedBy")
+  createdPayments    Payment[] @relation("UserCreatedPayments")
 }
 
 model Session {
@@ -86,38 +109,58 @@ model Location {
 
   stocks           Stock[]
   assetAssignments AssetAssignment[]
-  fromLines        MovementLine[]    @relation("FromLocation")
-  toLines          MovementLine[]    @relation("ToLocation")
+  fromLines        MovementLine[] @relation("FromLocation")
+  toLines          MovementLine[] @relation("ToLocation")
   stockCounts      StockCount[]
 
-  // ✅ NEW: nếu dùng serial và muốn biết serial đang nằm ở kho nào
-  itemSerials ItemSerial[]
+  itemSerials     ItemSerial[]
+  stockSnapshots  StockSnapshot[]
+  monthlyAvgCosts MonthlyAvgCost[]
+}
+
+// ✅ NEW: Đơn vị tính
+model Unit {
+  id        String   @id @default(cuid())
+  code      String   @unique // pcs, pair, m, kg...
+  name      String // Cái, Cặp, Mét...
+  note      String?
+  createdAt DateTime @default(now())
+
+  items Item[]
 }
 
 model Item {
-  id        String   @id @default(cuid())
-  sku       String
-  name      String   @unique
-  unit      String   @default("pcs")
-  price     Decimal  @db.Decimal(18, 2)
-  sellPrice Decimal  @default(0) @db.Decimal(18, 2)
+  id   String @id @default(cuid())
+  sku  String
+  name String @unique
+
+  // ✅ NEW: unit theo bảng Unit
+  unitId String
+  unit   Unit   @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  // price = giá vốn gốc (PRIVATE: chỉ admin xem ở API)
+  price     Decimal @db.Decimal(18, 2)
+  // sellPrice = giá bán gợi ý (có thể có/không)
+  sellPrice Decimal @default(0) @db.Decimal(18, 2)
+
   note      String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // ✅ NEW: phân loại & cờ quản lý serial
   kind         ItemKind @default(PART)
   isSerialized Boolean  @default(false)
 
   stocks       Stock[]
   moveLines    MovementLine[]
   countLines   StockCountLine[]
-  invoiceLines InvoiceLine[]    @relation("ItemToInvoiceLines")
+  invoiceLines InvoiceLine[] @relation("ItemToInvoiceLines")
 
-  // ✅ NEW: danh sách serial nếu là máy móc
-  serials      ItemSerial[]
-  machineParts MachinePart[] @relation("ItemMachineParts")
+  serials         ItemSerial[]
+  machineParts    MachinePart[] @relation("ItemMachineParts")
+  stockSnapshots  StockSnapshot[]
+  monthlyAvgCosts MonthlyAvgCost[]
 
+  @@index([unitId])
   @@index([kind])
   @@index([isSerialized])
 }
@@ -126,6 +169,7 @@ model Stock {
   itemId     String
   locationId String
   qty        Decimal  @db.Decimal(18, 3)
+  avgCost    Decimal  @default(0) @db.Decimal(18, 4)
   updatedAt  DateTime @updatedAt
 
   item     Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
@@ -136,13 +180,12 @@ model Stock {
   @@index([itemId])
 }
 
-// ✅ NEW: Serial cho máy móc (tuỳ chọn dùng)
 model ItemSerial {
   id         String   @id @default(cuid())
   itemId     String
   serialNo   String   @unique
-  status     String   @default("in_stock") // in_stock | reserved | sold | rma | ...
-  locationId String? // serial đang nằm ở kho nào (nếu muốn theo dõi)
+  status     String   @default("in_stock")
+  locationId String?
   note       String?
   createdAt  DateTime @default(now())
 
@@ -194,7 +237,6 @@ model Movement {
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
 
-  // Link hóa đơn (tùy chọn)
   invoiceId String?
   invoice   Invoice? @relation(fields: [invoiceId], references: [id])
 
@@ -205,18 +247,19 @@ model Movement {
 }
 
 model MovementLine {
-  id             String  @id @default(cuid())
+  id             String   @id @default(cuid())
   movementId     String
   itemId         String
   fromLocationId String?
   toLocationId   String?
-  qty            Decimal @db.Decimal(18, 3)
+  qty            Decimal  @db.Decimal(18, 3)
+  unitCost       Decimal? @db.Decimal(18, 4)
+  costTotal      Decimal? @db.Decimal(18, 4)
   note           String?
 
   movement Movement @relation(fields: [movementId], references: [id])
   item     Item     @relation(fields: [itemId], references: [id])
 
-  // MUST BE OPTIONAL because fromLocationId/toLocationId are optional
   fromLoc Location? @relation("FromLocation", fields: [fromLocationId], references: [id])
   toLoc   Location? @relation("ToLocation", fields: [toLocationId], references: [id])
 
@@ -232,7 +275,7 @@ model StockCount {
   locationId String
   refNo      String   @unique
   note       String?
-  status     String   @default("draft") // draft | posted
+  status     String   @default("draft")
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
@@ -253,7 +296,7 @@ model StockCountLine {
   @@index([itemId])
 }
 
-//============== Partner (NEW) ==============
+//============== Partner ==============
 model Partner {
   id        String   @id @default(cuid())
   code      String?  @unique
@@ -262,48 +305,63 @@ model Partner {
   phone     String?  @db.VarChar(20)
   email     String?
   address   String?
-  type      String   @default("customer") // customer | supplier | both
+  type      String   @default("customer")
   note      String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  payments Payment[] // <== THÊM DÒNG NÀY
+  payments Payment[]
   invoices Invoice[]
 }
 
-//============== Invoices (hóa đơn) ==============
+//============== Invoices ==============
 model Invoice {
   id        String      @id @default(cuid())
   code      String      @unique
   type      InvoiceType
   issueDate DateTime
 
-  // Liên kết đối tác (tùy chọn)
   partnerId String?
   partner   Partner? @relation(fields: [partnerId], references: [id])
 
-  // === Người phụ trách theo hóa đơn (không liên quan role) ===
   saleUserId String?
   saleUser   User?   @relation("InvoiceSaleUser", fields: [saleUserId], references: [id])
 
   techUserId String?
   techUser   User?   @relation("InvoiceTechUser", fields: [techUserId], references: [id])
 
-  // (tuỳ chọn) snapshot tên để report nhanh
+  // ✅ tài khoản gắn vào hoá đơn (phân loại doanh thu theo TK)
+  receiveAccountId String?
+  receiveAccount   PaymentAccount? @relation("InvoiceReceiveAccount", fields: [receiveAccountId], references: [id], onDelete: SetNull)
+
   saleUserName String?
   techUserName String?
-  // Snapshot đóng băng tại thời điểm xuất hóa đơn
+
   partnerName  String?
   partnerTax   String?
   partnerPhone String?
   partnerAddr  String?
+  partnerCode  String?
 
-  currency   String  @default("VND")
-  subtotal   Decimal @default(0) @db.Decimal(18, 2)
-  tax        Decimal @default(0) @db.Decimal(18, 2)
-  total      Decimal @default(0) @db.Decimal(18, 2)
+  currency   String   @default("VND")
+  subtotal   Decimal  @default(0) @db.Decimal(18, 2)
+  tax        Decimal  @default(0) @db.Decimal(18, 2)
+  total      Decimal  @default(0) @db.Decimal(18, 2)
+  totalCost  Decimal? @db.Decimal(18, 2) // admin-only in API
   note       String?
   attachment String?
+
+  refInvoiceId String?
+
+  // ===== Warranty hold (giữ lại bảo hành) =====
+  hasWarrantyHold     Boolean  @default(false)
+  warrantyHoldPct     Decimal  @default(0) @db.Decimal(5, 2)    // VD: 5.00
+  warrantyHoldAmount  Decimal  @default(0) @db.Decimal(18, 2)   // số tiền bị treo
+  warrantyDueDate     DateTime?
+
+  approvedById String?
+  approvedBy   User?     @relation("InvoiceApprovedBy", fields: [approvedById], references: [id])
+  approvedAt   DateTime?
 
   movements Movement[]
   lines     InvoiceLine[]
@@ -311,21 +369,47 @@ model Invoice {
   createdAt     DateTime            @default(now())
   updatedAt     DateTime            @updatedAt
   paymentStatus PaymentStatus       @default(UNPAID)
-  paidAmount    Decimal             @default(0) // số tiền đã thu
-  allocations   PaymentAllocation[] // <== THÊM DÒNG NÀY
+  paidAmount    Decimal             @default(0) @db.Decimal(18, 2)
+  allocations   PaymentAllocation[]
+  status        InvoiceStatus       @default(DRAFT)
+
+  // ✅ relation tới công nợ bảo hành
+  warrantyHold WarrantyHold?
 
   @@index([partnerId, issueDate])
   @@index([saleUserId])
   @@index([techUserId])
+  @@index([receiveAccountId])
+}
+
+model WarrantyHold {
+  id        String   @id @default(cuid())
+
+  invoiceId String   @unique
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  amount    Decimal  @db.Decimal(18, 2)
+  dueDate   DateTime
+  status    String   @default("OPEN") // OPEN | PAID | VOID
+  paidAt    DateTime?
+  note      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([dueDate])
+  @@index([status])
 }
 
 model InvoiceLine {
-  id        String  @id @default(cuid())
+  id        String   @id @default(cuid())
   invoiceId String
   itemId    String
-  qty       Decimal @db.Decimal(18, 3)
-  price     Decimal @db.Decimal(18, 2)
-  amount    Decimal @db.Decimal(18, 2)
+  qty       Decimal  @db.Decimal(18, 3)
+  price     Decimal  @db.Decimal(18, 2) // giá bán thực tế (staff nhập)
+  amount    Decimal  @db.Decimal(18, 2)
+  unitCost  Decimal? @db.Decimal(18, 2) // admin-only in API
+  costTotal Decimal? @db.Decimal(18, 2) // admin-only in API
   itemName  String?
   itemSku   String?
 
@@ -336,20 +420,75 @@ model InvoiceLine {
   @@index([itemId])
 }
 
+// ============== Stock Snapshot ==============
+model StockSnapshot {
+  id         String   @id @default(cuid())
+  itemId     String
+  locationId String
+  date       DateTime
+  qty        Decimal  @db.Decimal(18, 3)
+  avgCost    Decimal? @db.Decimal(18, 4)
+  createdAt  DateTime @default(now())
+
+  item     Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, locationId, date])
+  @@index([itemId])
+  @@index([locationId])
+  @@index([date])
+}
+
+// ============== Monthly Avg Cost ==============
+model MonthlyAvgCost {
+  id         String   @id @default(cuid())
+  itemId     String
+  locationId String
+  year       Int
+  month      Int
+  avgCost    Decimal  @db.Decimal(18, 4)
+  qtyTotal   Decimal  @db.Decimal(18, 3)
+  computedAt DateTime @default(now())
+
+  item     Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, locationId, year, month])
+  @@index([itemId])
+  @@index([locationId])
+  @@index([year, month])
+}
+
 //============== Logs & Device tokens ==============
 model AuditLog {
   id        String   @id @default(cuid())
-  userId    String?
-  action    String
-  entity    String
-  entityId  String?
-  meta      Json?
-  createdAt DateTime @default(now())
-  user      User?    @relation(fields: [userId], references: [id])
 
-  @@index([entity, createdAt])
+  // Ai làm
+  userId    String?
+  userRole  String?
+
+  // Làm gì
+  action    String   // PAYMENT_CREATE, MOVEMENT_POST, STOCKCOUNT_ADJUST...
+  entity    String   // Payment, Movement, Invoice, Stock...
+  entityId  String?
+
+  // Trước / sau (snapshot gọn)
+  before    Json?
+  after     Json?
+
+  // Ngữ cảnh
+  meta      Json?    // ip, userAgent, path, method, reason...
+
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([action])
   @@index([userId])
+  @@index([createdAt])
 }
+
 
 model DeviceToken {
   id        String   @id @default(cuid())
@@ -364,8 +503,8 @@ model DeviceToken {
 
 model Machine {
   id   String  @id @default(cuid())
-  code String  @unique // mã dòng máy, vd: "NJP-200I"
-  name String // tên hiển thị
+  code String  @unique
+  name String
   note String?
 
   createdAt DateTime @default(now())
@@ -384,13 +523,34 @@ model MachinePart {
   note      String?
 
   machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
-
-  // ĐỔI THÀNH DÒNG NÀY
-  item Item @relation("ItemMachineParts", fields: [itemId], references: [id], onDelete: Restrict)
+  item    Item    @relation("ItemMachineParts", fields: [itemId], references: [id], onDelete: Restrict)
 
   @@unique([machineId, itemId])
   @@index([machineId])
   @@index([itemId])
+}
+
+// ✅ NEW: Master tài khoản tiền (CASH/BANK1/BANK2...)
+model PaymentAccount {
+  id   String      @id @default(cuid())
+  code String      @unique // VD: CASH, BANK1, BANK2
+  name String // VD: Tiền mặt, Vietcombank - TK1
+  type AccountType @default(BANK)
+
+  bankName  String?
+  accountNo String?
+  holder    String?
+
+  isActive Boolean @default(true)
+  note     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments Payment[]
+
+  // ✅ opposite relation cho Invoice.receiveAccount
+  invoices Invoice[] @relation("InvoiceReceiveAccount")
 }
 
 model Payment {
@@ -402,8 +562,13 @@ model Payment {
 
   type   PaymentType
   amount Decimal     @db.Decimal(18, 2)
-  method String? // tiền mặt, chuyển khoản...
-  refNo  String? // số phiếu, số chứng từ (cho phép trùng)
+
+  // ✅ tiền vào/ra tài khoản nào
+  accountId String?
+  account   PaymentAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  method String?
+  refNo  String?
   note   String?
 
   createdById String?
@@ -415,6 +580,7 @@ model Payment {
   allocations PaymentAllocation[]
 
   @@index([partnerId, date])
+  @@index([accountId])
 }
 
 model PaymentAllocation {
@@ -426,10 +592,13 @@ model PaymentAllocation {
   invoice   Invoice @relation(fields: [invoiceId], references: [id])
 
   amount    Decimal  @db.Decimal(18, 2)
+  kind      AllocationKind @default(NORMAL)
+
   createdAt DateTime @default(now())
 
   @@index([invoiceId])
   @@index([paymentId])
+  @@index([kind])
 }
 
 model PeriodLock {
@@ -437,4 +606,30 @@ model PeriodLock {
   closedUntil DateTime
   note        String?
   createdAt   DateTime @default(now())
+}
+
+model ImportBatch {
+  id        String   @id @default(cuid())
+  batchId   String   @unique
+  fileName  String?
+  actorId   String?
+  createdAt DateTime @default(now())
+  notes     String?
+
+  logs ImportLog[]
+}
+
+model ImportLog {
+  id        String      @id @default(cuid())
+  batchId   String
+  batch     ImportBatch @relation(fields: [batchId], references: [batchId], onDelete: Cascade)
+  rowIndex  Int
+  refNo     String?
+  itemId    String?
+  status    String
+  message   String?
+  createdAt DateTime    @default(now())
+
+  @@index([batchId])
+  @@index([itemId])
 }

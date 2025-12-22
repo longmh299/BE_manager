@@ -17,6 +17,36 @@ const r = Router();
 // tất cả route kiểm kê đều yêu cầu đăng nhập
 r.use(requireAuth);
 
+function getUserId(req: any): string | undefined {
+  return req.user?.id || req.userId;
+}
+
+function getUserRole(req: any): string | undefined {
+  return req.user?.role || req.userRole;
+}
+
+function buildReqMeta(req: any) {
+  return {
+    ip: req.ip,
+    userAgent: req.headers?.["user-agent"],
+    path: req.originalUrl || req.url,
+    method: req.method,
+  };
+}
+
+/**
+ * Service stockcounts hiện dùng AuditCtx = { userId: string; userRole?: string } | undefined
+ * => route đảm bảo có userId để audit chạy ổn định
+ */
+function requireUserOr401(req: any, res: any) {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(401).json({ ok: false, message: "Chưa đăng nhập." });
+    return null;
+  }
+  return { userId, userRole: getUserRole(req) };
+}
+
 /**
  * GET /stock-counts?locationId=&status=&q=&page=&pageSize=
  * Danh sách phiếu kiểm kê
@@ -55,12 +85,18 @@ r.post("/", requireRole("accountant", "admin"), async (req, res, next) => {
       includeZero?: boolean;
     };
 
-    const data = await createStockCountWithLines({
-      locationId,
-      refNo,
-      note,
-      includeZero,
-    });
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
+
+    const data = await createStockCountWithLines(
+      {
+        locationId,
+        refNo,
+        note,
+        includeZero,
+      },
+      audit
+    );
 
     res.json({ ok: true, data });
   } catch (e) {
@@ -92,9 +128,16 @@ r.put(
   async (req, res, next) => {
     try {
       const { countedQty } = req.body as { countedQty?: string | number };
-      const data = await updateStockCountLine(req.params.lineId, {
-        countedQty,
-      });
+
+      const audit = requireUserOr401(req, res);
+      if (!audit) return;
+
+      const data = await updateStockCountLine(
+        req.params.lineId,
+        { countedQty },
+        audit
+      );
+
       res.json({ ok: true, data });
     } catch (e) {
       next(e);
@@ -110,61 +153,91 @@ r.put(
  *    - Cập nhật bảng Stock
  *    - Đổi status = "posted"
  */
-r.post(
-  "/:id/post",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const { movementRefNo, movementNote } = req.body as {
-        movementRefNo?: string;
-        movementNote?: string;
-      };
+r.post("/:id/post", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const { movementRefNo, movementNote } = req.body as {
+      movementRefNo?: string;
+      movementNote?: string;
+    };
 
-      const result = await postStockCount(req.params.id, {
-        movementRefNo,
-        movementNote,
-      });
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
 
-      res.json({ ok: true, ...result });
-    } catch (e) {
-      next(e);
-    }
+    const result = await postStockCount(
+      req.params.id,
+      { movementRefNo, movementNote },
+      audit
+    );
+
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    next(e);
   }
-);
+});
 
 /**
  * DELETE /stock-counts/:id  (accountant|admin)
  * -> Xoá phiếu kiểm kê DEMO / nháp
  *    - Chỉ cho xoá khi status = "draft"
+ *
+ * NOTE: route này đang xoá thẳng Prisma (không qua service),
+ * mình chỉ cắm thêm audit log nhẹ để truy vết.
+ *
+ * ✅ FIX: AuditLog schema chỉ có { userId, action, entity, entityId, meta }
+ * => nhét userRole/before/after/requestMeta vào meta.
  */
-r.delete(
-  "/:id",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const id = req.params.id;
+r.delete("/:id", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
 
-      const sc = await prisma.stockCount.findUnique({ where: { id } });
-      if (!sc) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "StockCount not found" });
-      }
-      if (sc.status === "posted") {
-        return res.status(400).json({
-          ok: false,
-          message: "Không thể xoá phiếu kiểm kê đã post",
-        });
-      }
+    const id = req.params.id;
 
-      await prisma.stockCount.delete({ where: { id } });
-
-      res.json({ ok: true });
-    } catch (e) {
-      next(e);
+    const sc = await prisma.stockCount.findUnique({ where: { id } });
+    if (!sc) {
+      return res.status(404).json({ ok: false, message: "StockCount not found" });
     }
+    if (String(sc.status).toLowerCase() === "posted") {
+      return res.status(400).json({
+        ok: false,
+        message: "Không thể xoá phiếu kiểm kê đã post",
+      });
+    }
+
+    await prisma.stockCount.delete({ where: { id } });
+
+    // ✅ audit nhẹ (không ảnh hưởng nghiệp vụ) - KHÔNG throw nếu fail
+    try {
+      await prisma.auditLog.create({
+        data: {
+          userId: audit.userId,
+          action: "STOCKCOUNT_DELETE",
+          entity: "StockCount",
+          entityId: id,
+          meta: {
+            userRole: audit.userRole ?? null,
+            before: {
+              id: sc.id,
+              refNo: sc.refNo,
+              status: sc.status,
+              locationId: sc.locationId,
+              note: sc.note ?? null,
+              createdAt: (sc as any).createdAt ?? null,
+            },
+            after: null,
+            request: buildReqMeta(req),
+          },
+        },
+      });
+    } catch (err) {
+      console.error("[AUDIT_LOG_FAILED]", err);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
   }
-);
+});
 
 /**
  * GET /stock-counts/:id/export?kind=PART|MACHINE
@@ -198,10 +271,7 @@ r.get("/:id/export", async (req, res, next) => {
     XLSX.utils.book_append_sheet(wb, ws, "StockCount");
     const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="stock_count.xlsx"'
-    );
+    res.setHeader("Content-Disposition", 'attachment; filename="stock_count.xlsx"');
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

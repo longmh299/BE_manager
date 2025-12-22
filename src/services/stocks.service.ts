@@ -1,19 +1,23 @@
 // src/services/stocks.service.ts
-import { PrismaClient, ItemKind } from "@prisma/client";
+import { PrismaClient, ItemKind, Prisma } from "@prisma/client";
 
 const prisma = new PrismaClient();
+
+function toNum(d: Prisma.Decimal | number | string | null | undefined): number {
+  if (d == null) return 0;
+  if (typeof d === "number") return d;
+  return Number(d.toString());
+}
 
 /**
  * -------- LIST TỒN KHO CHI TIẾT THEO KHO (/stocks) --------
  */
-
 export type GetStocksParams = {
   itemId?: string;
   locationId?: string;
   q?: string;
   page?: number;
   pageSize?: number;
-  // Lọc theo loại hàng: PART / MACHINE (tuỳ chọn)
   kind?: ItemKind | "PART" | "MACHINE";
 };
 
@@ -22,14 +26,9 @@ export async function getStocks(params: GetStocksParams) {
 
   const where: any = {};
 
-  if (itemId) {
-    where.itemId = itemId;
-  }
-  if (locationId) {
-    where.locationId = locationId;
-  }
+  if (itemId) where.itemId = itemId;
+  if (locationId) where.locationId = locationId;
 
-  // Lọc theo từ khoá sku / name
   if (q && q.trim()) {
     const keyword = q.trim();
     where.item = {
@@ -41,12 +40,9 @@ export async function getStocks(params: GetStocksParams) {
     };
   }
 
-  // Lọc theo kind = PART / MACHINE
   if (kind) {
     const k =
-      typeof kind === "string"
-        ? (kind.toUpperCase() as ItemKind)
-        : (kind as ItemKind);
+      typeof kind === "string" ? (kind.toUpperCase() as ItemKind) : (kind as ItemKind);
     where.item = {
       ...(where.item || {}),
       kind: k,
@@ -60,7 +56,11 @@ export async function getStocks(params: GetStocksParams) {
     prisma.stock.findMany({
       where,
       include: {
-        item: true,
+        item: {
+          include: {
+            unit: true, // ✅ NEW: lấy unit relation
+          },
+        },
         location: true,
       },
       orderBy: {
@@ -79,15 +79,12 @@ export async function getStocks(params: GetStocksParams) {
 
 /**
  * -------- TỔNG HỢP TỒN THEO ITEM (/stocks/summary-by-item) --------
- * - Đi từ bảng Item
- * - include stocks rồi cộng Qty
- * - Lọc được theo:
- *    + q: sku / tên
- *    + kind: PART / MACHINE
- * - Hỗ trợ phân trang page, pageSize
- * => Máy/LK nào không có record Stock vẫn xuất hiện với totalQty = 0
+ *
+ * ✅ FIX LỖ HỔNG:
+ * - Nếu totalQty = 0 thì KHÔNG trả avgCost=0 nữa.
+ * - Thay vào đó lấy "avgCost gần nhất" từ stock (updatedAt mới nhất).
+ * - Vì avgCost là master-cost theo tồn/movement, hết hàng vẫn nên giữ giá vốn gần nhất để dashboard không bị 0.
  */
-
 export type GetStockSummaryParams = {
   q?: string;
   kind?: ItemKind | "PART" | "MACHINE";
@@ -95,14 +92,11 @@ export type GetStockSummaryParams = {
   pageSize?: number;
 };
 
-export async function getStockSummaryByItem(
-  params: GetStockSummaryParams = {},
-) {
+export async function getStockSummaryByItem(params: GetStockSummaryParams = {}) {
   const { q, kind, page = 1, pageSize = 50 } = params;
 
   const whereItem: any = {};
 
-  // Tìm kiếm theo sku / tên
   if (q && q.trim()) {
     const keyword = q.trim();
     whereItem.OR = [
@@ -111,12 +105,9 @@ export async function getStockSummaryByItem(
     ];
   }
 
-  // Lọc theo loại hàng: PART / MACHINE
   if (kind) {
     const k =
-      typeof kind === "string"
-        ? (kind.toUpperCase() as ItemKind)
-        : (kind as ItemKind);
+      typeof kind === "string" ? (kind.toUpperCase() as ItemKind) : (kind as ItemKind);
     whereItem.kind = k;
   }
 
@@ -130,26 +121,56 @@ export async function getStockSummaryByItem(
       skip,
       take,
       include: {
-        stocks: true, // để cộng qty tất cả kho
+        unit: true,
+        // ✅ lấy cả qty + avgCost + updatedAt để tính giá vốn TB + giá trị tồn + fallback giá vốn khi qty=0
+        stocks: { select: { qty: true, avgCost: true, updatedAt: true } },
       },
     }),
     prisma.item.count({ where: whereItem }),
   ]);
 
   const rows = items.map((item) => {
-    const totalQty = (item.stocks || []).reduce(
-      (sum, s) => sum + Number(s.qty || 0),
-      0,
-    );
+    const stocks = item.stocks || [];
+
+    const totalQty = stocks.reduce((sum, s) => sum + toNum(s.qty as any), 0);
+
+    // ✅ bình quân gia quyền theo tồn: sum(qty*avgCost)/sum(qty)
+    const totalValue = stocks.reduce((sum, s) => {
+      const qty = toNum(s.qty as any);
+      const avg = toNum(s.avgCost as any);
+      return sum + qty * avg;
+    }, 0);
+
+    // ✅ FIX: nếu hết hàng (totalQty=0) thì lấy avgCost gần nhất theo updatedAt
+    let avgCost = 0;
+    if (totalQty > 0) {
+      avgCost = totalValue / totalQty;
+    } else {
+      if (stocks.length > 0) {
+        const latest = [...stocks].sort((a, b) => {
+          const ta = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+          const tb = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+          return tb - ta;
+        })[0];
+        avgCost = toNum((latest as any).avgCost);
+      } else {
+        avgCost = 0;
+      }
+    }
 
     return {
       itemId: item.id,
       sku: item.sku,
       name: item.name,
-      unit: item.unit,
+      unit: item.unit?.code ?? "pcs",
+      unitName: item.unit?.name ?? "Cái",
       kind: item.kind,
-      sellPrice: item.sellPrice, // 🔹 THÊM GIÁ BÁN TRẢ RA FE + EXPORT
+      sellPrice: item.sellPrice,
       totalQty,
+
+      // ✅ NEW cho FE admin
+      avgCost, // giá vốn TB (hoặc giá vốn gần nhất nếu qty=0)
+      stockValue: totalValue, // giá trị tồn (qty=0 => 0 là đúng)
     };
   });
 

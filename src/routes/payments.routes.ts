@@ -8,20 +8,185 @@ import {
 } from "../services/payments.service";
 
 const r = Router();
-
 r.use(requireAuth);
 
 function getUserId(req: any): string | undefined {
   return req.user?.id || req.userId;
 }
 
-r.post("/", async (req, res, next) => {
+function getUserRole(req: any): string | undefined {
+  return req.user?.role || req.userRole;
+}
+
+function buildAuditMeta(req: any) {
+  return {
+    ip: req.ip,
+    userAgent: req.headers?.["user-agent"],
+    path: req.originalUrl || req.url,
+    method: req.method,
+    // thêm chút context để trace (nhẹ)
+    params: req.params,
+    query: req.query,
+  };
+}
+
+function buildAuditCtx(req: any) {
+  const userId = getUserId(req);
+  const userRole = getUserRole(req);
+  return userId
+    ? {
+        userId,
+        userRole,
+        meta: buildAuditMeta(req),
+      }
+    : undefined;
+}
+
+function normalizeKind(k: any) {
+  const v = String(k ?? "NORMAL").toUpperCase();
+  return v === "WARRANTY_HOLD" ? "WARRANTY_HOLD" : "NORMAL";
+}
+
+function normalizePaymentType(t: any) {
+  const v = String(t ?? "").toUpperCase();
+  return v === "PAYMENT" ? "PAYMENT" : "RECEIPT";
+}
+
+function isValidDateString(s: any) {
+  if (!s) return false;
+  const d = new Date(String(s));
+  return !isNaN(d.getTime());
+}
+
+r.post("/", async (req, res) => {
   try {
     const userId = getUserId(req);
-    const payment = await createPaymentWithAllocations({
-      ...(req.body || {}),
-      createdById: userId,
-    });
+    const userRole = getUserRole(req);
+    const auditCtx = buildAuditCtx(req);
+
+    const body = req.body || {};
+
+    if (!userId) {
+      return res.status(401).json({ message: "Chưa đăng nhập." });
+    }
+
+    if (!body.partnerId) {
+      return res.status(400).json({ message: "Thiếu partnerId." });
+    }
+    if (!isValidDateString(body.date)) {
+      return res.status(400).json({ message: "Ngày (date) không hợp lệ." });
+    }
+
+    const type = normalizePaymentType(body.type);
+
+    const amountRaw = Number(body.amount);
+    if (!Number.isFinite(amountRaw) || amountRaw === 0) {
+      return res
+        .status(400)
+        .json({ message: "Số tiền phiếu thu/chi không hợp lệ (khác 0)." });
+    }
+
+    // ✅ Payment.amount luôn dương (tiền thực thu/chi)
+    const amount = Math.abs(amountRaw);
+
+    const allocations = Array.isArray(body.allocations)
+      ? body.allocations
+          .map((a: any) => {
+            const invoiceId = a?.invoiceId ? String(a.invoiceId) : "";
+            const kind = normalizeKind(a?.kind);
+            const amt = Number(a?.amount ?? 0);
+
+            return {
+              invoiceId,
+              amount: amt,
+              kind,
+            };
+          })
+          .filter((a: any) => {
+            if (!a.invoiceId) return false;
+            if (!Number.isFinite(a.amount)) return false;
+            if (a.amount === 0) return false;
+
+            // ✅ WARRANTY_HOLD: chỉ dương
+            if (a.kind === "WARRANTY_HOLD") return a.amount > 0;
+
+            // ✅ NORMAL: cho phép âm/dương (service sẽ validate theo type)
+            return true;
+          })
+      : undefined;
+
+    // ========= quick validations ở route (để báo lỗi sớm) =========
+    if (allocations && allocations.length > 0) {
+      const normal = allocations.filter((x: any) => x.kind === "NORMAL");
+      const hold = allocations.filter((x: any) => x.kind === "WARRANTY_HOLD");
+
+      // RECEIPT: NORMAL không được âm
+      if (type === "RECEIPT" && normal.some((x: any) => x.amount < 0)) {
+        return res.status(400).json({
+          message:
+            "Phiếu THU (RECEIPT) không được có phân bổ NORMAL âm. Nếu hoàn tiền hãy dùng phiếu CHI (PAYMENT).",
+        });
+      }
+
+      // PAYMENT: NORMAL không được dương (theo Option A: refund)
+      if (type === "PAYMENT" && normal.some((x: any) => x.amount > 0)) {
+        return res.status(400).json({
+          message:
+            "Phiếu CHI (PAYMENT) không được có phân bổ NORMAL dương. Nếu là thu tiền hãy dùng phiếu THU (RECEIPT).",
+        });
+      }
+
+      // ✅ check tổng tiền theo “cash amount”
+      const holdSum = hold.reduce(
+        (s: number, x: any) => s + Math.abs(Number(x.amount) || 0),
+        0
+      );
+
+      if (type === "RECEIPT") {
+        const normalSum = normal.reduce(
+          (s: number, x: any) => s + (Number(x.amount) || 0),
+          0
+        ); // >=0
+        const expected = normalSum + holdSum;
+        const diff = Math.abs(expected - amount);
+        if (diff > 0.0001) {
+          return res.status(400).json({
+            message: `Tổng phân bổ (NORMAL + HOLD) = ${expected} phải bằng số tiền phiếu = ${amount}.`,
+          });
+        }
+      } else {
+        // PAYMENT: normal là số âm => cash = abs(normal)
+        const normalAbs = normal.reduce(
+          (s: number, x: any) => s + Math.abs(Number(x.amount) || 0),
+          0
+        );
+        const expected = normalAbs + holdSum;
+        const diff = Math.abs(expected - amount);
+        if (diff > 0.0001) {
+          return res.status(400).json({
+            message: `Tổng phân bổ (abs(NORMAL) + HOLD) = ${expected} phải bằng số tiền phiếu = ${amount}.`,
+          });
+        }
+      }
+    }
+
+    const payment = await createPaymentWithAllocations(
+      {
+        date: body.date,
+        partnerId: body.partnerId,
+        type,
+        amount, // ✅ dương
+        accountId: body.accountId || undefined,
+        method: body.method,
+        refNo: body.refNo,
+        note: body.note,
+        allocations,
+        createdById: userId,
+      },
+      // ✅ audit context
+      auditCtx ?? { userId, userRole, meta: buildAuditMeta(req) }
+    );
+
     res.json(payment);
   } catch (err: any) {
     console.error(err);
@@ -36,6 +201,7 @@ r.get("/", async (req, res, next) => {
     const data = await listPayments({
       partnerId: req.query.partnerId as string | undefined,
       type: req.query.type as any,
+      accountId: req.query.accountId as string | undefined,
       from: req.query.from as string | undefined,
       to: req.query.to as string | undefined,
     });

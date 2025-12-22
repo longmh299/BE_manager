@@ -1,6 +1,6 @@
 // src/routes/invoices.routes.ts
 import { Router } from "express";
-import { requireAuth, requireRole } from "../middlewares/auth";
+import { requireAuth, requireRole, getUser } from "../middlewares/auth";
 import {
   listInvoices,
   getInvoiceById,
@@ -10,19 +10,138 @@ import {
   postInvoiceToStock,
   unpostInvoiceStock,
   updateInvoiceNote,
-
+  approveInvoice,
+  rejectInvoice,
+  submitInvoice,
+  recallInvoice,
 } from "../services/invoices.service";
 
 const r = Router();
 
-// tất cả route hoá đơn yêu cầu đăng nhập
+/** ========================= AUDIT HELPERS ========================= **/
+
+function buildAuditMeta(req: any) {
+  return {
+    ip: req.ip,
+    userAgent: req.headers?.["user-agent"],
+    path: req.originalUrl || req.url,
+    method: req.method,
+  };
+}
+
+/** ========================= SANITIZE (ẩn giá vốn theo role) ========================= **/
+
+function sanitizeInvoiceForRole(inv: any, role: string) {
+  if (!inv) return inv;
+
+  // admin + accountant mới được xem giá vốn
+  const canSeeCost = role === "admin" || role === "accountant";
+  const hideItemPrice = role === "staff";
+
+  const cloned = JSON.parse(JSON.stringify(inv));
+
+  // invoice level
+  if (!canSeeCost) {
+    delete cloned.totalCost;
+  }
+
+  // invoice lines
+  if (Array.isArray(cloned.lines)) {
+    for (const l of cloned.lines) {
+      if (!canSeeCost) {
+        delete l.unitCost;
+        delete l.costTotal;
+      }
+      if (l.item && hideItemPrice) {
+        delete l.item.price; // giá vốn gốc item
+      }
+    }
+  }
+
+  // movements
+  if (Array.isArray(cloned.movements)) {
+    for (const mv of cloned.movements) {
+      if (Array.isArray(mv.lines) && !canSeeCost) {
+        for (const ml of mv.lines) {
+          delete ml.unitCost;
+          delete ml.costTotal;
+        }
+      }
+    }
+  }
+
+  // ✅ warranty fields: staff được xem (không phải giá vốn)
+  // giữ nguyên, không xoá
+
+  return cloned;
+}
+
+function sanitizeInvoiceListForRole(rows: any[], role: string) {
+  return rows.map((x) => sanitizeInvoiceForRole(x, role));
+}
+
+/** ========================= HELPERS (RBAC) ========================= **/
+
+async function mustGetInvoice(id: string) {
+  const inv = await getInvoiceById(id);
+  if (!inv) {
+    const err: any = new Error("Invoice not found");
+    err.statusCode = 404;
+    throw err;
+  }
+  return inv;
+}
+
+function httpError(statusCode: number, message: string) {
+  const err: any = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
+
+function isStaff(role: string) {
+  return role === "staff";
+}
+
+function isAdmin(role: string) {
+  return role === "admin";
+}
+
+function ensureNoPurchaseReturnAccessOrThrow(invOrType: any, role: string) {
+  const t = typeof invOrType === "string" ? invOrType : invOrType?.type;
+  if (t === "PURCHASE_RETURN" && !isAdmin(role)) {
+    throw httpError(403, "Xuất trả NCC chỉ dành cho ADMIN.");
+  }
+}
+
+function ensureStaffOwnInvoiceOrThrow(inv: any, userId: string) {
+  if (!inv.saleUserId || String(inv.saleUserId) !== String(userId)) {
+    throw httpError(403, "Bạn không có quyền truy cập hóa đơn này.");
+  }
+}
+
+function ensureDraftForStaffOrThrow(inv: any) {
+  if (inv.status !== "DRAFT") {
+    throw httpError(409, "Hóa đơn không còn là NHÁP nên không thể thao tác.");
+  }
+}
+
+function ensureSubmittedForRecallOrThrow(inv: any) {
+  if (inv.status !== "SUBMITTED") {
+    throw httpError(409, "Chỉ có thể HỦY GỬI DUYỆT khi hóa đơn đang ở trạng thái CHỜ DUYỆT.");
+  }
+}
+
+/** ========================= ROUTES ========================= **/
+
 r.use(requireAuth);
 
 /**
- * GET /invoices?q=&page=&pageSize=&type=&saleUserId=&techUserId=&from=&to=
+ * GET /invoices
  */
 r.get("/", async (req, res, next) => {
   try {
+    const u = getUser(req)!;
+
     const {
       q = "",
       page = "1",
@@ -32,29 +151,43 @@ r.get("/", async (req, res, next) => {
       techUserId = "",
       from = "",
       to = "",
+      status = "",
+      paymentStatus = "",
+      receiveAccountId = "",
     } = req.query as any;
+
+    if (String(type) === "PURCHASE_RETURN" && !isAdmin(u.role)) {
+      throw httpError(403, "Xuất trả NCC chỉ dành cho ADMIN.");
+    }
 
     const pageNum = Number(page) || 1;
     const sizeNum = Number(pageSize) || 20;
 
     const filter: any = {};
     if (type) filter.type = type;
-    if (saleUserId) filter.saleUserId = saleUserId;
+
+    if (!isAdmin(u.role)) {
+      filter.excludeTypes = ["PURCHASE_RETURN"];
+    }
+
+    if (isStaff(u.role)) {
+      filter.saleUserId = u.id;
+    } else {
+      if (saleUserId) filter.saleUserId = saleUserId;
+    }
+
     if (techUserId) filter.techUserId = techUserId;
     if (from) filter.from = new Date(from);
     if (to) filter.to = new Date(to);
+    if (status) filter.status = status;
+    if (paymentStatus) filter.paymentStatus = paymentStatus;
+    if (receiveAccountId) filter.receiveAccountId = String(receiveAccountId);
 
-    const result = await listInvoices(
-      q ? String(q) : undefined,
-      pageNum,
-      sizeNum,
-      filter
-    );
+    const result = await listInvoices(q ? String(q) : undefined, pageNum, sizeNum, filter);
 
-    // FE đang dùng hàm unwrap nên giữ dạng { ok, data }
     res.json({
       ok: true,
-      data: result.data,
+      data: sanitizeInvoiceListForRole(result.data, u.role),
       total: result.total,
       page: result.page,
       pageSize: result.pageSize,
@@ -69,9 +202,21 @@ r.get("/", async (req, res, next) => {
  */
 r.get("/:id", async (req, res, next) => {
   try {
-    const data = await getInvoiceById(req.params.id);
-    res.json({ ok: true, data });
-  } catch (e) {
+    const u = getUser(req)!;
+    const inv = await mustGetInvoice(req.params.id);
+
+    ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
+
+    if (isStaff(u.role)) {
+      ensureStaffOwnInvoiceOrThrow(inv, u.id);
+    }
+
+    res.json({
+      ok: true,
+      data: sanitizeInvoiceForRole(inv, u.role),
+    });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
     next(e);
   }
 });
@@ -79,104 +224,285 @@ r.get("/:id", async (req, res, next) => {
 /**
  * POST /invoices
  */
-r.post(
-  "/",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const data = await createInvoice(req.body);
-      res.json({ ok: true, data });
-    } catch (e: any) {
-      // lỗi business (đã được service gắn statusCode) -> trả JSON luôn, không đẩy lên error middleware
-      if (e && (e as any).statusCode) {
-        return res
-          .status((e as any).statusCode)
-          .json({ ok: false, message: e.message });
-      }
-      next(e);
+r.post("/", async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+    const body = { ...(req.body || {}) };
+
+    if (String(body.type || "") === "PURCHASE_RETURN" && !isAdmin(u.role)) {
+      throw httpError(403, "Xuất trả NCC chỉ dành cho ADMIN.");
     }
+
+    if (isStaff(u.role)) {
+      body.saleUserId = u.id;
+
+      // ✅ staff: cho tick bảo hành nhưng ép % = 5 nếu có
+      if (body.hasWarrantyHold === true) body.warrantyHoldPct = 5;
+      if (body.warrantyHoldPct !== undefined) delete body.warrantyHoldPct; // staff không tự set %
+      if (body.hasWarrantyHold !== true) {
+        body.hasWarrantyHold = false;
+        body.warrantyHoldPct = 0;
+      }
+    }
+
+    const data = await createInvoice(body, {
+      userId: u.id,
+      userRole: u.role,
+      meta: buildAuditMeta(req),
+    });
+
+    res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
   }
-);
+});
 
 /**
  * PUT /invoices/:id
- *  - update header + CRUD dòng hàng
  */
-r.put(
-  "/:id",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const data = await updateInvoice(req.params.id, req.body);
-      res.json({ ok: true, data });
-    } catch (e: any) {
-      if (e && (e as any).statusCode) {
-        return res
-          .status((e as any).statusCode)
-          .json({ ok: false, message: e.message });
-      }
-      next(e);
-    }
-  }
-);
-
-/**
- * DELETE /invoices/:id
- *  - chỉ xóa khi chưa post tồn (không có movement)
- */
-r.delete(
-  "/:id",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const data = await deleteInvoice(req.params.id);
-      res.json({ ok: true, data });
-    } catch (e) {
-      next(e);
-    }
-  }
-);
-
-/**
- * POST /invoices/:id/post
- *  - ghi tồn kho từ hoá đơn
- */
-r.post(
-  "/:id/post",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const result = await postInvoiceToStock(req.params.id);
-      res.json({ ok: true, data: result });
-    } catch (e) {
-      next(e);
-    }
-  }
-);
-
-/**
- * POST /invoices/:id/unpost
- *  - HỦY post tồn: rollback tồn kho và xoá movement của hoá đơn
- */
-r.post(
-  "/:id/unpost",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const result = await unpostInvoiceStock(req.params.id);
-      res.json({ ok: true, data: result });
-    } catch (e) {
-      next(e);
-    }
-  }
-);
-r.patch("/:id/note", requireAuth, async (req, res, next) => {
+r.put("/:id", async (req, res, next) => {
   try {
-    const note = (req.body?.note ?? "") as string;
-    const invoice = await updateInvoiceNote(req.params.id, note);
-    res.json(invoice);
-  } catch (err) {
-    next(err);
+    const u = getUser(req)!;
+    const id = req.params.id;
+
+    const inv = await mustGetInvoice(id);
+    ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
+
+    if (req.body?.type === "PURCHASE_RETURN" && !isAdmin(u.role)) {
+      throw httpError(403, "Xuất trả NCC chỉ dành cho ADMIN.");
+    }
+
+    const body = { ...(req.body || {}) };
+
+    if (isStaff(u.role)) {
+      ensureStaffOwnInvoiceOrThrow(inv, u.id);
+      ensureDraftForStaffOrThrow(inv);
+
+      // ✅ staff: cho tick bảo hành nhưng ép % = 5 nếu có
+      if (body.hasWarrantyHold === true) body.warrantyHoldPct = 5;
+      if (body.warrantyHoldPct !== undefined) delete body.warrantyHoldPct; // staff không tự set %
+      if (body.hasWarrantyHold === false) {
+        body.warrantyHoldPct = 0;
+      }
+
+      const data = await updateInvoice(id, body, {
+        userId: u.id,
+        userRole: u.role,
+        meta: buildAuditMeta(req),
+      });
+
+      return res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
+    }
+
+    const data = await updateInvoice(id, body, {
+      userId: u.id,
+      userRole: u.role,
+      meta: buildAuditMeta(req),
+    });
+
+    res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
   }
 });
+
+/**
+ * PATCH /invoices/:id/note
+ */
+r.patch("/:id/note", async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+    const id = req.params.id;
+    const note = String(req.body?.note ?? "");
+
+    const inv = await mustGetInvoice(id);
+    ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
+
+    if (isStaff(u.role)) {
+      ensureStaffOwnInvoiceOrThrow(inv, u.id);
+      ensureDraftForStaffOrThrow(inv);
+    }
+
+    const data = await updateInvoiceNote(id, note, {
+      userId: u.id,
+      userRole: u.role,
+      meta: buildAuditMeta(req),
+    });
+
+    res.json({ ok: true, data });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
+  }
+});
+
+r.patch("/:id/payment", requireRole("accountant", "admin"), async (_req, res) => {
+  return res.status(409).json({
+    ok: false,
+    message:
+      "Route /invoices/:id/payment đã deprecated. Vui lòng tạo phiếu thu/chi qua POST /payments (kèm allocations) để thanh toán/thu nợ. Invoice sẽ tự cập nhật paidAmount/paymentStatus theo allocations.",
+  });
+});
+
+r.post("/:id/submit", async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+    const id = req.params.id;
+
+    const inv = await mustGetInvoice(id);
+    ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
+
+    if (isStaff(u.role)) {
+      ensureStaffOwnInvoiceOrThrow(inv, u.id);
+      ensureDraftForStaffOrThrow(inv);
+    }
+
+    const data = await submitInvoice(
+      { invoiceId: id, submittedById: u.id },
+      { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
+    );
+
+    res.json({
+      ok: true,
+      data: sanitizeInvoiceForRole(data, u.role),
+    });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
+  }
+});
+
+r.post("/:id/recall", async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+    const id = req.params.id;
+
+    const inv = await mustGetInvoice(id);
+    ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
+
+    if (isStaff(u.role)) {
+      ensureStaffOwnInvoiceOrThrow(inv, u.id);
+      ensureSubmittedForRecallOrThrow(inv);
+    }
+
+    const data = await recallInvoice(
+      { invoiceId: id, actorId: u.id },
+      { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
+    );
+
+    res.json({
+      ok: true,
+      data: sanitizeInvoiceForRole(data, u.role),
+    });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
+  }
+});
+
+r.post("/:id/approve", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+
+    const inv = await mustGetInvoice(req.params.id);
+    if (inv.type === "PURCHASE_RETURN" && !isAdmin(u.role)) {
+      throw httpError(403, "Xuất trả NCC chỉ ADMIN mới được duyệt.");
+    }
+
+    const { warehouseId } = req.body || {};
+
+    const data = await approveInvoice(
+      {
+        invoiceId: req.params.id,
+        approvedById: u.id,
+        warehouseId: warehouseId ? String(warehouseId) : undefined,
+      },
+      { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
+    );
+
+    res.json({
+      ok: true,
+      data: sanitizeInvoiceForRole(data, u.role),
+    });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
+  }
+});
+
+r.post("/:id/reject", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+
+    const inv = await mustGetInvoice(req.params.id);
+    if (inv.type === "PURCHASE_RETURN" && !isAdmin(u.role)) {
+      throw httpError(403, "Xuất trả NCC chỉ ADMIN mới được từ chối.");
+    }
+
+    const { reason } = req.body || {};
+
+    const data = await rejectInvoice(
+      {
+        invoiceId: req.params.id,
+        approvedById: u.id,
+        reason: reason ? String(reason) : undefined,
+      },
+      { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
+    );
+
+    res.json({
+      ok: true,
+      data: sanitizeInvoiceForRole(data, u.role),
+    });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
+  }
+});
+
+r.delete("/:id", async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+    const id = req.params.id;
+
+    const inv = await mustGetInvoice(id);
+    ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
+
+    if (isStaff(u.role)) {
+      ensureStaffOwnInvoiceOrThrow(inv, u.id);
+      ensureDraftForStaffOrThrow(inv);
+    }
+
+    const data = await deleteInvoice(id, { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) });
+    res.json({ ok: true, data });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
+  }
+});
+
+r.post("/:id/post", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    // ✅ deprecated function, không truyền auditCtx để khỏi TS error
+    const result = await postInvoiceToStock(req.params.id);
+    res.json({ ok: true, data: result });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
+  }
+});
+
+r.post("/:id/unpost", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    // ✅ deprecated function, không truyền auditCtx để khỏi TS error
+    const result = await unpostInvoiceStock(req.params.id);
+    res.json({ ok: true, data: result });
+  } catch (e: any) {
+    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+    next(e);
+  }
+});
+
 export default r;

@@ -1,11 +1,9 @@
+// src/routes/stocks_import.routes.ts
 import { Router, text } from "express";
 import multer from "multer";
 import * as XLSX from "xlsx";
 import { requireAuth, requireAnyRole } from "../middlewares/auth";
-import {
-  importOpeningStocks,
-  importOpeningOneFile,
-} from "../services/stocks_import.service";
+import { importOpeningFromExcelBuffer } from "../services/stocks_import.service";
 
 const router = Router();
 
@@ -16,37 +14,35 @@ const upload = multer({
 
 type ImportMode = "replace" | "add";
 
-/** JSON rows */
-router.post(
-  "/opening",
-  requireAuth,
-  requireAnyRole(["admin", "accountant"]),
-  async (req, res) => {
-    try {
-      const result = await importOpeningStocks(undefined as any, req.body);
-      return res.json(Object.assign({ ok: true }, result));
-    } catch (e: any) {
-      return res
-        .status(400)
-        .json({ ok: false, message: e?.message || "Import failed" });
-    }
-  },
-);
+function parseMode(raw: any): ImportMode {
+  const s = String(raw ?? "replace").toLowerCase().trim();
+  return s === "add" || s === "adjust" ? "add" : "replace";
+}
 
-/** ONE FILE – chấp nhận mọi field file (upload.any) */
+/**
+ * Trả về JSON ok chuẩn mà không bị TS2783 (ok bị set 2 lần).
+ * - Nếu result đã có ok -> giữ nguyên ok đó
+ * - Nếu chưa có ok -> set ok: true
+ */
+function sendOk(res: any, result: any) {
+  if (result && typeof result === "object" && "ok" in result) return res.json(result);
+  return res.json({ ok: true, ...result });
+}
+
+/**
+ * POST /imports/stocks/opening-onefile
+ * Postman form-data:
+ *  - file: (xlsx)
+ *  - mode: replace | add
+ */
 router.post(
   "/opening-onefile",
   requireAuth,
   requireAnyRole(["admin", "accountant"]),
-  upload.any(),
-  async (req, res) => {
+  upload.single("file"),
+  async (req, res, next) => {
     try {
-      const files = (req as any).files as
-        | Express.Multer.File[]
-        | undefined;
-      const f =
-        (files && files.find((ff) => ff.fieldname === "file")) ||
-        (files && files[0]);
+      const f = req.file;
       if (!f) {
         return res.status(400).json({
           ok: false,
@@ -54,23 +50,58 @@ router.post(
         });
       }
 
-      const rawMode = (req.body?.mode ?? "replace")
-        .toString()
-        .toLowerCase();
-      const mode: ImportMode =
-        rawMode === "add" || rawMode === "adjust" ? "add" : "replace";
+      const mode: ImportMode = parseMode(req.body?.mode);
+      const result = await importOpeningFromExcelBuffer(f.buffer, { mode });
 
-      const result = await importOpeningOneFile(f.buffer, { mode });
-      return res.json(Object.assign({ ok: true }, result));
-    } catch (e: any) {
-      return res
-        .status(400)
-        .json({ ok: false, message: e?.message || "Import failed" });
+      return sendOk(res, result);
+    } catch (e) {
+      return next(e);
     }
-  },
+  }
 );
 
-/** CSV raw (tuỳ chọn) */
+/**
+ * POST /imports/stocks/opening  (JSON rows)
+ * Body:
+ * {
+ *   "mode": "replace"|"add",
+ *   "rows": [...]
+ * }
+ * Convert JSON -> XLSX buffer để reuse importer
+ */
+router.post(
+  "/opening",
+  requireAuth,
+  requireAnyRole(["admin", "accountant"]),
+  async (req, res, next) => {
+    try {
+      const mode: ImportMode = parseMode(req.body?.mode);
+
+      const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+      if (!rows.length) {
+        return res.status(400).json({
+          ok: false,
+          message: "rows must be a non-empty array",
+        });
+      }
+
+      const ws = XLSX.utils.json_to_sheet(rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "OPENING");
+      const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+
+      const result = await importOpeningFromExcelBuffer(buf, { mode });
+      return sendOk(res, result);
+    } catch (e) {
+      return next(e);
+    }
+  }
+);
+
+/**
+ * POST /imports/stocks/opening/csv
+ * Raw CSV body -> convert to XLSX buffer -> reuse importer
+ */
 router.post(
   "/opening/csv",
   requireAuth,
@@ -78,81 +109,99 @@ router.post(
   text({
     type: ["text/csv", "application/vnd.ms-excel", "text/plain"],
   }),
-  async (req, res) => {
+  async (req, res, next) => {
     try {
       const csv = req.body || "";
-      if (!csv.trim())
-        return res
-          .status(400)
-          .json({ ok: false, message: "Empty CSV body" });
+      if (!csv.trim()) {
+        return res.status(400).json({ ok: false, message: "Empty CSV body" });
+      }
 
-      const rawMode = (req.query.mode || req.body?.mode || "replace")
-        .toString()
-        .toLowerCase();
-      const mode: ImportMode =
-        rawMode === "add" || rawMode === "adjust" ? "add" : "replace";
+      const mode: ImportMode = parseMode(req.query.mode ?? req.body?.mode);
 
-      const buf = Buffer.from(csv, "utf8");
-      const result = await importOpeningOneFile(buf, { mode });
-      return res.json(Object.assign({ ok: true }, result));
-    } catch (e: any) {
-      return res
-        .status(400)
-        .json({ ok: false, message: e?.message || "Import failed" });
+      const wb = XLSX.read(csv, { type: "string" });
+      const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+
+      const result = await importOpeningFromExcelBuffer(buf, { mode });
+      return sendOk(res, result);
+    } catch (e) {
+      return next(e);
     }
-  },
+  }
 );
 
 /**
  * GET /imports/stocks/opening-template
- * Xuất file Excel mẫu để nhập tồn đầu
+ * Excel template đúng format bạn đang dùng
  */
 router.get(
   "/opening-template",
-
-  async (req, res) => {
+  requireAuth,
+  requireAnyRole(["admin", "accountant"]),
+  async (_req, res, next) => {
     try {
       const rows = [
         {
-          sku: "MAY001",
-          name: "Máy hút chân không DZ-400",
+          name: "Bếp chiên vn [ID-1]",
+          skud: "ID-1",
+          ton_dau: 1,
+          nhap: 0,
+          xuat: 1,
+          ton_cuoi: 0,
+          note: "Ví dụ",
+          location: "wh-01",
           kind: "MACHINE",
-          qty: 10,
-          sellPrice: 4500000,
-          note: "Ví dụ máy",
+          ten_goc: "Bếp chiên vn",
+          gia_goc: 70000,
         },
         {
-          sku: "PART001",
-          name: "Dây nhiệt máy hàn",
-          kind: "PART",
-          qty: 200,
-          sellPrice: 15000,
-          note: "Ví dụ linh kiện",
+          name: "Bếp nướng điện [ID-2]",
+          skud: "ID-2",
+          ton_dau: 1,
+          nhap: 0,
+          xuat: 0,
+          ton_cuoi: 1,
+          note: "",
+          location: "wh-01",
+          kind: "MACHINE",
+          ten_goc: "Bếp nướng điện",
+          gia_goc: 22222,
         },
       ];
 
       const ws = XLSX.utils.json_to_sheet(rows, {
-        header: ["sku", "name", "kind", "qty", "sellPrice", "note"],
+        header: [
+          "name",
+          "skud",
+          "ton_dau",
+          "nhap",
+          "xuat",
+          "ton_cuoi",
+          "note",
+          "location",
+          "kind",
+          "ten_goc",
+          "gia_goc",
+        ],
       });
+
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "OpeningTemplate");
       const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 
       res.setHeader(
         "Content-Disposition",
-        'attachment; filename="ton_dau_template.xlsx"',
+        'attachment; filename="ton_dau_template.xlsx"'
       );
       res.setHeader(
         "Content-Type",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
       );
-      res.send(buf);
-    } catch (e: any) {
-      return res
-        .status(500)
-        .json({ ok: false, message: e?.message || "Export template failed" });
+
+      return res.send(buf);
+    } catch (e) {
+      return next(e);
     }
-  },
+  }
 );
 
 export default router;

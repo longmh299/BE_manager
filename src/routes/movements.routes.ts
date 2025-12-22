@@ -19,6 +19,38 @@ const r = Router();
 
 r.use(requireAuth);
 
+function getUserId(req: any): string | undefined {
+  return req.user?.id || req.userId;
+}
+
+function getUserRole(req: any): string | undefined {
+  return req.user?.role || req.userRole;
+}
+
+function buildAuditMeta(req: any) {
+  return {
+    ip: req.ip,
+    userAgent: req.headers?.["user-agent"],
+    path: req.originalUrl || req.url,
+    method: req.method,
+    params: req.params,
+    query: req.query,
+  };
+}
+
+function requireUserOr401(req: any, res: any) {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(401).json({ ok: false, message: "Chưa đăng nhập." });
+    return null;
+  }
+  return {
+    userId,
+    userRole: getUserRole(req),
+    meta: buildAuditMeta(req),
+  };
+}
+
 /** GET /movements?type=&posted=&page=&pageSize= */
 r.get("/", async (req, res, next) => {
   try {
@@ -27,22 +59,25 @@ r.get("/", async (req, res, next) => {
     if (type) where.type = type;
     if (posted !== undefined) where.posted = posted === "true";
 
+    const pageNum = Number(page) || 1;
+    const pageSizeNum = Number(pageSize) || 20;
+
     const [total, data] = await Promise.all([
       prisma.movement.count({ where }),
       prisma.movement.findMany({
         where,
-        include: { lines: { include: { item: true } } },
+        include: { lines: { include: { item: true, fromLoc: true, toLoc: true } } },
         orderBy: { createdAt: "desc" },
-        skip: (Number(page) - 1) * Number(pageSize),
-        take: Number(pageSize),
+        skip: (pageNum - 1) * pageSizeNum,
+        take: pageSizeNum,
       }),
     ]);
 
     res.json({
       ok: true,
       total,
-      page: Number(page),
-      pageSize: Number(pageSize),
+      page: pageNum,
+      pageSize: pageSizeNum,
       data,
     });
   } catch (e) {
@@ -55,7 +90,7 @@ r.get("/:id", async (req, res, next) => {
   try {
     const data = await prisma.movement.findUnique({
       where: { id: req.params.id },
-      include: { lines: { include: { item: true } }, invoice: true },
+      include: { lines: { include: { item: true, fromLoc: true, toLoc: true } }, invoice: true },
     });
     res.json({ ok: true, data });
   } catch (e) {
@@ -63,7 +98,7 @@ r.get("/:id", async (req, res, next) => {
   }
 });
 
-/** POST /movements  (accountant|admin) — tạo phiếu nháp (IN/OUT/TRANSFER) */
+/** POST /movements  (accountant|admin) — tạo phiếu nháp */
 r.post("/", requireRole("accountant", "admin"), async (req, res, next) => {
   try {
     const { type, refNo, note } = req.body as {
@@ -72,9 +107,10 @@ r.post("/", requireRole("accountant", "admin"), async (req, res, next) => {
       note?: string;
     };
 
-    // createDraft nhận (type, { refNo?, note? })
-    const data = await createDraft(type, { refNo, note });
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
 
+    const data = await createDraft(type, { refNo, note }, audit);
     res.json({ ok: true, data });
   } catch (e) {
     next(e);
@@ -82,82 +118,81 @@ r.post("/", requireRole("accountant", "admin"), async (req, res, next) => {
 });
 
 /** POST /movements/:id/lines (accountant|admin) — thêm dòng */
-r.post(
-  "/:id/lines",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const movementId = req.params.id;
-      // 🔒 kiểm tra phiếu có thuộc kỳ đã khoá không
-      await ensureMovementNotLocked(movementId);
+r.post("/:id/lines", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const movementId = req.params.id;
+    await ensureMovementNotLocked(movementId);
 
-      const { itemId, fromLocationId, toLocationId, qty, note } = req.body;
-      const data = await addLine(movementId, {
+    const { itemId, fromLocationId, toLocationId, qty, note, unitCost } = req.body;
+
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
+
+    const data = await addLine(
+      movementId,
+      {
         itemId,
         fromLocationId,
         toLocationId,
         qty,
         note,
-      });
-      res.json({ ok: true, data });
-    } catch (e) {
-      next(e);
-    }
+        unitCost, // ✅ cho IN/ADJUST-IN nếu muốn nhập
+      },
+      audit
+    );
+
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
   }
-);
+});
 
 /** PUT /movements/lines/:lineId (accountant|admin) — sửa dòng */
-r.put(
-  "/lines/:lineId",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const lineId = req.params.lineId;
-      // 🔒 kiểm tra dòng thuộc kỳ đã khoá không
-      await ensureMovementLineNotLocked(lineId);
+r.put("/lines/:lineId", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const lineId = req.params.lineId;
+    await ensureMovementLineNotLocked(lineId);
 
-      const data = await updateLine(lineId, req.body);
-      res.json({ ok: true, data });
-    } catch (e) {
-      next(e);
-    }
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
+
+    const data = await updateLine(lineId, req.body, audit);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
   }
-);
+});
 
 /** DELETE /movements/lines/:lineId (accountant|admin) — xoá dòng */
-r.delete(
-  "/lines/:lineId",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const lineId = req.params.lineId;
-      // 🔒 kiểm tra dòng thuộc kỳ đã khoá không
-      await ensureMovementLineNotLocked(lineId);
+r.delete("/lines/:lineId", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const lineId = req.params.lineId;
+    await ensureMovementLineNotLocked(lineId);
 
-      const data = await deleteLine(lineId);
-      res.json({ ok: true, data });
-    } catch (e) {
-      next(e);
-    }
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
+
+    const data = await deleteLine(lineId, audit);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
   }
-);
+});
 
 /** POST /movements/:id/post (accountant|admin) — ghi sổ */
-r.post(
-  "/:id/post",
-  requireRole("accountant", "admin"),
-  async (req, res, next) => {
-    try {
-      const movementId = req.params.id;
-      // 🔒 kiểm tra phiếu thuộc kỳ đã khoá không
-      await ensureMovementNotLocked(movementId);
+r.post("/:id/post", requireRole("accountant", "admin"), async (req, res, next) => {
+  try {
+    const movementId = req.params.id;
+    await ensureMovementNotLocked(movementId);
 
-      const data = await postMovement(movementId);
-      res.json({ ok: true, data });
-    } catch (e) {
-      next(e);
-    }
+    const audit = requireUserOr401(req, res);
+    if (!audit) return;
+
+    const data = await postMovement(movementId, audit);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
   }
-);
+});
 
 export default r;

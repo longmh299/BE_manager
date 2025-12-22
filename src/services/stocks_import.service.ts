@@ -1,10 +1,11 @@
 // src/services/stocks_import.service.ts
-import { PrismaClient, ItemKind } from "@prisma/client";
 import * as XLSX from "xlsx";
+import { Prisma, PrismaClient, ItemKind } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
-// ---------- helpers ----------
+export type ImportMode = "replace" | "add";
+
 function toNumber(v: any): number {
   if (v == null) return 0;
   if (typeof v === "number") return v;
@@ -14,327 +15,327 @@ function toNumber(v: any): number {
   return isNaN(n) ? 0 : n;
 }
 
-function norm(s: string) {
-  return s
-    ?.toString()
+function norm(s: any) {
+  return String(s ?? "")
     .trim()
     .toLowerCase()
     .replace(/\s+/g, "")
     .replace(/[._-]/g, "");
 }
 
-/**
- * Convert text kind trong file → enum ItemKind
- */
-function parseItemKind(raw?: string): ItemKind {
-  const t = (raw || "").toString().trim().toLowerCase();
+function parseKind(raw: any): ItemKind {
+  const t = String(raw ?? "").trim().toUpperCase();
+  return t === "MACHINE" ? "MACHINE" : "PART";
+}
 
-  if (!t) return "PART";
+type TxLike = Prisma.TransactionClient | PrismaClient;
 
-  if (
-    t === "machine" ||
-    t === "máy" ||
-    t === "may" ||
-    t === "mm" ||
-    t === "maymoc" ||
-    t === "máymóc"
-  ) {
-    return "MACHINE";
-  }
-
-  // Cho phép chỉ cần bắt đầu bằng "m" là coi là MACHINE
-  if (t.startsWith("m")) return "MACHINE";
-
-  return "PART";
+async function getDefaultUnitId(db: TxLike) {
+  const u = await db.unit.findFirst({ where: { code: "pcs" } });
+  if (!u) throw new Error("Default Unit(code='pcs') not found. Please seed Unit first.");
+  return u.id;
 }
 
 /**
- * Khi không có cột kind, suy luận theo tên:
- * tên bắt đầu bằng "máy", "may", hoặc chứa "machine" → MACHINE
+ * ✅ Lấy kho mặc định: kho warehouse tạo sớm nhất.
+ * Nếu DB chưa có kho -> tự tạo wh-01.
  */
-function inferKindFromName(name?: string): ItemKind {
-  const t = (name || "").toString().trim().toLowerCase();
-  if (!t) return "PART";
-
-  if (
-    t.startsWith("máy") ||
-    t.startsWith("may ") ||
-    t.startsWith("may-") ||
-    t.startsWith("may_") ||
-    t.includes("machine")
-  ) {
-    return "MACHINE";
-  }
-
-  return "PART";
-}
-
-/** Dùng enum để suy ra prefix cho SKU (LK / MM) */
-function kindToPrefixFromEnum(kind: ItemKind): "LK" | "MM" {
-  return kind === "MACHINE" ? "MM" : "LK";
-}
-
-function toSlugBase(s: string) {
-  // 40 ký tự để hạn chế trùng slug
-  return (
-    (s || "SP")
-      .normalize("NFD")
-      .replace(/\p{Diacritic}/gu, "")
-      .replace(/[^a-zA-Z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .toUpperCase()
-      .slice(0, 40) || "SP"
-  );
-}
-
-// ⚙️ Giữ lại helper nhưng sửa dùng findFirst (sku không còn unique)
-async function ensureUniqueSkuFromName(
-  name: string,
-  prefix: "LK" | "MM"
-): Promise<string> {
-  const base = `${prefix}-${toSlugBase(name)}`;
-  let n = 1;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const sku = n === 1 ? base : `${base}-${n}`;
-    const found = await prisma.item.findFirst({ where: { sku } });
-    if (!found) return sku;
-    n++;
-  }
-}
-
-async function getSingleWarehouseId(): Promise<string> {
-  const wh = await prisma.location.findFirst({
+async function getOrCreateDefaultWarehouse(db: TxLike) {
+  const wh = await db.location.findFirst({
     where: { kind: "warehouse" },
     orderBy: { createdAt: "asc" },
   });
-  if (!wh) throw new Error("No warehouse Location found.");
-  return wh.id;
+
+  if (wh) return wh;
+
+  return db.location.create({
+    data: {
+      code: "wh-01",
+      name: "Kho mặc định",
+      kind: "warehouse",
+    },
+  });
 }
 
-// ---------- JSON rows importer (/opening) ----------
-export async function importOpeningStocks(_p: PrismaClient, body: any) {
-  const modeRaw = (body?.mode ?? "set").toString().toLowerCase();
-  const mode: "replace" | "add" = modeRaw === "adjust" ? "add" : "replace";
-  const rows = Array.isArray(body?.rows) ? body.rows : null;
-  if (!rows?.length) throw new Error("rows must be a non-empty array");
-
-  let locationId: string;
-  const code = (body?.warehouseCode ?? "").toString().trim();
-  if (code) {
-    const found = await prisma.location.findFirst({ where: { code } });
-    if (!found) throw new Error(`Warehouse not found: ${code}`);
-    locationId = found.id;
-  } else {
-    locationId = await getSingleWarehouseId();
+/**
+ * ✅ Resolve location:
+ * - Nếu file có code:
+ *    - đúng -> dùng kho đó
+ *    - sai -> fallback kho mặc định + warning
+ * - Nếu file trống -> fallback kho mặc định
+ */
+async function resolveLocationId(
+  db: TxLike,
+  params: {
+    fileLocCode?: any;
+    defaultLocationId: string;
+    locCache: Map<string, string>;
+    warningRows: Array<{ row: number; message: string }>;
+    excelRowNo: number;
   }
-
-  let affectedStocks = 0;
-  for (const r of rows) {
-    const sku = (r?.sku ?? "").toString().trim();
-    const qty = toNumber(r?.qty);
-    if (!sku) continue;
-
-    // 🔁 sku không còn unique → dùng findFirst
-    const item = await prisma.item.findFirst({ where: { sku } });
-    if (!item) continue;
-
-    const key = { itemId: item.id, locationId };
-    const old = await prisma.stock.findUnique({
-      where: { itemId_locationId: key },
-    });
-
-    if (mode === "replace") {
-      if (old) {
-        await prisma.stock.update({
-          where: { itemId_locationId: key },
-          data: { qty: qty as any },
-        });
-      } else {
-        await prisma.stock.create({ data: { ...key, qty: qty as any } });
-      }
-    } else {
-      if (old) {
-        await prisma.stock.update({
-          where: { itemId_locationId: key },
-          data: { qty: Number(old.qty) + qty as any },
-        });
-      } else {
-        await prisma.stock.create({ data: { ...key, qty: qty as any } });
-      }
-    }
-    affectedStocks++;
-  }
-
-  return { ok: true, summary: { affectedStocks, mode } };
-}
-
-// ---------- ONE-FILE importer (/opening-onefile) ----------
-export async function importOpeningOneFile(
-  buf: Buffer,
-  opts: { mode: "replace" | "add" } = { mode: "replace" }
 ) {
+  const { fileLocCode, defaultLocationId, locCache, warningRows, excelRowNo } = params;
+
+  const locCode = String(fileLocCode ?? "").trim();
+  if (!locCode) return defaultLocationId;
+
+  if (locCache.has(locCode)) return locCache.get(locCode)!;
+
+  const loc = await db.location.findFirst({ where: { code: locCode } });
+  if (!loc) {
+    warningRows.push({
+      row: excelRowNo,
+      message: `Location not found "${locCode}" -> fallback to default warehouse`,
+    });
+    return defaultLocationId;
+  }
+
+  locCache.set(locCode, loc.id);
+  return loc.id;
+}
+
+function chunkArray<T>(arr: T[], size: number) {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function isNeonTxnError(err: any) {
+  const msg = String(err?.message || "");
+  return (
+    msg.includes("Unable to start a transaction") ||
+    msg.includes("Transaction not found") ||
+    msg.includes("Transaction ID is invalid") ||
+    msg.includes("old closed transaction")
+  );
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function runWithRetry<T>(fn: () => Promise<T>, tries = 3) {
+  let lastErr: any;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      lastErr = e;
+      if (!isNeonTxnError(e) || i === tries - 1) throw e;
+      // backoff nhẹ
+      await sleep(250 * (i + 1));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Import OPENING from Excel buffer
+ * - Upsert Item theo name (vì name unique)
+ * - Stock.qty = ton_dau (ưu tiên) hoặc ton_cuoi
+ * - Stock.avgCost = gia_goc (nếu có)
+ * - mode:
+ *    - replace: set qty = qtyFile
+ *    - add: qty = qtyOld + qtyFile
+ *
+ * ✅ Neon-safe: chunk nhỏ, tránh transaction dài.
+ */
+export async function importOpeningFromExcelBuffer(
+  buf: Buffer,
+  opts?: { mode?: ImportMode; locationId?: string; batchId?: string }
+) {
+  const mode: ImportMode = (opts?.mode ?? "replace") === "add" ? "add" : "replace";
+
   const wb = XLSX.read(buf, { type: "buffer" });
   const sheetName = wb.SheetNames[0];
   if (!sheetName) throw new Error("Empty workbook");
   const ws = wb.Sheets[sheetName];
 
-  const headers = (XLSX.utils.sheet_to_json(ws, {
-    header: 1,
-    raw: true,
-  })[0] || []) as string[];
-  if (!headers.length) throw new Error("Missing header row");
+  const table = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true }) as any[][];
+  if (!table || table.length < 2) throw new Error("File has no data");
 
-  const idx: Record<string, number> = {};
-  headers.forEach((h, i) => (idx[norm(h)] = i));
+  const headers = (table[0] || []).map(norm);
+  const pickCol = (...cands: string[]) => {
+    for (const c of cands) {
+      const i = headers.indexOf(norm(c));
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
 
-  const colSku =
-    idx["sku"] ?? idx["skud"] ?? idx["mahang"] ?? idx["mahàng"] ?? idx["code"];
-  const colName =
-    idx["name"] ??
-    idx["tenhang"] ??
-    idx["tênhàng"] ??
-    idx["ten"] ??
-    idx["tên"];
-  const colQty =
-    idx["qty"] ??
-    idx["ton"] ??
-    idx["tồn"] ??
-    idx["tondau"] ??
-    idx["tồnđầu"] ??
-    idx["toncuoi"] ??
-    idx["tồncuối"];
-  const colSell = idx["sellprice"] ?? idx["giaban"] ?? idx["gia"] ?? idx["price"];
-  const colNote = idx["note"] ?? idx["ghichu"] ?? idx["ghichú"];
-  const colKind = idx["kind"] ?? idx["loai"] ?? idx["loại"];
+  // Columns theo file bạn
+  const colName = pickCol("name", "ten", "tên");
+  const colTenGoc = pickCol("ten_goc", "tengoc");
+  const colSku = pickCol("sku", "skud", "code", "mahang", "mãhàng");
+  const colTonDau = pickCol("ton_dau", "tondau", "tồnđầu");
+  const colTonCuoi = pickCol("ton_cuoi", "toncuoi", "tồncuối", "ton");
+  const colLoc = pickCol("location", "kho", "warehouse");
+  const colKind = pickCol("kind", "loai", "loại");
+  const colGiaGoc = pickCol("gia_goc", "giagoc", "basecost", "cost");
 
-  if (colQty === undefined) {
-    throw new Error(
-      "Header must contain quantity column (qty/ton/tonDau/tonCuoi)"
-    );
-  }
+  const dataRows = table.slice(1);
 
-  const whId = await getSingleWarehouseId();
-  const rows = XLSX.utils.sheet_to_json(ws, {
-    header: 1,
-    raw: true,
-  }) as any[][];
+  // ✅ preload master tối thiểu (ngoài transaction)
+  const unitId = await getDefaultUnitId(prisma);
+  const defaultWh = await getOrCreateDefaultWarehouse(prisma);
 
+  // ✅ defaultLocationId:
+  // - nếu opts.locationId có -> dùng luôn
+  // - nếu không -> dùng kho mặc định
+  const defaultLocationId = opts?.locationId ? opts.locationId : defaultWh.id;
+
+  // cache để giảm query
+  const locCache = new Map<string, string>();
+  const itemCacheByName = new Map<string, { id: string; name: string; sku: string }>();
+
+  const warningRows: Array<{ row: number; message: string }> = [];
   let createdItems = 0;
   let updatedItems = 0;
   let affectedStocks = 0;
 
-  const hasKindColumn = colKind !== undefined;
+  // ✅ chunk nhỏ để tránh giữ transaction lâu (Neon-friendly)
+  const CHUNK_SIZE = 20;
+  const chunks = chunkArray(dataRows, CHUNK_SIZE);
 
-  for (let r = 1; r < rows.length; r++) {
-    const row = rows[r] || [];
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const part = chunks[ci];
 
-    const rawSku = colSku !== undefined ? row[colSku] ?? "" : "";
-    let sku = String(rawSku || "").trim();
+    await runWithRetry(async () => {
+      return prisma.$transaction(
+        async (tx) => {
+          for (let j = 0; j < part.length; j++) {
+            const iGlobal = ci * CHUNK_SIZE + j;
+            const excelRowNo = iGlobal + 2;
+            const row = part[j] || [];
 
-    const name =
-      colName !== undefined ? String(row[colName] ?? "").trim() : "";
-    const qty = toNumber(row[colQty]);
-    const sell = colSell !== undefined ? toNumber(row[colSell]) : 0;
-    const note =
-      colNote !== undefined
-        ? (String(row[colNote] ?? "").trim() || undefined)
-        : undefined;
+            const name = colName >= 0 ? String(row[colName] ?? "").trim() : "";
+            const tenGoc = colTenGoc >= 0 ? String(row[colTenGoc] ?? "").trim() : "";
+            const sku = colSku >= 0 ? String(row[colSku] ?? "").trim() : "";
 
-    // ---- Xác định kind ----
-    let kindEnum: ItemKind;
-    if (hasKindColumn) {
-      const rawKind = String(row[colKind] ?? "");
-      if (rawKind && rawKind.toString().trim() !== "") {
-        kindEnum = parseItemKind(rawKind);
-      } else {
-        kindEnum = inferKindFromName(name);
-      }
-    } else {
-      kindEnum = inferKindFromName(name);
-    }
+            const keyName = (tenGoc || name || sku).trim();
+            if (!keyName) continue;
 
-    if (!sku && !name) continue;
+            const kind = colKind >= 0 ? parseKind(row[colKind]) : "PART";
 
-    const itemName = name || sku;
-    const prefix = kindToPrefixFromEnum(kindEnum);
+            // qty: ưu tiên ton_dau, fallback ton_cuoi
+            const qty =
+              colTonDau >= 0 && String(row[colTonDau] ?? "").trim() !== ""
+                ? toNumber(row[colTonDau])
+                : colTonCuoi >= 0
+                ? toNumber(row[colTonCuoi])
+                : 0;
 
-    // 🔁 SKU mới: giữ nguyên mã trong file, chỉ gen thêm khi bị trống
-    if (!sku) {
-      sku = await ensureUniqueSkuFromName(itemName || "SP", prefix);
-    }
-    const finalSku = sku;
+            const baseCost = colGiaGoc >= 0 ? toNumber(row[colGiaGoc]) : 0;
 
-    // 🔁 ĐỔI LOGIC: 1 Item theo name, nếu tồn tại thì update, không tạo mới trùng
-    let item = await prisma.item.findFirst({
-      where: { name: itemName },
-    });
+            // ✅ location: nếu sai -> fallback về kho mặc định + warning
+            const locationId = await resolveLocationId(tx, {
+              fileLocCode: colLoc >= 0 ? row[colLoc] : "",
+              defaultLocationId,
+              locCache,
+              warningRows,
+              excelRowNo,
+            });
 
-    if (item) {
-      item = await prisma.item.update({
-        where: { id: item.id },
-        data: {
-          sku: finalSku,
-          sellPrice: sell as any,
-          note: note,
-          kind: kindEnum,
-        } as any,
-      });
-      updatedItems++;
-    } else {
-      item = await prisma.item.create({
-        data: {
-          sku: finalSku,
-          name: itemName,
-          unit: "pcs",
-          price: 0 as any,
-          sellPrice: sell as any,
-          note: note,
-          kind: kindEnum,
-        } as any,
-      });
-      createdItems++;
-    }
+            // ==== upsert item theo NAME (name unique) ====
+            let item = itemCacheByName.get(keyName);
+            if (!item) {
+              const existed = await tx.item.findUnique({
+                where: { name: keyName },
+                select: { id: true, name: true, sku: true },
+              });
 
-    const key = { itemId: item.id, locationId: whId };
-    const old = await prisma.stock.findUnique({
-      where: { itemId_locationId: key },
-    });
+              if (existed) {
+                const up = await tx.item.update({
+                  where: { id: existed.id },
+                  data: {
+                    sku: sku || existed.sku, // sku không unique => chỉ update nếu có
+                    unitId,
+                    kind,
+                    // ❗ price (giá vốn) không import vào Item
+                  },
+                  select: { id: true, name: true, sku: true },
+                });
+                item = up;
+                updatedItems++;
+              } else {
+                const created = await tx.item.create({
+                  data: {
+                    sku: sku || keyName,
+                    name: keyName,
+                    unitId,
+                    kind,
+                    price: new Prisma.Decimal(0),
+                    sellPrice: new Prisma.Decimal(0),
+                  },
+                  select: { id: true, name: true, sku: true },
+                });
+                item = created;
+                createdItems++;
+              }
 
-    if (opts.mode === "replace") {
-      if (old) {
-        await prisma.stock.update({
-          where: { itemId_locationId: key },
-          data: { qty: qty as any },
-        });
-      } else {
-        await prisma.stock.create({
-          data: { ...key, qty: qty as any },
-        });
-      }
-    } else {
-      if (old) {
-        await prisma.stock.update({
-          where: { itemId_locationId: key },
-          data: { qty: Number(old.qty) + qty as any },
-        });
-      } else {
-        await prisma.stock.create({
-          data: { ...key, qty: qty as any },
-        });
-      }
-    }
+              itemCacheByName.set(keyName, item);
+            }
 
-    affectedStocks++;
+            // ==== upsert stock ====
+            const deltaQty = new Prisma.Decimal(qty);
+
+            if (mode === "replace") {
+              await tx.stock.upsert({
+                where: { itemId_locationId: { itemId: item.id, locationId } },
+                create: {
+                  itemId: item.id,
+                  locationId,
+                  qty: deltaQty,
+                  avgCost: new Prisma.Decimal(baseCost || 0),
+                },
+                update: {
+                  qty: deltaQty,
+                  ...(baseCost > 0 ? { avgCost: new Prisma.Decimal(baseCost) } : {}),
+                },
+              });
+            } else {
+              await tx.stock.upsert({
+                where: { itemId_locationId: { itemId: item.id, locationId } },
+                create: {
+                  itemId: item.id,
+                  locationId,
+                  qty: deltaQty,
+                  avgCost: new Prisma.Decimal(baseCost || 0),
+                },
+                update: {
+                  qty: { increment: deltaQty },
+                  ...(baseCost > 0 ? { avgCost: new Prisma.Decimal(baseCost) } : {}),
+                },
+              });
+            }
+
+            affectedStocks++;
+
+            if (qty === 0) {
+              warningRows.push({
+                row: excelRowNo,
+                message: `Qty = 0 for "${keyName}" (still imported item)`,
+              });
+            }
+          }
+        },
+        // ✅ tăng chút maxWait/timeout cho Neon, nhưng transaction vẫn ngắn vì chunk nhỏ
+        { maxWait: 10000, timeout: 20000 }
+      );
+    }, 3);
   }
 
   return {
     ok: true,
     summary: {
+      mode,
       createdItems,
       updatedItems,
       affectedStocks,
-      mode: opts.mode,
+      warnings: warningRows.length,
+      defaultWarehouse: { id: defaultWh.id, code: defaultWh.code, name: defaultWh.name },
     },
+    warningRows,
+    batchId: opts?.batchId ?? null,
   };
 }

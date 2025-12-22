@@ -15,34 +15,13 @@ r.get("/", async (req, res, next) => {
     const page = +(req.query.page as string) || 1;
     const pageSize = +(req.query.pageSize as string) || 50;
 
-    // 👇 Gán kiểu tường minh cho where
     const where: Prisma.PartnerWhereInput = q
       ? {
           OR: [
-            {
-              code: {
-                contains: q,
-                mode: "insensitive" as Prisma.QueryMode,
-              },
-            },
-            {
-              name: {
-                contains: q,
-                mode: "insensitive" as Prisma.QueryMode,
-              },
-            },
-            {
-              taxCode: {
-                contains: q,
-                mode: "insensitive" as Prisma.QueryMode,
-              },
-            },
-            {
-              phone: {
-                contains: q,
-                mode: "insensitive" as Prisma.QueryMode,
-              },
-            },
+            { code: { contains: q, mode: "insensitive" as Prisma.QueryMode } },
+            { name: { contains: q, mode: "insensitive" as Prisma.QueryMode } },
+            { taxCode: { contains: q, mode: "insensitive" as Prisma.QueryMode } },
+            { phone: { contains: q, mode: "insensitive" as Prisma.QueryMode } },
           ],
         }
       : {};
@@ -66,55 +45,33 @@ r.get("/", async (req, res, next) => {
 /** GET /partners/:id — chi tiết khách hàng + lịch sử hóa đơn */
 r.get("/:id", async (req, res, next) => {
   try {
-    const id = req.params.id; // Partner.id là String (cuid)
+    const id = req.params.id;
 
     if (!id) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Thiếu id khách hàng" });
+      return res.status(400).json({ ok: false, error: "Thiếu id khách hàng" });
     }
 
-    const partner = await prisma.partner.findUnique({
-      where: { id },
-    });
+    const partner = await prisma.partner.findUnique({ where: { id } });
 
     if (!partner) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "Không tìm thấy khách hàng" });
+      return res.status(404).json({ ok: false, error: "Không tìm thấy khách hàng" });
     }
 
-    // Lịch sử hóa đơn gắn với khách này
     const invoices = await prisma.invoice.findMany({
-      where: {
-        partnerId: id,
-        // nếu bạn có enum InvoiceType và chỉ muốn hóa đơn bán
-        // thì có thể lọc thêm: type: "SALE",
-      },
+      where: { partnerId: id },
       orderBy: { issueDate: "desc" },
-      select: {
-        id: true,
-        code: true,
-        issueDate: true,
-        total: true,
-      },
+      select: { id: true, code: true, issueDate: true, total: true },
     });
 
-    res.json({
-      ok: true,
-      data: {
-        ...partner,
-        invoices,
-      },
-    });
+    res.json({ ok: true, data: { ...partner, invoices } });
   } catch (e) {
     console.error("GET /partners/:id error:", e);
     next(e);
   }
 });
 
-/** POST /partners  — tạo thường (có fallback code) */
-r.post("/", requireRole("accountant", "admin"), async (req, res) => {
+/** POST /partners — ai đăng nhập cũng tạo được */
+r.post("/", async (req, res) => {
   try {
     const codeRaw = (req.body?.code ?? "").toString().trim();
     const nameRaw = (req.body?.name ?? "").toString().trim();
@@ -123,15 +80,11 @@ r.post("/", requireRole("accountant", "admin"), async (req, res) => {
     const address = (req.body?.address ?? "").toString().trim();
 
     if (!nameRaw && !taxCode) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Thiếu name hoặc taxCode" });
+      return res.status(400).json({ ok: false, error: "Thiếu name hoặc taxCode" });
     }
 
     const name = nameRaw || (taxCode ? `KH ${taxCode}` : "KH mới");
-    const code = codeRaw || taxCode || `P${Date.now()}`; // Fallback luôn có
-
-    console.log("CREATE /partners code=", code);
+    const code = codeRaw || taxCode || `P${Date.now()}`;
 
     const created = await prisma.partner.create({
       data: {
@@ -146,92 +99,65 @@ r.post("/", requireRole("accountant", "admin"), async (req, res) => {
     res.json({ ok: true, data: created });
   } catch (e: any) {
     console.error("POST /partners error:", e);
-    if (
-      e instanceof Prisma.PrismaClientKnownRequestError &&
-      e.code === "P2002"
-    ) {
-      return res
-        .status(409)
-        .json({ ok: false, error: "Trùng dữ liệu unique (code/taxCode)" });
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+      return res.status(409).json({ ok: false, error: "Trùng dữ liệu unique (code/taxCode)" });
     }
-    res
-      .status(500)
-      .json({ ok: false, error: "Server error", detail: e?.message });
+    res.status(500).json({ ok: false, error: "Server error", detail: e?.message });
   }
 });
 
-/** POST /partners/upsert-tax — upsert theo MST (có fallback code) */
-r.post(
-  "/upsert-tax",
-  requireRole("accountant", "admin"),
-  async (req, res) => {
-    try {
-      const taxCode = (req.body?.taxCode ?? "").toString().trim();
-      const nameRaw = (req.body?.name ?? "").toString().trim();
-      const phone = (req.body?.phone ?? "").toString().trim();
-      const address = (req.body?.address ?? "").toString().trim();
-      const codeRaw = (req.body?.code ?? "").toString().trim();
+/** POST /partners/upsert-tax — ai đăng nhập cũng upsert được */
+r.post("/upsert-tax", async (req, res) => {
+  try {
+    const taxCode = (req.body?.taxCode ?? "").toString().trim();
+    const nameRaw = (req.body?.name ?? "").toString().trim();
+    const phone = (req.body?.phone ?? "").toString().trim();
+    const address = (req.body?.address ?? "").toString().trim();
+    const codeRaw = (req.body?.code ?? "").toString().trim();
 
-      if (!taxCode)
-        return res
-          .status(400)
-          .json({ ok: false, error: "taxCode là bắt buộc" });
+    if (!taxCode) return res.status(400).json({ ok: false, error: "taxCode là bắt buộc" });
 
-      const found = await prisma.partner.findFirst({ where: { taxCode } });
+    const found = await prisma.partner.findFirst({ where: { taxCode } });
 
-      if (found) {
-        const updated = await prisma.partner.update({
-          where: { id: found.id },
-          data: {
-            ...(nameRaw ? { name: nameRaw } : {}),
-            ...(phone ? { phone } : {}),
-            ...(address ? { address } : {}),
-            ...(codeRaw ? { code: codeRaw } : {}), // không ép đổi code khi không gửi
-          },
-        });
-        return res.json({ ok: true, data: updated, upsert: "updated" });
-      }
-
-      // tạo mới
-      const name = nameRaw || `KH ${taxCode}`;
-      const code = codeRaw || taxCode || `P${Date.now()}`; // Fallback luôn có
-
-      console.log("CREATE /partners/upsert-tax code=", code);
-
-      const created = await prisma.partner.create({
+    if (found) {
+      const updated = await prisma.partner.update({
+        where: { id: found.id },
         data: {
-          code,
-          taxCode,
-          name,
+          ...(nameRaw ? { name: nameRaw } : {}),
           ...(phone ? { phone } : {}),
           ...(address ? { address } : {}),
+          ...(codeRaw ? { code: codeRaw } : {}),
         },
       });
-
-      res.json({ ok: true, data: created, upsert: "created" });
-    } catch (e: any) {
-      console.error("POST /partners/upsert-tax error:", e);
-      if (e instanceof Prisma.PrismaClientKnownRequestError) {
-        if (e.code === "P2002") {
-          return res
-            .status(409)
-            .json({ ok: false, error: "Trùng unique (code/taxCode)" });
-        }
-        if (e.code === "P2003") {
-          return res
-            .status(400)
-            .json({ ok: false, error: "Ràng buộc khóa ngoại" });
-        }
-      }
-      res
-        .status(500)
-        .json({ ok: false, error: "Server error", detail: e?.message });
+      return res.json({ ok: true, data: updated, upsert: "updated" });
     }
-  }
-);
 
-/** PUT /partners/:id */
-r.put("/:id", requireRole("accountant", "admin"), async (req, res) => {
+    const name = nameRaw || `KH ${taxCode}`;
+    const code = codeRaw || taxCode || `P${Date.now()}`;
+
+    const created = await prisma.partner.create({
+      data: {
+        code,
+        taxCode,
+        name,
+        ...(phone ? { phone } : {}),
+        ...(address ? { address } : {}),
+      },
+    });
+
+    res.json({ ok: true, data: created, upsert: "created" });
+  } catch (e: any) {
+    console.error("POST /partners/upsert-tax error:", e);
+    if (e instanceof Prisma.PrismaClientKnownRequestError) {
+      if (e.code === "P2002") return res.status(409).json({ ok: false, error: "Trùng unique (code/taxCode)" });
+      if (e.code === "P2003") return res.status(400).json({ ok: false, error: "Ràng buộc khóa ngoại" });
+    }
+    res.status(500).json({ ok: false, error: "Server error", detail: e?.message });
+  }
+});
+
+/** PUT /partners/:id — ai đăng nhập cũng sửa được */
+r.put("/:id", async (req, res) => {
   try {
     const id = req.params.id;
     const code = (req.body?.code ?? "").toString().trim();
@@ -254,21 +180,14 @@ r.put("/:id", requireRole("accountant", "admin"), async (req, res) => {
     res.json({ ok: true, data: updated });
   } catch (e: any) {
     console.error("PUT /partners/:id error:", e);
-    if (
-      e instanceof Prisma.PrismaClientKnownRequestError &&
-      e.code === "P2002"
-    ) {
-      return res
-        .status(409)
-        .json({ ok: false, error: "Trùng dữ liệu unique" });
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+      return res.status(409).json({ ok: false, error: "Trùng dữ liệu unique" });
     }
-    res
-      .status(500)
-      .json({ ok: false, error: "Server error", detail: e?.message });
+    res.status(500).json({ ok: false, error: "Server error", detail: e?.message });
   }
 });
 
-/** DELETE /partners/:id */
+/** DELETE /partners/:id — vẫn admin-only để an toàn */
 r.delete("/:id", requireRole("admin"), async (req, res) => {
   try {
     const id = req.params.id;
@@ -276,9 +195,7 @@ r.delete("/:id", requireRole("admin"), async (req, res) => {
     res.json({ ok: true, data: del });
   } catch (e: any) {
     console.error("DELETE /partners/:id error:", e);
-    res
-      .status(500)
-      .json({ ok: false, error: "Server error", detail: e?.message });
+    res.status(500).json({ ok: false, error: "Server error", detail: e?.message });
   }
 });
 
