@@ -12,6 +12,8 @@ import { auditLog, type AuditCtx } from "./audit.service";
 
 const prisma = new PrismaClient();
 
+/** ======================= helpers ======================= **/
+
 function mergeMeta(a: any, b: any) {
   if (!a && !b) return undefined;
   if (!a) return b;
@@ -35,11 +37,11 @@ export type CreatePaymentInput = {
   note?: string;
   createdById?: string;
 
-  // ✅ allocation.amount: NORMAL có thể âm (refund), WARRANTY_HOLD chỉ dương
+  // ✅ allocation.amount: NORMAL signed (receipt + / refund -), HOLD signed (receipt + / refund -)
   allocations?: {
     invoiceId: string;
     amount: number;
-    kind?: AllocationKind | "NORMAL" | "WARRANTY_HOLD";
+    kind?: AllocationKind | "NORMAL" | "HOLD" | "WARRANTY_HOLD";
   }[];
 };
 
@@ -53,8 +55,19 @@ function num(n: any): number {
   return Number.isFinite(v) ? v : 0;
 }
 
-function kindOf(x: any): AllocationKind {
+function isHoldKind(k: any) {
+  const x = String(k ?? "").toUpperCase();
+  return x === "WARRANTY_HOLD" || x === "HOLD";
+}
+
+/**
+ * Normalize kind:
+ * - Accept legacy "HOLD" and normalize to "WARRANTY_HOLD" (new name)
+ * - Default: "NORMAL"
+ */
+function kindOf(x: any): AllocationKind | "NORMAL" | "WARRANTY_HOLD" {
   const k = String(x ?? "NORMAL").toUpperCase();
+  if (k === "HOLD") return "WARRANTY_HOLD";
   if (k === "WARRANTY_HOLD") return "WARRANTY_HOLD";
   return "NORMAL";
 }
@@ -85,24 +98,104 @@ function roundMoney(n: number) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
 }
 
-function computeDerivedHold(params: { total: number; hasHold: boolean; pct: number }) {
-  const total = roundMoney(params.total || 0);
-  if (!params.hasHold) return { pct: 0, holdAmount: 0, collectible: total };
-  const pct =
-    Number.isFinite(params.pct) && params.pct > 0 ? params.pct : 5; // default 5%
-  const holdAmount = roundMoney((total * pct) / 100);
-  const collectible = Math.max(0, roundMoney(total - holdAmount));
-  return { pct, holdAmount, collectible };
+/** ======================= NET helpers (VERY IMPORTANT) ======================= **/
+
+function getInvoiceNetBase(inv: {
+  subtotal?: any;
+  total?: any;
+  netSubtotal?: any;
+  netTotal?: any;
+}) {
+  const total = roundMoney(num(inv.total));
+  const subtotal = roundMoney(num(inv.subtotal));
+
+  const netTotal = roundMoney(num((inv as any).netTotal));
+  const netSubtotal = roundMoney(num((inv as any).netSubtotal));
+
+  const baseTotal = Number.isFinite(netTotal) && netTotal >= 0 ? netTotal : total;
+  const baseSubtotal = Number.isFinite(netSubtotal) && netSubtotal >= 0 ? netSubtotal : subtotal;
+
+  return { total, subtotal, baseTotal, baseSubtotal };
 }
+
+/**
+ * Legacy fallback (chỉ dùng nếu invoice cũ chưa có warrantyHoldAmount)
+ * - KHÔNG phải logic chính nữa.
+ *
+ * ✅ NEW RULE:
+ * - warrantyHoldPct (nếu dùng legacy) áp trên SUBTOTAL (tạm tính), không phải total (gross)
+ */
+function legacyDerivedHold(params: { subtotal: number; hasHold: boolean; pct: number }) {
+  const subtotal = roundMoney(params.subtotal || 0);
+  if (!params.hasHold) return { pct: 0, holdAmount: 0 };
+  const pct = Number.isFinite(params.pct) && params.pct > 0 ? params.pct : 0;
+  const holdAmount = pct > 0 ? roundMoney((subtotal * pct) / 100) : 0;
+  return { pct, holdAmount };
+}
+
+/**
+ * Hold = số tiền treo nhập trực tiếp (warrantyHoldAmount) nếu hasWarrantyHold=true.
+ * Fallback legacy:
+ * - nếu hasWarrantyHold=true mà warrantyHoldAmount=0 và warrantyHoldPct>0 => derive theo pct (trên subtotal/netSubtotal)
+ *
+ * ✅ IMPORTANT:
+ * - collectible NORMAL = baseTotal (NET after return, still includes VAT) - holdAmount
+ * - holdAmount cap theo baseSubtotal
+ */
+function computeHoldFromInvoice(inv: {
+  subtotal?: any;
+  total?: any;
+  netSubtotal?: any;
+  netTotal?: any;
+  hasWarrantyHold: any;
+  warrantyHoldAmount: any;
+  warrantyHoldPct: any;
+}) {
+  const { baseTotal, baseSubtotal } = getInvoiceNetBase(inv);
+
+  const hasHold = inv.hasWarrantyHold === true;
+  if (!hasHold) {
+    return { hasHold: false, holdAmount: 0, collectible: baseTotal, source: "NONE" as const };
+  }
+
+  const holdDb = roundMoney(Math.max(0, num(inv.warrantyHoldAmount)));
+  if (holdDb > 0) {
+    const holdAmount = Math.min(holdDb, baseSubtotal);
+    return {
+      hasHold: true,
+      holdAmount,
+      collectible: Math.max(0, roundMoney(baseTotal - holdAmount)),
+      source: "AMOUNT" as const,
+    };
+  }
+
+  // legacy fallback (pct on baseSubtotal)
+  const pct = num(inv.warrantyHoldPct);
+  const legacy = legacyDerivedHold({ subtotal: baseSubtotal, hasHold: true, pct });
+  const holdAmount = Math.min(Math.max(0, legacy.holdAmount), baseSubtotal);
+
+  return {
+    hasHold: true,
+    holdAmount,
+    collectible: Math.max(0, roundMoney(baseTotal - holdAmount)),
+    source: holdAmount > 0 ? ("PERCENT_LEGACY" as const) : ("ZERO" as const),
+  };
+}
+
+/** ======================= main service ======================= **/
 
 /**
  * Create payment + allocations and update invoices
  * ✅ supports auditCtx for logging (userId/userRole/meta)
+ *
+ * Business rules (Option A upgraded):
+ * - RECEIPT: NORMAL >= 0, HOLD >= 0
+ * - PAYMENT (refund): NORMAL <= 0, HOLD <= 0   (để hoàn cả HOLD nếu đã thu)
+ *
+ * - Invoice.paidAmount = NET NORMAL (không cộng HOLD)
+ * - WarrantyHold net = sum allocations kind HOLD (có thể giảm khi refund HOLD)
  */
-export async function createPaymentWithAllocations(
-  input: CreatePaymentInput,
-  auditCtx?: AuditCtx
-) {
+export async function createPaymentWithAllocations(input: CreatePaymentInput, auditCtx?: AuditCtx) {
   const {
     date,
     partnerId,
@@ -130,14 +223,20 @@ export async function createPaymentWithAllocations(
     .filter((a) => a?.invoiceId && Number.isFinite(num(a.amount)) && num(a.amount) !== 0)
     .map((a) => ({
       invoiceId: String(a.invoiceId),
-      amount: num(a.amount), // ✅ signed for NORMAL; HOLD always positive
+      amount: num(a.amount), // signed
       kind: kindOf(a.kind),
     }));
 
   // ========= validate allocation sign rules =========
   for (const a of rawAllocs) {
-    if (a.kind === "WARRANTY_HOLD") {
-      if (a.amount <= 0) throw new Error("Phân bổ WARRANTY_HOLD phải là số dương.");
+    if (isHoldKind(a.kind)) {
+      // ✅ RECEIPT chỉ dương; PAYMENT chỉ âm (refund hold)
+      if (type === "RECEIPT" && a.amount <= 0) {
+        throw new Error("Phiếu THU (RECEIPT): phân bổ HOLD phải là số dương.");
+      }
+      if (type === "PAYMENT" && a.amount >= 0) {
+        throw new Error("Phiếu CHI (PAYMENT): phân bổ HOLD phải là số âm (hoàn HOLD).");
+      }
     } else {
       // NORMAL
       if (type === "RECEIPT" && a.amount < 0) {
@@ -151,29 +250,18 @@ export async function createPaymentWithAllocations(
 
   // ========= validate total = cash amount =========
   if (rawAllocs.length > 0) {
-    const holdSum = rawAllocs
-      .filter((x) => x.kind === "WARRANTY_HOLD")
-      .reduce((s, x) => s + Math.abs(x.amount), 0);
-
     if (type === "RECEIPT") {
-      const normalSum = rawAllocs
-        .filter((x) => x.kind === "NORMAL")
-        .reduce((s, x) => s + x.amount, 0); // >=0
-      const expected = normalSum + holdSum;
+      const expected = rawAllocs.reduce((s, x) => s + num(x.amount), 0);
       if (!nearlyEqual(expected, num(amount))) {
         throw new Error(
-          `Tổng phân bổ (NORMAL + HOLD) = ${expected} phải bằng số tiền phiếu = ${num(amount)}.`
+          `Tổng phân bổ (signed) = ${expected} phải bằng số tiền phiếu = ${num(amount)}.`
         );
       }
     } else {
-      // PAYMENT: normal âm => cash = abs(normal)
-      const normalAbs = rawAllocs
-        .filter((x) => x.kind === "NORMAL")
-        .reduce((s, x) => s + Math.abs(x.amount), 0);
-      const expected = normalAbs + holdSum;
+      const expected = rawAllocs.reduce((s, x) => s + Math.abs(num(x.amount)), 0);
       if (!nearlyEqual(expected, num(amount))) {
         throw new Error(
-          `Tổng phân bổ (abs(NORMAL) + HOLD) = ${expected} phải bằng số tiền phiếu = ${num(amount)}.`
+          `Tổng phân bổ (sum abs allocations) = ${expected} phải bằng số tiền phiếu = ${num(amount)}.`
         );
       }
     }
@@ -191,15 +279,22 @@ export async function createPaymentWithAllocations(
         if (!acc.isActive) throw new Error("Tài khoản nhận/chi đang bị khóa");
       }
 
-      // Snapshot audit input summary (small)
       const allocSummary = {
         invoiceCount: Array.from(new Set(rawAllocs.map((a) => a.invoiceId))).length,
         normalSigned: sumBy(
-          rawAllocs.filter((a) => a.kind === "NORMAL"),
+          rawAllocs.filter((a) => !isHoldKind(a.kind)),
           (a) => a.amount
         ),
-        hold: sumBy(
-          rawAllocs.filter((a) => a.kind === "WARRANTY_HOLD"),
+        holdSigned: sumBy(
+          rawAllocs.filter((a) => isHoldKind(a.kind)),
+          (a) => a.amount
+        ),
+        normalAbs: sumBy(
+          rawAllocs.filter((a) => !isHoldKind(a.kind)),
+          (a) => Math.abs(a.amount)
+        ),
+        holdAbs: sumBy(
+          rawAllocs.filter((a) => isHoldKind(a.kind)),
           (a) => Math.abs(a.amount)
         ),
       };
@@ -252,7 +347,7 @@ export async function createPaymentWithAllocations(
         meta: mergeMeta(auditCtx?.meta, {
           allocations: {
             ...allocSummary,
-            preview: rawAllocs.slice(0, 20).map((a) => ({
+            preview: rawAllocs.slice(0, 30).map((a) => ({
               invoiceId: a.invoiceId,
               kind: a.kind,
               amount: a.amount,
@@ -265,7 +360,6 @@ export async function createPaymentWithAllocations(
       if (rawAllocs.length > 0) {
         const invoiceIds = Array.from(new Set(rawAllocs.map((a) => a.invoiceId)));
 
-        // Load invoices (total + warrantyHold + partner + type + status)
         const invs = await tx.invoice.findMany({
           where: { id: { in: invoiceIds } },
           select: {
@@ -274,7 +368,11 @@ export async function createPaymentWithAllocations(
             type: true,
             status: true,
             partnerId: true,
+
+            subtotal: true,
             total: true,
+            netSubtotal: true,
+            netTotal: true,
 
             paidAmount: true,
             paymentStatus: true,
@@ -283,6 +381,8 @@ export async function createPaymentWithAllocations(
             warrantyHoldPct: true,
             warrantyHoldAmount: true,
             warrantyDueDate: true,
+
+            refInvoiceId: true,
           },
         });
 
@@ -292,10 +392,13 @@ export async function createPaymentWithAllocations(
           throw new Error(`Invoice không tồn tại: ${missing.join(", ")}`);
         }
 
-        // ✅ invoice phải APPROVED mới cho thu/chi phân bổ
+        // ✅ invoice must be APPROVED + not CANCELLED
         for (const inv of invs) {
           if (inv.status !== ("APPROVED" as InvoiceStatus)) {
             throw new Error(`Hoá đơn ${inv.code || inv.id} chưa DUYỆT nên không thể thu/chi.`);
+          }
+          if (String(inv.status) === "CANCELLED") {
+            throw new Error(`Hoá đơn ${inv.code || inv.id} đã HỦY nên không thể thu/chi.`);
           }
         }
 
@@ -306,53 +409,70 @@ export async function createPaymentWithAllocations(
           }
         }
 
-        // ✅ Option A: allocation NORMAL âm chỉ được gắn vào invoice SALES (gốc)
+        // ✅ Option A: allocations chỉ áp vào SALES gốc
         for (const a of rawAllocs) {
-          if (a.kind === "NORMAL" && a.amount < 0) {
-            const inv = invs.find((x) => x.id === a.invoiceId)!;
-            if (inv.type !== "SALES") {
-              throw new Error(
-                "Hoàn tiền (NORMAL âm) theo phương án A chỉ được phân bổ vào hoá đơn SALES gốc."
-              );
-            }
-          }
-        }
+          const inv = invs.find((x) => x.id === a.invoiceId)!;
 
-        // ✅ WARRANTY_HOLD chỉ áp cho hoá đơn SALES có hasWarrantyHold=true
-        for (const a of rawAllocs) {
-          if (a.kind === "WARRANTY_HOLD") {
-            const inv = invs.find((x) => x.id === a.invoiceId)!;
-            if (inv.type !== "SALES") {
-              throw new Error("WARRANTY_HOLD chỉ áp dụng cho hoá đơn BÁN (SALES).");
-            }
+          if (inv.type !== "SALES") {
+            throw new Error("Option A: phân bổ chỉ được áp vào hoá đơn SALES gốc.");
+          }
+
+          if (isHoldKind(a.kind)) {
             if (inv.hasWarrantyHold !== true) {
               throw new Error(
-                `Hoá đơn ${inv.code || inv.id} không có bảo hành, không thể phân bổ WARRANTY_HOLD.`
+                `Hoá đơn ${inv.code || inv.id} không có BH treo (hasWarrantyHold=false), không thể phân bổ HOLD.`
               );
             }
           }
         }
 
-        // Map invoice meta (derive hold nếu legacy bị 0)
+        // Existing sums by invoiceId & kind (signed net)
+        const existing = await tx.paymentAllocation.groupBy({
+          by: ["invoiceId", "kind"],
+          where: { invoiceId: { in: invoiceIds } },
+          _sum: { amount: true },
+        });
+
+        const existingMap = new Map<string, { normal: number; hold: number }>();
+        for (const e of existing) {
+          const cur = existingMap.get(e.invoiceId) || { normal: 0, hold: 0 };
+          const s = num(e._sum.amount);
+
+          if (isHoldKind(e.kind)) cur.hold += s; // signed net hold
+          else cur.normal += s; // signed net normal
+
+          existingMap.set(e.invoiceId, cur);
+        }
+
+        // Map invoice meta (NET base + hold on netSubtotal)
         const invMap = new Map(
           invs.map((i) => {
-            const total = num(i.total);
-            const hasHold = i.hasWarrantyHold === true;
-            const holdDb = num(i.warrantyHoldAmount);
-            const pct = num(i.warrantyHoldPct);
-            const derived = computeDerivedHold({ total, hasHold, pct });
-            const holdAmount = hasHold ? (holdDb > 0 ? holdDb : derived.holdAmount) : 0;
-            const collectible = Math.max(0, roundMoney(total - holdAmount));
+            const base = getInvoiceNetBase(i);
+            const holdInfo = computeHoldFromInvoice(i);
+
+            const ex = existingMap.get(i.id) || { normal: 0, hold: 0 };
+            const existingHoldNet = roundMoney(Math.max(0, ex.hold));
+            const holdCap = roundMoney(Math.max(holdInfo.holdAmount, existingHoldNet));
+
+            // collectible should always use NET baseTotal
+            const collectible = Math.max(0, roundMoney(base.baseTotal - holdInfo.holdAmount));
+
             return [
               i.id,
               {
                 code: i.code,
                 type: i.type as InvoiceType,
-                total,
-                hasHold,
-                pct: hasHold ? (pct > 0 ? pct : 5) : 0,
-                holdAmount,
-                collectible,
+
+                baseSubtotal: base.baseSubtotal,
+                baseTotal: base.baseTotal,
+
+                hasHold: (i.hasWarrantyHold === true) || existingHoldNet > 0.0001,
+                holdAmount: holdCap, // cap for HOLD net
+                collectible, // cap for NORMAL net
+                holdSource:
+                  holdCap > holdInfo.holdAmount
+                    ? ("EXISTING_HOLD_NET_CAP" as const)
+                    : (holdInfo.source as any),
               },
             ] as const;
           })
@@ -364,41 +484,31 @@ export async function createPaymentWithAllocations(
           return {
             invoiceId: inv.id,
             code: inv.code,
-            total: meta.total,
+            baseTotal: meta.baseTotal,
+            baseSubtotal: meta.baseSubtotal,
             hasHold: meta.hasHold,
             holdAmount: meta.holdAmount,
             collectible: meta.collectible,
             paidAmount: num(inv.paidAmount),
             paymentStatus: String(inv.paymentStatus || ""),
+            holdSource: meta.holdSource,
           };
         });
-
-        // Existing sums by invoiceId & kind
-        const existing = await tx.paymentAllocation.groupBy({
-          by: ["invoiceId", "kind"],
-          where: { invoiceId: { in: invoiceIds } },
-          _sum: { amount: true },
-        });
-
-        const existingMap = new Map<string, { normal: number; hold: number }>();
-        for (const e of existing) {
-          const cur = existingMap.get(e.invoiceId) || { normal: 0, hold: 0 };
-          const s = num(e._sum.amount);
-          if (e.kind === "WARRANTY_HOLD") cur.hold = s;
-          else cur.normal = s; // ✅ can be signed sum
-          existingMap.set(e.invoiceId, cur);
-        }
 
         // New sums in request
         const newMap = new Map<string, { normal: number; hold: number }>();
         for (const a of rawAllocs) {
           const cur = newMap.get(a.invoiceId) || { normal: 0, hold: 0 };
-          if (a.kind === "WARRANTY_HOLD") cur.hold += a.amount; // always positive
+          if (isHoldKind(a.kind)) cur.hold += a.amount; // signed
           else cur.normal += a.amount; // signed
           newMap.set(a.invoiceId, cur);
         }
 
-        // Validate caps per invoice (allow refund => normal giảm, nhưng không < 0)
+        /**
+         * ✅ Validate caps per invoice:
+         * - For RECEIPT: enforce upper bound (không thu vượt)
+         * - For PAYMENT (refund): chỉ cần không âm (không hoàn quá số đã thu)
+         */
         for (const invoiceId of invoiceIds) {
           const meta = invMap.get(invoiceId);
           if (!meta) throw new Error(`Invoice ${invoiceId} không tồn tại`);
@@ -406,43 +516,45 @@ export async function createPaymentWithAllocations(
           const ex = existingMap.get(invoiceId) || { normal: 0, hold: 0 };
           const nw = newMap.get(invoiceId) || { normal: 0, hold: 0 };
 
-          const nextNormal = ex.normal + nw.normal; // ✅ can decrease
-          const nextHold = ex.hold + nw.hold;
+          const nextNormal = ex.normal + nw.normal; // net signed
+          const nextHold = ex.hold + nw.hold; // net signed
 
-          // ✅ NORMAL không được < 0 (refund không vượt số đã thu)
           if (nextNormal < -0.0001) {
             throw new Error(
-              `Hoàn tiền vượt quá số đã thu NORMAL. Sau giao dịch, NORMAL sẽ thành ${nextNormal} (< 0).`
+              `Hoàn tiền NORMAL vượt quá số đã thu. Sau giao dịch, NORMAL net = ${nextNormal} (< 0).`
             );
           }
-
-          // ✅ NORMAL không vượt collectible
-          if (nextNormal > meta.collectible + 0.0001) {
+          if (nextHold < -0.0001) {
             throw new Error(
-              `Số tiền phân bổ (NORMAL) vượt quá số cần thu. Được thu tối đa ${meta.collectible}, hiện tại sẽ thành ${nextNormal}.`
+              `Hoàn tiền HOLD vượt quá số đã thu HOLD. Sau giao dịch, HOLD net = ${nextHold} (< 0).`
             );
           }
 
-          // ✅ HOLD chỉ khi invoice có hold + không vượt holdAmount
-          if (nextHold > 0 && !meta.hasHold) {
-            throw new Error("Hoá đơn không có bảo hành, không thể phân bổ khoản WARRANTY_HOLD.");
-          }
-          if (meta.hasHold) {
+          if (type === "RECEIPT") {
+            if (nextNormal > meta.collectible + 0.0001) {
+              throw new Error(
+                `Số tiền NORMAL net vượt quá số cần thu. Tối đa ${meta.collectible}, hiện tại sẽ thành ${nextNormal}.`
+              );
+            }
             if (nextHold > meta.holdAmount + 0.0001) {
               throw new Error(
-                `Số tiền phân bổ (WARRANTY_HOLD) vượt quá số bảo hành treo. Tối đa ${meta.holdAmount}, hiện tại sẽ thành ${nextHold}.`
+                `Số tiền HOLD net vượt quá mức cho phép. Tối đa ${meta.holdAmount}, hiện tại sẽ thành ${nextHold}.`
               );
             }
           }
+
+          if (nextHold > 0 && !meta.hasHold) {
+            throw new Error("Hoá đơn không có bảo hành, không thể có phân bổ HOLD.");
+          }
         }
 
-        // Persist allocations (allow signed)
+        // Persist allocations (signed)
         await tx.paymentAllocation.createMany({
           data: rawAllocs.map((a) => ({
             paymentId: payment.id,
             invoiceId: a.invoiceId,
-            amount: toDec(a.amount), // ✅ signed
-            kind: a.kind,
+            amount: toDec(a.amount),
+            kind: a.kind as any,
           })),
         });
 
@@ -459,8 +571,13 @@ export async function createPaymentWithAllocations(
             normal: new Prisma.Decimal(0),
             hold: new Prisma.Decimal(0),
           };
-          if (s.kind === "WARRANTY_HOLD") cur.hold = s._sum.amount ?? new Prisma.Decimal(0);
-          else cur.normal = s._sum.amount ?? new Prisma.Decimal(0);
+          if (isHoldKind(s.kind)) {
+            cur.hold = (cur.hold ?? new Prisma.Decimal(0)).add(s._sum.amount ?? new Prisma.Decimal(0));
+          } else {
+            cur.normal = (cur.normal ?? new Prisma.Decimal(0)).add(
+              s._sum.amount ?? new Prisma.Decimal(0)
+            );
+          }
           sum2Map.set(s.invoiceId, cur);
         }
 
@@ -474,20 +591,22 @@ export async function createPaymentWithAllocations(
             hold: new Prisma.Decimal(0),
           };
 
-          const paidNormalNum = num(sums.normal); // signed sum, validated >= 0 overall
-          const paidHoldNum = num(sums.hold); // >= 0
+          const paidNormalNet = num(sums.normal); // net >= 0
+          const paidHoldNet = num(sums.hold); // net >= 0
 
-          // ✅ clamp normal/hold trong range (an toàn)
-          const paidNormalClamped = clamp(paidNormalNum, 0, meta.collectible);
-          const paidHoldClamped = clamp(paidHoldNum, 0, meta.holdAmount);
+          const paidNormalClamped = clamp(paidNormalNet, 0, meta.collectible);
+          const paidHoldClamped = clamp(paidHoldNet, 0, meta.holdAmount);
 
-          // ✅ invoice.paidAmount = NORMAL đã thu (không cộng HOLD)
+          // ✅ invoice.paidAmount = NET NORMAL (clamped)
           const invoicePaidAmount = paidNormalClamped;
 
           let paymentStatus: PaymentStatus = "UNPAID";
           if (paidNormalClamped <= 0) paymentStatus = "UNPAID";
           else if (paidNormalClamped + 0.0001 < meta.collectible) paymentStatus = "PARTIAL";
           else paymentStatus = "PAID";
+          if (meta.collectible <= 0.0001) {
+            paymentStatus = "PAID";
+          }
 
           await tx.invoice.update({
             where: { id: inv.id },
@@ -497,9 +616,8 @@ export async function createPaymentWithAllocations(
             },
           });
 
-          // ✅ Update WarrantyHold row + audit (nếu có hold)
+          // ✅ WarrantyHold row sync (OPEN/PAID) based on HOLD NET
           if (meta.hasHold) {
-            // invoiceId đang unique trong WarrantyHold model
             const holdBefore = await tx.warrantyHold.findUnique({
               where: { invoiceId: inv.id },
               select: {
@@ -515,7 +633,6 @@ export async function createPaymentWithAllocations(
               },
             });
 
-            // nếu legacy chưa có row thì tạo (robust)
             const holdRow =
               holdBefore ??
               (await tx.warrantyHold.create({
@@ -548,7 +665,7 @@ export async function createPaymentWithAllocations(
                 dueDate: inv.warrantyDueDate ?? holdRow.dueDate,
                 status: shouldPaid ? "PAID" : "OPEN",
                 paidAt: shouldPaid ? payment.date : null,
-              },
+              } as any,
             });
 
             const holdAfter = await tx.warrantyHold.findUnique({
@@ -566,7 +683,6 @@ export async function createPaymentWithAllocations(
               },
             });
 
-            // ✅ AUDIT WarrantyHold change (chỉ log khi userId có)
             await auditLog(tx, {
               userId: auditCtx?.userId ?? createdById,
               userRole: auditCtx?.userRole,
@@ -598,8 +714,9 @@ export async function createPaymentWithAllocations(
                 invoiceCode: meta.code,
                 paymentId: payment.id,
                 paymentDate: toIsoDateOnly(payment.date),
-                paidHoldClamped,
+                paidHoldNet: paidHoldClamped,
                 holdAmount: meta.holdAmount,
+                holdSource: meta.holdSource,
               }),
             });
           }
@@ -607,12 +724,13 @@ export async function createPaymentWithAllocations(
           invAfterForAudit.push({
             invoiceId: inv.id,
             code: meta.code,
-            total: meta.total,
+            baseTotal: meta.baseTotal,
+            baseSubtotal: meta.baseSubtotal,
             hasHold: meta.hasHold,
             holdAmount: meta.holdAmount,
             collectible: meta.collectible,
-            paidNormal: paidNormalClamped,
-            paidHold: paidHoldClamped,
+            paidNormalNet: paidNormalClamped,
+            paidHoldNet: paidHoldClamped,
             invoicePaidAmount,
             paymentStatus,
           });
@@ -625,12 +743,8 @@ export async function createPaymentWithAllocations(
           action: "PAYMENT_APPLY_ALLOCATIONS",
           entity: "Payment",
           entityId: payment.id,
-          before: {
-            invoices: invBeforeForAudit,
-          },
-          after: {
-            invoices: invAfterForAudit,
-          },
+          before: { invoices: invBeforeForAudit },
+          after: { invoices: invAfterForAudit },
           meta: mergeMeta(auditCtx?.meta, {
             payment: {
               id: payment.id,
@@ -665,10 +779,13 @@ export async function createPaymentWithAllocations(
               issueDate: true,
               type: true,
               total: true,
+              netTotal: true,
               hasWarrantyHold: true,
               warrantyHoldPct: true,
               warrantyHoldAmount: true,
               warrantyDueDate: true,
+              refInvoiceId: true,
+              status: true,
             },
           },
         },
@@ -719,10 +836,13 @@ export async function listPayments(params: ListPaymentsParams) {
               issueDate: true,
               type: true,
               total: true,
+              netTotal: true,
               hasWarrantyHold: true,
               warrantyHoldPct: true,
               warrantyHoldAmount: true,
               warrantyDueDate: true,
+              refInvoiceId: true,
+              status: true,
             },
           },
         },
@@ -747,10 +867,13 @@ export async function getPaymentById(id: string) {
               issueDate: true,
               type: true,
               total: true,
+              netTotal: true,
               hasWarrantyHold: true,
               warrantyHoldPct: true,
               warrantyHoldAmount: true,
               warrantyDueDate: true,
+              refInvoiceId: true,
+              status: true,
             },
           },
         },

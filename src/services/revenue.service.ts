@@ -48,38 +48,30 @@ type StaffRow = {
   role: "SALE" | "TECH";
 
   /**
-   * ✅ Doanh thu cá nhân (NET - chưa VAT) theo Payment.date
-   * - phần thu: NET = NORMAL(gross) * subtotal/total
-   * - bonus: NET hold = holdGross * subtotal/total (chỉ khi thu đủ "need" = total - holdGross)
-   * => trần doanh thu = subtotal (chưa VAT)
+   * ✅ Doanh thu cá nhân theo dòng tiền, quy về NET (chưa VAT)
+   * - NORMAL: quy đổi gross -> net theo tỷ lệ subtotalNet/total
+   * - WARRANTY_HOLD: không cộng vào personalRevenue ngay, chỉ bonus khi NORMAL thu đủ "need"
+   * => khi thu đủ need, nhân viên hưởng 100% giá trị hóa đơn (NET, không VAT)
    */
   personalRevenue: number;
 
-  /**
-   * ✅ "Đã thu" để hiển thị cùng hệ quy chiếu với doanh thu (NET chưa VAT)
-   * -> tránh tình trạng "đã thu > doanh thu" do VAT.
-   *
-   * LƯU Ý: net ở đây vẫn tính theo NORMAL (không tính WARRANTY_HOLD vào doanh thu).
-   */
-  collectedNormal: number; // NET (từ NORMAL)
+  /** ✅ NET thu từ NORMAL (để hiển thị cùng hệ quy chiếu với doanh thu) */
+  collectedNormal: number;
 
-  /** ✅ BONUS = NET (chưa VAT) */
+  /** ✅ BONUS NET (phần BH treo quy đổi net) */
   bonusWarranty: number;
 
-  /** ✅ GROSS tiền thực thu (bao gồm NORMAL + WARRANTY_HOLD nếu có) */
+  /** ✅ GROSS tiền thực thu (NORMAL + WARRANTY_HOLD, có thể gồm VAT) */
   collectedGross?: number;
 };
 
 /**
- * ✅ Doanh thu cá nhân theo dòng tiền (Payment.date)
- * - Chỉ tính invoices APPROVED (SALES/SALES_RETURN)
- * - allocations:
- *    + NORMAL:
- *       - collectedNet:   NET (để hiển thị cùng doanh thu)
- *       - collectedGross: GROSS (đối soát)
- *    + WARRANTY_HOLD:
- *       - KHÔNG cộng vào personalRevenue (tránh double count doanh thu)
- *       - NHƯNG phải cộng vào collectedGross để phản ánh "tiền thực thu"
+ * ✅ Fix quan trọng:
+ * Một số dữ liệu bị lưu sai subtotal (bằng gross), dẫn tới net = gross.
+ * Quy ước tính subtotalNet:
+ * - Nếu có VAT và |(subtotal + tax) - total| lệch đáng kể -> subtotalNet = total - tax
+ * - Else ưu tiên subtotal nếu > 0
+ * - Nếu subtotal = 0 -> fallback SUM(InvoiceLine.amount)
  */
 async function getStaffPersonalRevenue(params: {
   from?: Date;
@@ -105,18 +97,42 @@ async function getStaffPersonalRevenue(params: {
           i."id",
           i."type",
 
-          -- 🔥 staffId có thể NULL (data trả hàng cũ / FE chưa gửi)
+          -- staffId có thể NULL (data cũ)
           i."saleUserId" AS "staffId",
           COALESCE(NULLIF(i."saleUserName", ''), NULLIF(u."username", ''), 'Unknown') AS "staffName",
 
           i."receiveAccountId",
 
-          -- ✅ cần subtotal/total để loại VAT theo tỷ lệ
-          COALESCE(i."subtotal",0) AS subtotal,
-          COALESCE(i."total",0) AS total,
+          COALESCE(i."subtotal",0) AS subtotal_raw,
+          COALESCE(i."tax",0)      AS tax_raw,
+          COALESCE(i."total",0)    AS total,
+
+          -- fallback subtotal theo dòng hàng
+          (
+            SELECT COALESCE(SUM(il."amount"),0)
+            FROM "InvoiceLine" il
+            WHERE il."invoiceId" = i."id"
+          ) AS line_subtotal,
 
           COALESCE(i."warrantyHoldAmount",0) AS hold,
-          (COALESCE(i."total",0) - COALESCE(i."warrantyHoldAmount",0)) AS need
+          (COALESCE(i."total",0) - COALESCE(i."warrantyHoldAmount",0)) AS need,
+
+          -- ✅ subtotalNet (chưa VAT)
+          (
+            CASE
+              WHEN COALESCE(i."total",0) > 0
+                   AND COALESCE(i."tax",0) > 0
+                   AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
+                THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
+              WHEN COALESCE(i."subtotal",0) > 0
+                THEN COALESCE(i."subtotal",0)
+              ELSE (
+                SELECT COALESCE(SUM(il."amount"),0)
+                FROM "InvoiceLine" il
+                WHERE il."invoiceId" = i."id"
+              )
+            END
+          ) AS subtotal_net
         FROM "Invoice" i
         LEFT JOIN "User" u ON u."id" = i."saleUserId"
         WHERE
@@ -135,7 +151,6 @@ async function getStaffPersonalRevenue(params: {
           COALESCE(pa."amount",0) AS amt
         FROM "PaymentAllocation" pa
         JOIN "Payment" p ON p."id" = pa."paymentId"
-        -- ✅ lấy cả NORMAL + WARRANTY_HOLD để tính "thực thu" (gross)
         WHERE pa."kind"::text IN ('NORMAL','WARRANTY_HOLD')
       ),
       seq AS (
@@ -146,7 +161,7 @@ async function getStaffPersonalRevenue(params: {
           inv."staffId",
           inv."staffName",
 
-          inv.subtotal,
+          inv.subtotal_net,
           inv.total,
           inv.hold,
           inv.need,
@@ -156,7 +171,7 @@ async function getStaffPersonalRevenue(params: {
           pay.kind,
           pay.amt,
 
-          -- ✅ chỉ cộng dồn NORMAL để xác định mốc "đủ need" (không tính WARRANTY_HOLD)
+          -- ✅ chỉ cộng dồn NORMAL để xác định đủ need (không tính BH treo)
           SUM(
             CASE WHEN pay.kind = 'NORMAL' THEN pay.amt ELSE 0 END
           ) OVER (
@@ -172,24 +187,22 @@ async function getStaffPersonalRevenue(params: {
           s.invoice_id,
           MIN(s.pay_date) AS hit_date
         FROM seq s
-        -- chỉ bonus khi có hold > 0 và need > 0
         WHERE s.hold > 0 AND s.need > 0 AND s.cum_amt_normal >= s.need
         GROUP BY s.invoice_id
       ),
       cash AS (
         SELECT
-          -- 🔥 key: ưu tiên staffId; nếu NULL thì dùng "__NAME__:" + staffName
           COALESCE(s."staffId", ('__NAME__:' || s."staffName")) AS userId,
           MAX(s."staffName") AS name,
 
-          -- ✅ collected_gross = GROSS thực thu = NORMAL + WARRANTY_HOLD
+          -- ✅ GROSS thực thu = NORMAL + WARRANTY_HOLD
           COALESCE(SUM(s.amt),0) AS collected_gross,
 
-          -- ✅ collected_net = NET (chỉ từ NORMAL, loại VAT theo tỷ lệ subtotal/total)
+          -- ✅ NET thu từ NORMAL (loại VAT theo subtotalNet/total)
           COALESCE(SUM(
             CASE
               WHEN s.kind = 'NORMAL' AND COALESCE(s.total,0) > 0
-                THEN (s.amt * (s.subtotal / NULLIF(s.total,0)))
+                THEN (s.amt * (s.subtotal_net / NULLIF(s.total,0)))
               ELSE 0
             END
           ),0) AS collected_net
@@ -201,19 +214,34 @@ async function getStaffPersonalRevenue(params: {
       ),
       bonus AS (
         SELECT
-          -- 🔥 key giống cash
           COALESCE(i."saleUserId", ('__NAME__:' || COALESCE(NULLIF(i."saleUserName", ''), 'Unknown'))) AS userId,
           MAX(COALESCE(NULLIF(i."saleUserName", ''), NULLIF(u."username", ''), 'Unknown')) AS name,
 
-          -- ✅ BONUS NET (chưa VAT)
-          -- bonusNet = holdGross * (subtotal/total), có xét SALES(+)/SALES_RETURN(-)
+          -- ✅ BONUS NET = holdGross * (subtotalNet/total)
           COALESCE(SUM(
             CASE
               WHEN COALESCE(i."total",0) <= 0 THEN 0
               ELSE (
+                -- subtotalNet same rule as above
+                (
+                  CASE
+                    WHEN COALESCE(i."total",0) > 0
+                         AND COALESCE(i."tax",0) > 0
+                         AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
+                      THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
+                    WHEN COALESCE(i."subtotal",0) > 0
+                      THEN COALESCE(i."subtotal",0)
+                    ELSE (
+                      SELECT COALESCE(SUM(il."amount"),0)
+                      FROM "InvoiceLine" il
+                      WHERE il."invoiceId" = i."id"
+                    )
+                  END
+                ) / NULLIF(COALESCE(i."total",0),0)
+              ) * (
                 CASE i."type"
-                  WHEN 'SALES' THEN COALESCE(i."warrantyHoldAmount",0) * (COALESCE(i."subtotal",0) / NULLIF(COALESCE(i."total",0),0))
-                  WHEN 'SALES_RETURN' THEN -COALESCE(i."warrantyHoldAmount",0) * (COALESCE(i."subtotal",0) / NULLIF(COALESCE(i."total",0),0))
+                  WHEN 'SALES' THEN COALESCE(i."warrantyHoldAmount",0)
+                  WHEN 'SALES_RETURN' THEN -COALESCE(i."warrantyHoldAmount",0)
                   ELSE 0
                 END
               )
@@ -247,9 +275,9 @@ async function getStaffPersonalRevenue(params: {
       name: String(r.name || "Unknown"),
       role: "SALE",
       personalRevenue: n(r.personal), // NET
-      collectedNormal: n(r.collected_net), // ✅ NET (NORMAL)
+      collectedNormal: n(r.collected_net), // NET (NORMAL)
       bonusWarranty: n(r.bonus), // NET
-      collectedGross: n(r.collected_gross), // ✅ GROSS (NORMAL + HOLD)
+      collectedGross: n(r.collected_gross), // GROSS (NORMAL + HOLD)
     }));
 
     return out;
@@ -274,11 +302,34 @@ async function getStaffPersonalRevenue(params: {
 
         i."receiveAccountId",
 
-        COALESCE(i."subtotal",0) AS subtotal,
-        COALESCE(i."total",0) AS total,
+        COALESCE(i."subtotal",0) AS subtotal_raw,
+        COALESCE(i."tax",0)      AS tax_raw,
+        COALESCE(i."total",0)    AS total,
+
+        (
+          SELECT COALESCE(SUM(il."amount"),0)
+          FROM "InvoiceLine" il
+          WHERE il."invoiceId" = i."id"
+        ) AS line_subtotal,
 
         COALESCE(i."warrantyHoldAmount",0) AS hold,
-        (COALESCE(i."total",0) - COALESCE(i."warrantyHoldAmount",0)) AS need
+        (COALESCE(i."total",0) - COALESCE(i."warrantyHoldAmount",0)) AS need,
+
+        (
+          CASE
+            WHEN COALESCE(i."total",0) > 0
+                 AND COALESCE(i."tax",0) > 0
+                 AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
+              THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
+            WHEN COALESCE(i."subtotal",0) > 0
+              THEN COALESCE(i."subtotal",0)
+            ELSE (
+              SELECT COALESCE(SUM(il."amount"),0)
+              FROM "InvoiceLine" il
+              WHERE il."invoiceId" = i."id"
+            )
+          END
+        ) AS subtotal_net
       FROM "Invoice" i
       LEFT JOIN "User" u ON u."id" = i."techUserId"
       WHERE
@@ -297,7 +348,6 @@ async function getStaffPersonalRevenue(params: {
         COALESCE(pa."amount",0) AS amt
       FROM "PaymentAllocation" pa
       JOIN "Payment" p ON p."id" = pa."paymentId"
-      -- ✅ lấy cả NORMAL + WARRANTY_HOLD để tính "thực thu" (gross)
       WHERE pa."kind"::text IN ('NORMAL','WARRANTY_HOLD')
     ),
     seq AS (
@@ -308,7 +358,7 @@ async function getStaffPersonalRevenue(params: {
         inv."staffId",
         inv."staffName",
 
-        inv.subtotal,
+        inv.subtotal_net,
         inv.total,
         inv.hold,
         inv.need,
@@ -318,7 +368,6 @@ async function getStaffPersonalRevenue(params: {
         pay.kind,
         pay.amt,
 
-        -- ✅ chỉ cộng dồn NORMAL để xác định mốc "đủ need"
         SUM(
           CASE WHEN pay.kind = 'NORMAL' THEN pay.amt ELSE 0 END
         ) OVER (
@@ -342,14 +391,12 @@ async function getStaffPersonalRevenue(params: {
         COALESCE(s."staffId", ('__NAME__:' || s."staffName")) AS userId,
         MAX(s."staffName") AS name,
 
-        -- ✅ GROSS thực thu = NORMAL + WARRANTY_HOLD
         COALESCE(SUM(s.amt),0) AS collected_gross,
 
-        -- ✅ NET để hiển thị = chỉ NORMAL, loại VAT theo tỷ lệ
         COALESCE(SUM(
           CASE
             WHEN s.kind = 'NORMAL' AND COALESCE(s.total,0) > 0
-              THEN (s.amt * (s.subtotal / NULLIF(s.total,0)))
+              THEN (s.amt * (s.subtotal_net / NULLIF(s.total,0)))
             ELSE 0
           END
         ),0) AS collected_net
@@ -364,14 +411,29 @@ async function getStaffPersonalRevenue(params: {
         COALESCE(i."techUserId", ('__NAME__:' || COALESCE(NULLIF(i."techUserName", ''), 'Unknown'))) AS userId,
         MAX(COALESCE(NULLIF(i."techUserName", ''), NULLIF(u."username", ''), 'Unknown')) AS name,
 
-        -- ✅ BONUS NET (chưa VAT)
         COALESCE(SUM(
           CASE
             WHEN COALESCE(i."total",0) <= 0 THEN 0
             ELSE (
+              (
+                CASE
+                  WHEN COALESCE(i."total",0) > 0
+                       AND COALESCE(i."tax",0) > 0
+                       AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
+                    THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
+                  WHEN COALESCE(i."subtotal",0) > 0
+                    THEN COALESCE(i."subtotal",0)
+                  ELSE (
+                    SELECT COALESCE(SUM(il."amount"),0)
+                    FROM "InvoiceLine" il
+                    WHERE il."invoiceId" = i."id"
+                  )
+                END
+              ) / NULLIF(COALESCE(i."total",0),0)
+            ) * (
               CASE i."type"
-                WHEN 'SALES' THEN COALESCE(i."warrantyHoldAmount",0) * (COALESCE(i."subtotal",0) / NULLIF(COALESCE(i."total",0),0))
-                WHEN 'SALES_RETURN' THEN -COALESCE(i."warrantyHoldAmount",0) * (COALESCE(i."subtotal",0) / NULLIF(COALESCE(i."total",0),0))
+                WHEN 'SALES' THEN COALESCE(i."warrantyHoldAmount",0)
+                WHEN 'SALES_RETURN' THEN -COALESCE(i."warrantyHoldAmount",0)
                 ELSE 0
               END
             )
@@ -405,9 +467,9 @@ async function getStaffPersonalRevenue(params: {
     name: String(r.name || "Unknown"),
     role: "TECH",
     personalRevenue: n(r.personal), // NET
-    collectedNormal: n(r.collected_net), // ✅ NET (NORMAL)
+    collectedNormal: n(r.collected_net), // NET (NORMAL)
     bonusWarranty: n(r.bonus), // NET
-    collectedGross: n(r.collected_gross), // ✅ GROSS (NORMAL + HOLD)
+    collectedGross: n(r.collected_gross), // GROSS (NORMAL + HOLD)
   }));
 
   return out;
@@ -421,7 +483,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   const trunc = groupBy === "month" ? "month" : groupBy === "week" ? "week" : "day";
 
   /** =========================
-   * KPI: invoice-level (company revenue) ✅ (APPROVED + approvedAt)
+   * KPI: invoice-level (company revenue) (APPROVED + approvedAt)
    * ========================= */
   const invWhere: Prisma.InvoiceWhereInput = {
     status: InvoiceStatus.APPROVED,
@@ -450,39 +512,42 @@ export async function getRevenueDashboard(q: RevenueQuery) {
       subtotal: true,
       tax: true,
       total: true,
-      paidAmount: true, // NORMAL collected (gross, clamp theo collectible)
+      paidAmount: true, // NORMAL collected (gross)
     },
   });
 
-  let netRevenue = 0; // subtotal signed (không VAT)
+  let netRevenue = 0; // subtotalNet signed (không VAT)
   let netVat = 0;
   let netTotal = 0;
 
-  /**
-   * ✅ netCollected: quy về NET để cùng hệ quy chiếu với netRevenue
-   * - paidAmount là gross (NORMAL) -> convert theo tỷ lệ subtotal/total
-   */
+  // ✅ netCollected: quy về NET để cùng hệ quy chiếu với netRevenue
   let netCollected = 0;
 
   for (const r of invRows) {
     const s = revenueSign(r.type);
-    const subtotal = n(r.subtotal);
+    const subtotalRaw = n(r.subtotal);
     const tax = n(r.tax);
     const total = n(r.total);
     const paidGross = n(r.paidAmount);
 
-    netRevenue += s * subtotal;
+    // ✅ Fix: nếu có VAT mà subtotalRaw bị “dính gross” -> dùng total - tax
+    let subtotalNet = subtotalRaw;
+    if (total > 0 && tax > 0 && Math.abs((subtotalRaw + tax) - total) > 0.01) {
+      subtotalNet = Math.max(total - tax, 0);
+    }
+
+    netRevenue += s * subtotalNet;
     netVat += s * tax;
     netTotal += s * total;
 
-    const paidNet = total > 0 ? paidGross * (subtotal / total) : 0;
+    const paidNet = total > 0 ? paidGross * (subtotalNet / total) : 0;
     netCollected += s * paidNet;
   }
 
   const orderCount = invRows.length;
 
   /** =========================
-   * KPI: Net COGS theo MovementLine (OUT +, IN -) ✅
+   * KPI: Net COGS theo MovementLine (OUT +, IN -)
    * ========================= */
   const cogsAgg: Array<{ cogs: any }> = await prisma.$queryRaw`
     SELECT COALESCE(SUM(
@@ -511,7 +576,8 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   const marginPct = netRevenue !== 0 ? (grossProfit / netRevenue) * 100 : 0;
 
   /** =========================
-   * Trend: company revenue (approvedAt) + cogs ✅
+   * Trend: company revenue (approvedAt) + cogs
+   * - revenue dùng subtotalNet (fix VAT lệch)
    * ========================= */
   const trend: Array<{ t: any; revenue: any; cogs: any }> = await prisma.$queryRaw`
     WITH inv AS (
@@ -519,10 +585,21 @@ export async function getRevenueDashboard(q: RevenueQuery) {
         i."id",
         i."approvedAt",
         i."type",
-        i."subtotal",
+        COALESCE(i."subtotal",0) AS subtotal_raw,
+        COALESCE(i."tax",0)      AS tax_raw,
+        COALESCE(i."total",0)    AS total,
         i."saleUserId",
         i."techUserId",
-        i."receiveAccountId"
+        i."receiveAccountId",
+        (
+          CASE
+            WHEN COALESCE(i."total",0) > 0
+                 AND COALESCE(i."tax",0) > 0
+                 AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
+              THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
+            ELSE COALESCE(i."subtotal",0)
+          END
+        ) AS subtotal_net
       FROM "Invoice" i
       WHERE
         i."status" = ${INV_STATUS_APPROVED}
@@ -539,8 +616,8 @@ export async function getRevenueDashboard(q: RevenueQuery) {
         date_trunc(${trunc}, inv."approvedAt") AS t,
         COALESCE(SUM(
           CASE inv."type"
-            WHEN 'SALES' THEN COALESCE(inv."subtotal",0)
-            WHEN 'SALES_RETURN' THEN -COALESCE(inv."subtotal",0)
+            WHEN 'SALES' THEN COALESCE(inv.subtotal_net,0)
+            WHEN 'SALES_RETURN' THEN -COALESCE(inv.subtotal_net,0)
             ELSE 0
           END
         ),0) AS revenue
@@ -583,7 +660,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   });
 
   /** =========================
-   * By Product ✅ (company revenue) - giữ nguyên
+   * By Product (company revenue) - giữ theo InvoiceLine.amount
    * ========================= */
   const byProduct: Array<{ itemId: string; name: string; revenue: any; cogs: any }> = await prisma.$queryRaw`
     WITH inv AS (
@@ -661,7 +738,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   });
 
   /** =========================
-   * ✅ By Staff: doanh thu cá nhân theo Payment.date + bonus hold khi đủ need (NET)
+   * By Staff: doanh thu cá nhân theo Payment.date + bonus hold khi đủ need (NET)
    * ========================= */
   const staffSalePersonal = await getStaffPersonalRevenue({
     from,
@@ -681,20 +758,14 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     receiveAccountId: q.receiveAccountId,
   });
 
-  // FE cũ đang đọc byStaff.sale/tech là list có revenue/cogs/profit/marginPct
-  // → để không vỡ UI, mình map:
-  // - revenue = personalRevenue (NET)
-  // - collectedNormal = NET (để hiển thị cùng revenue)
-  // - collectedGross = GROSS (NORMAL + WARRANTY_HOLD) để phản ánh "thực thu"
-  // - cogs/profit/marginPct = 0 (cash-based theo kỳ, không ghép approve-time)
   const mapToLegacyStaffShape = (rows: StaffRow[]) =>
     rows.map((r) => ({
       userId: r.userId,
       name: r.name,
       role: r.role,
-      revenue: r.personalRevenue, // NET
-      collectedNormal: r.collectedNormal, // ✅ NET (NORMAL)
-      collectedGross: r.collectedGross ?? 0, // ✅ GROSS (NORMAL + HOLD)
+      revenue: r.personalRevenue, // ✅ NET (Doanh thu chưa VAT, đã cộng bonus BH nếu đủ need)
+      collectedNormal: r.collectedNormal, // NET (NORMAL)
+      collectedGross: r.collectedGross ?? 0, // ✅ GROSS thực thu (NORMAL + HOLD)
       bonusWarranty: r.bonusWarranty, // NET
       cogs: 0,
       profit: 0,
@@ -709,7 +780,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
       orderCount,
       netVat,
       netTotal,
-      netCollected, // ✅ NET collected (không VAT) từ paidAmount (NORMAL)
+      netCollected,
       netCogs,
     },
     trend: trendOut,

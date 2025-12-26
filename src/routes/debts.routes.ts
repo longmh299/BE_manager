@@ -26,6 +26,8 @@ function buildAuditMeta(req: any) {
     userAgent: req.headers?.["user-agent"],
     path: req.originalUrl || req.url,
     method: req.method,
+    params: req.params,
+    query: req.query,
   };
 }
 
@@ -38,7 +40,13 @@ function requireUserOr401(req: any, res: any) {
   return { userId, userRole: getUserRole(req) };
 }
 
-r.get("/ping", (req, res) => {
+function isValidDateString(s: any) {
+  if (!s) return true; // optional
+  const d = new Date(String(s));
+  return !isNaN(d.getTime());
+}
+
+r.get("/ping", (_req, res) => {
   res.json({ ok: true, route: "debts", message: "debts router is mounted" });
 });
 
@@ -47,12 +55,23 @@ r.get("/ping", (req, res) => {
  */
 r.get("/by-sale", async (req, res, next) => {
   try {
+    const from = req.query.from as string | undefined;
+    const to = req.query.to as string | undefined;
+
+    if (!isValidDateString(from)) {
+      return res.status(400).json({ ok: false, message: "from không hợp lệ." });
+    }
+    if (!isValidDateString(to)) {
+      return res.status(400).json({ ok: false, message: "to không hợp lệ." });
+    }
+
     const rows = await getDebtsBySale({
-      from: req.query.from as string | undefined,
-      to: req.query.to as string | undefined,
+      from,
+      to,
       saleUserId: req.query.saleUserId as string | undefined,
     });
 
+    // giữ nguyên response shape (array)
     res.json(rows);
   } catch (err) {
     next(err);
@@ -64,11 +83,22 @@ r.get("/by-sale", async (req, res, next) => {
  */
 r.get("/summary-by-sale", async (req, res, next) => {
   try {
+    const from = req.query.from as string | undefined;
+    const to = req.query.to as string | undefined;
+
+    if (!isValidDateString(from)) {
+      return res.status(400).json({ ok: false, message: "from không hợp lệ." });
+    }
+    if (!isValidDateString(to)) {
+      return res.status(400).json({ ok: false, message: "to không hợp lệ." });
+    }
+
     const rows = await getDebtsSummaryBySale({
-      from: req.query.from as string | undefined,
-      to: req.query.to as string | undefined,
+      from,
+      to,
     });
 
+    // giữ nguyên response shape (array)
     res.json(rows);
   } catch (err) {
     next(err);
@@ -80,9 +110,19 @@ r.get("/summary-by-sale", async (req, res, next) => {
  */
 r.get("/by-sale/export", async (req, res, next) => {
   try {
+    const from = req.query.from as string | undefined;
+    const to = req.query.to as string | undefined;
+
+    if (!isValidDateString(from)) {
+      return res.status(400).json({ ok: false, message: "from không hợp lệ." });
+    }
+    if (!isValidDateString(to)) {
+      return res.status(400).json({ ok: false, message: "to không hợp lệ." });
+    }
+
     const rows = await getDebtsBySale({
-      from: req.query.from as string | undefined,
-      to: req.query.to as string | undefined,
+      from,
+      to,
       saleUserId: req.query.saleUserId as string | undefined,
     });
 
@@ -138,7 +178,7 @@ r.get("/by-sale/export", async (req, res, next) => {
       };
     });
 
-    // ✅ FIX: format số tới cột 9 (Nợ) luôn
+    // format số + canh phải (qty + tiền)
     [5, 6, 7, 8, 9].forEach((colIdx) => {
       const col = sheet.getColumn(colIdx);
       col.alignment = { horizontal: "right" };
@@ -246,10 +286,7 @@ r.get("/by-sale/export", async (req, res, next) => {
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="cong-no-theo-sale.xlsx"`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename="cong-no-theo-sale.xlsx"`);
     res.send(Buffer.from(buf));
   } catch (err) {
     next(err);
@@ -263,6 +300,10 @@ r.patch("/:invoiceId/note", async (req, res, next) => {
   try {
     const { invoiceId } = req.params;
     const { note } = req.body as { note?: string };
+
+    if (!invoiceId) {
+      return res.status(400).json({ ok: false, message: "Thiếu invoiceId." });
+    }
 
     const audit = requireUserOr401(req, res);
     if (!audit) return;

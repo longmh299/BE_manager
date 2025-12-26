@@ -4,14 +4,7 @@ import { auditLog, type AuditCtx } from "./audit.service";
 
 const prisma = new PrismaClient();
 
-export type DebtsBySaleParams = {
-  from?: string;
-  to?: string;
-  saleUserId?: string;
-
-  // ✅ tuỳ chọn: mặc định chỉ lấy APPROVED để công nợ “chốt”
-  statuses?: InvoiceStatus[];
-};
+/** ======================= helpers ======================= **/
 
 function toEndOfDay(d: Date) {
   const x = new Date(d);
@@ -29,8 +22,16 @@ function toNum(v: any) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function roundMoney(n: number) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * Legacy helper: tính gross total (VAT included) cho UI cũ
+ * - ưu tiên các field legacy nếu có
+ * - fallback = subtotal + tax
+ */
 function calcInvoiceTotalWithTax(inv: any, subtotalFallback: number, taxFallback: number) {
-  // ưu tiên total nếu đã lưu sẵn
   const candidates = [inv.totalWithTax, inv.totalAmount, inv.total, inv.grandTotal].filter(
     (x) => x != null
   );
@@ -41,16 +42,81 @@ function calcInvoiceTotalWithTax(inv: any, subtotalFallback: number, taxFallback
   return subtotal + tax;
 }
 
+/**
+ * ✅ NEW: basis/net/collectible để tính công nợ chuẩn
+ *
+ * Rule:
+ * - netTotal: ưu tiên netTotal (đã trừ trả hàng), fallback total
+ * - holdAmount: nếu hasWarrantyHold => dùng warrantyHoldAmount (đã sync theo netSubtotal)
+ * - clamp holdAmount: 0..netSubtotal
+ * - collectible = max(0, netTotal - holdAmount)
+ */
+function computeDebtBasis(inv: any, grossSubtotalFallback: number, grossTaxFallback: number) {
+  const grossSubtotal = inv.subtotal != null ? toNum(inv.subtotal) : grossSubtotalFallback;
+  const grossTax = inv.tax != null ? toNum(inv.tax) : grossTaxFallback;
+  const grossTotal = roundMoney(calcInvoiceTotalWithTax(inv, grossSubtotal, grossTax));
+
+  const netSubtotal = inv.netSubtotal != null ? roundMoney(toNum(inv.netSubtotal)) : grossSubtotal;
+  const netTax = inv.netTax != null ? roundMoney(toNum(inv.netTax)) : grossTax;
+  const netTotal =
+    inv.netTotal != null
+      ? roundMoney(toNum(inv.netTotal))
+      : roundMoney(toNum(inv.total ?? grossTotal));
+
+  const hasHold = inv.hasWarrantyHold === true;
+
+  let holdAmount = hasHold ? roundMoney(Math.max(0, toNum(inv.warrantyHoldAmount))) : 0;
+  if (holdAmount > netSubtotal) holdAmount = netSubtotal;
+
+  const collectible = Math.max(0, roundMoney(netTotal - holdAmount));
+
+  return {
+    grossSubtotal,
+    grossTax,
+    grossTotal,
+
+    netSubtotal,
+    netTax,
+    netTotal,
+
+    hasHold,
+    holdAmount,
+    collectible,
+  };
+}
+
+/**
+ * ✅ NEW: loại invoice full-return khỏi công nợ
+ * - dùng DB filter nếu có netTotal
+ */
+function buildExcludeFullyReturnedWhere() {
+  return {
+    OR: [{ netTotal: { gt: 0 } }, { netTotal: null, total: { gt: 0 } }],
+  };
+}
+
 /** =========================================================
- *  CHI TIẾT CÔNG NỢ THEO SALE
- *  (READ-ONLY → KHÔNG audit)
+ *  CHI TIẾT CÔNG NỢ THEO SALE (READ-ONLY)
  * ========================================================= */
+
+export type DebtsBySaleParams = {
+  from?: string;
+  to?: string;
+  saleUserId?: string;
+
+  // ✅ tuỳ chọn: mặc định chỉ lấy APPROVED để công nợ “chốt”
+  statuses?: InvoiceStatus[];
+};
+
 export async function getDebtsBySale(params: DebtsBySaleParams) {
   const { from, to, saleUserId } = params;
 
   const whereInvoice: any = {
     type: InvoiceType.SALES,
     status: { in: params.statuses?.length ? params.statuses : (["APPROVED"] as InvoiceStatus[]) },
+
+    // ✅ loại full-return (netTotal<=0)
+    ...buildExcludeFullyReturnedWhere(),
   };
 
   if (from || to) {
@@ -70,9 +136,8 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
   const rows: any[] = [];
 
   for (const inv of invoices as any[]) {
-    const paidTotal = toNum(inv.paidAmount);
+    const paidTotal = roundMoney(toNum(inv.paidAmount)); // paidAmount = NET NORMAL
 
-    // subtotal (tiền hàng chưa VAT) - fallback sum line.amount
     let subtotal = inv.subtotal != null ? toNum(inv.subtotal) : 0;
     if (!subtotal) {
       subtotal = (inv.lines || []).reduce((sum: number, line: any) => {
@@ -82,11 +147,15 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
         return sum + amount;
       }, 0);
     }
+    subtotal = roundMoney(subtotal);
 
-    const tax = inv.tax != null ? toNum(inv.tax) : 0;
-    const totalWithTax = calcInvoiceTotalWithTax(inv, subtotal, tax);
+    const tax = inv.tax != null ? roundMoney(toNum(inv.tax)) : 0;
+    const totalWithTax = roundMoney(calcInvoiceTotalWithTax(inv, subtotal, tax));
 
-    const debtTotal = Math.max(0, totalWithTax - paidTotal);
+    const basis = computeDebtBasis(inv, subtotal, tax);
+    if (basis.collectible <= 0.0001) continue;
+
+    const debtTotal = Math.max(0, roundMoney(basis.collectible - paidTotal));
 
     const lines = Array.isArray(inv.lines) ? inv.lines : [];
     if (lines.length === 0) {
@@ -100,19 +169,27 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
         qty: 0,
         unitPrice: 0,
         amount: subtotal,
+
         paid: paidTotal,
         debt: debtTotal,
+
         note: inv.note ?? "",
         saleUserId: inv.saleUserId ?? null,
         saleUserName: inv.saleUser?.username ?? inv.saleUserName ?? "(Chưa gán)",
+
         invoiceSubtotal: subtotal,
         invoiceTax: tax,
         invoiceTotal: totalWithTax,
+
+        invoiceNetSubtotal: basis.netSubtotal,
+        invoiceNetTax: basis.netTax,
+        invoiceNetTotal: basis.netTotal,
+        invoiceHoldAmount: basis.holdAmount,
+        invoiceCollectible: basis.collectible,
       });
       continue;
     }
 
-    // ✅ paid/debt chỉ nằm ở dòng đầu tiên
     lines.forEach((line: any, idx: number) => {
       const qty = toNum(line.qty);
       const price = toNum(line.price);
@@ -128,14 +205,23 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
         qty,
         unitPrice: price,
         amount,
+
         paid: idx === 0 ? paidTotal : 0,
         debt: idx === 0 ? debtTotal : 0,
+
         note: inv.note ?? "",
         saleUserId: inv.saleUserId ?? null,
         saleUserName: inv.saleUser?.username ?? inv.saleUserName ?? "(Chưa gán)",
+
         invoiceSubtotal: subtotal,
         invoiceTax: tax,
         invoiceTotal: totalWithTax,
+
+        invoiceNetSubtotal: basis.netSubtotal,
+        invoiceNetTax: basis.netTax,
+        invoiceNetTotal: basis.netTotal,
+        invoiceHoldAmount: basis.holdAmount,
+        invoiceCollectible: basis.collectible,
       });
     });
   }
@@ -144,9 +230,9 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
 }
 
 /** =========================================================
- *  TỔNG HỢP CÔNG NỢ THEO SALE
- *  (READ-ONLY → KHÔNG audit)
+ *  TỔNG HỢP CÔNG NỢ THEO SALE (READ-ONLY)
  * ========================================================= */
+
 export type DebtsSummaryBySaleParams = {
   from?: string;
   to?: string;
@@ -159,6 +245,7 @@ export async function getDebtsSummaryBySale(params: DebtsSummaryBySaleParams) {
   const whereInvoice: any = {
     type: InvoiceType.SALES,
     status: { in: params.statuses?.length ? params.statuses : (["APPROVED"] as InvoiceStatus[]) },
+    ...buildExcludeFullyReturnedWhere(),
   };
 
   if (from || to) {
@@ -177,9 +264,14 @@ export async function getDebtsSummaryBySale(params: DebtsSummaryBySaleParams) {
     {
       saleUserId: string | null;
       saleUserName: string;
-      totalAmount: number;
+
+      totalAmount: number; // gross
       totalPaid: number;
       totalDebt: number;
+
+      totalNetAmount: number;
+      totalCollectible: number;
+      totalHoldAmount: number;
     }
   > = {};
 
@@ -189,9 +281,14 @@ export async function getDebtsSummaryBySale(params: DebtsSummaryBySaleParams) {
       map[key] = {
         saleUserId: inv.saleUserId ?? null,
         saleUserName: inv.saleUser?.username ?? inv.saleUserName ?? "(Chưa gán sale)",
+
         totalAmount: 0,
         totalPaid: 0,
         totalDebt: 0,
+
+        totalNetAmount: 0,
+        totalCollectible: 0,
+        totalHoldAmount: 0,
       };
     }
 
@@ -204,25 +301,33 @@ export async function getDebtsSummaryBySale(params: DebtsSummaryBySaleParams) {
         return sum + amount;
       }, 0);
     }
+    subtotal = roundMoney(subtotal);
 
-    const tax = inv.tax != null ? toNum(inv.tax) : 0;
-    const totalWithTax = calcInvoiceTotalWithTax(inv, subtotal, tax);
+    const tax = inv.tax != null ? roundMoney(toNum(inv.tax)) : 0;
+    const totalWithTax = roundMoney(calcInvoiceTotalWithTax(inv, subtotal, tax));
 
-    const paid = toNum(inv.paidAmount);
-    const debt = Math.max(0, totalWithTax - paid);
+    const basis = computeDebtBasis(inv, subtotal, tax);
+    if (basis.collectible <= 0.0001) continue;
+
+    const paid = roundMoney(toNum(inv.paidAmount));
+    const debt = Math.max(0, roundMoney(basis.collectible - paid));
 
     map[key].totalAmount += totalWithTax;
     map[key].totalPaid += paid;
     map[key].totalDebt += debt;
+
+    map[key].totalNetAmount += basis.netTotal;
+    map[key].totalHoldAmount += basis.holdAmount;
+    map[key].totalCollectible += basis.collectible;
   }
 
   return Object.values(map);
 }
 
 /** =========================================================
- *  UPDATE GHI CHÚ CÔNG NỢ
- *  (MUTATE → CÓ AUDIT)
+ *  UPDATE NOTE (MUTATE → CÓ AUDIT)
  * ========================================================= */
+
 export async function updateDebtNote(invoiceId: string, note: string, auditCtx?: AuditCtx) {
   return prisma.$transaction(async (tx) => {
     const before = await tx.invoice.findUnique({

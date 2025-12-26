@@ -29,6 +29,73 @@ function buildAuditMeta(req: any) {
   };
 }
 
+/** ========================= RETURN META (BE computed) ========================= **/
+
+function toNum(v: any) {
+  if (v == null) return 0;
+  const n = typeof v === "number" ? v : Number(String(v));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function roundMoney(n: number) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * ✅ returnMeta giúp FE render & filter lâu dài
+ * - state:
+ *   - FULL: (status=CANCELLED) OR (netTotal<=0 && returnedTotal>0)
+ *   - PARTIAL: returnedTotal>0 && netTotal>0
+ *   - NONE: returnedTotal<=0
+ *
+ * - debtIgnore: FULL => true
+ * - collectible: max(0, baseTotal - holdAmount)
+ *   baseTotal: netTotal fallback total
+ *   holdAmount: warrantyHoldAmount (đã recompute theo netSubtotal ở service)
+ */
+function computeReturnMeta(inv: any) {
+  const total = roundMoney(toNum(inv.total));
+  const netTotal =
+    inv.netTotal != null && toNum(inv.netTotal) >= 0 ? roundMoney(toNum(inv.netTotal)) : total;
+
+  const returnedTotal =
+    inv.returnedTotal != null && toNum(inv.returnedTotal) >= 0
+      ? roundMoney(toNum(inv.returnedTotal))
+      : 0;
+
+  const baseSubtotal =
+    inv.netSubtotal != null && toNum(inv.netSubtotal) >= 0
+      ? roundMoney(toNum(inv.netSubtotal))
+      : inv.subtotal != null
+      ? roundMoney(toNum(inv.subtotal))
+      : 0;
+
+  let holdAmount = 0;
+  if (inv.hasWarrantyHold === true) {
+    holdAmount = roundMoney(toNum(inv.warrantyHoldAmount));
+    if (holdAmount < 0) holdAmount = 0;
+    if (holdAmount > baseSubtotal) holdAmount = baseSubtotal;
+  }
+
+  const collectible = Math.max(0, roundMoney(netTotal - holdAmount));
+
+  let state: "NONE" | "PARTIAL" | "FULL" = "NONE";
+  if (String(inv.status) === "CANCELLED") state = "FULL";
+  else if (returnedTotal > 0 && netTotal <= 0.0001) state = "FULL";
+  else if (returnedTotal > 0 && netTotal > 0.0001) state = "PARTIAL";
+
+  const debtIgnore = state === "FULL";
+
+  return {
+    state,
+    debtIgnore,
+    returnedTotal,
+    netTotal,
+    holdAmount,
+    collectible,
+  };
+}
+
 /** ========================= SANITIZE (ẩn giá vốn theo role) ========================= **/
 
 function sanitizeInvoiceForRole(inv: any, role: string) {
@@ -39,6 +106,13 @@ function sanitizeInvoiceForRole(inv: any, role: string) {
   const hideItemPrice = role === "staff";
 
   const cloned = JSON.parse(JSON.stringify(inv));
+
+  // ✅ attach returnMeta (BE computed)
+  try {
+    cloned.returnMeta = computeReturnMeta(cloned);
+  } catch {
+    cloned.returnMeta = undefined;
+  }
 
   // invoice level
   if (!canSeeCost) {
@@ -70,9 +144,7 @@ function sanitizeInvoiceForRole(inv: any, role: string) {
     }
   }
 
-  // ✅ warranty fields: staff được xem (không phải giá vốn)
-  // giữ nguyên, không xoá
-
+  // warranty fields: staff được xem
   return cloned;
 }
 

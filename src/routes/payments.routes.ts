@@ -42,11 +42,22 @@ function buildAuditCtx(req: any) {
     : undefined;
 }
 
+/**
+ * Normalize allocation kind:
+ * - Accept both "HOLD" and "WARRANTY_HOLD" as hold kind
+ * - Default: "NORMAL"
+ */
 function normalizeKind(k: any) {
   const v = String(k ?? "NORMAL").toUpperCase();
-  return v === "WARRANTY_HOLD" ? "WARRANTY_HOLD" : "NORMAL";
+  if (v === "HOLD" || v === "WARRANTY_HOLD") return "WARRANTY_HOLD";
+  return "NORMAL";
 }
 
+/**
+ * NOTE:
+ * - vẫn giữ normalizePaymentType để tương thích legacy
+ * - nhưng phía dưới sẽ có "auto-fix" theo dấu của amountRaw để tránh nhập âm mà vẫn THU
+ */
 function normalizePaymentType(t: any) {
   const v = String(t ?? "").toUpperCase();
   return v === "PAYMENT" ? "PAYMENT" : "RECEIPT";
@@ -56,6 +67,10 @@ function isValidDateString(s: any) {
   if (!s) return false;
   const d = new Date(String(s));
   return !isNaN(d.getTime());
+}
+
+function nearlyEqual(a: number, b: number, eps = 0.0001) {
+  return Math.abs(a - b) <= eps;
 }
 
 r.post("/", async (req, res) => {
@@ -77,14 +92,21 @@ r.post("/", async (req, res) => {
       return res.status(400).json({ message: "Ngày (date) không hợp lệ." });
     }
 
-    const type = normalizePaymentType(body.type);
-
     const amountRaw = Number(body.amount);
     if (!Number.isFinite(amountRaw) || amountRaw === 0) {
       return res
         .status(400)
         .json({ message: "Số tiền phiếu thu/chi không hợp lệ (khác 0)." });
     }
+
+    /**
+     * ✅ FIX: type phải khớp chiều tiền
+     * - Nếu user nhập amount âm => auto chuyển thành PAYMENT (phiếu CHI)
+     * - Nếu user nhập amount dương => giữ normalizePaymentType(body.type) (default RECEIPT)
+     *
+     * Lý do: route luôn dùng amount dương (cash amount), còn chiều thu/chi nằm ở type + allocations signed.
+     */
+    const type = amountRaw < 0 ? "PAYMENT" : normalizePaymentType(body.type);
 
     // ✅ Payment.amount luôn dương (tiền thực thu/chi)
     const amount = Math.abs(amountRaw);
@@ -98,7 +120,7 @@ r.post("/", async (req, res) => {
 
             return {
               invoiceId,
-              amount: amt,
+              amount: amt, // ✅ signed (RECEIPT +, PAYMENT -)
               kind,
             };
           })
@@ -107,64 +129,52 @@ r.post("/", async (req, res) => {
             if (!Number.isFinite(a.amount)) return false;
             if (a.amount === 0) return false;
 
-            // ✅ WARRANTY_HOLD: chỉ dương
-            if (a.kind === "WARRANTY_HOLD") return a.amount > 0;
-
-            // ✅ NORMAL: cho phép âm/dương (service sẽ validate theo type)
+            // ✅ IMPORTANT:
+            // HOLD/WARRANTY_HOLD cho phép signed. (RECEIPT dương, PAYMENT âm) -> service sẽ validate theo type.
             return true;
           })
       : undefined;
 
-    // ========= quick validations ở route (để báo lỗi sớm) =========
+    // ========= quick validations ở route (nhẹ, không ép kind) =========
+    // Mục tiêu: bắt lỗi obvious (sign sai), còn lại để service validate/cap.
     if (allocations && allocations.length > 0) {
-      const normal = allocations.filter((x: any) => x.kind === "NORMAL");
-      const hold = allocations.filter((x: any) => x.kind === "WARRANTY_HOLD");
-
-      // RECEIPT: NORMAL không được âm
-      if (type === "RECEIPT" && normal.some((x: any) => x.amount < 0)) {
+      // RECEIPT: mọi allocation phải >= 0
+      if (type === "RECEIPT" && allocations.some((x: any) => x.amount < 0)) {
         return res.status(400).json({
           message:
-            "Phiếu THU (RECEIPT) không được có phân bổ NORMAL âm. Nếu hoàn tiền hãy dùng phiếu CHI (PAYMENT).",
+            "Phiếu THU (RECEIPT) không được có phân bổ âm. Nếu hoàn tiền hãy dùng phiếu CHI (PAYMENT).",
         });
       }
 
-      // PAYMENT: NORMAL không được dương (theo Option A: refund)
-      if (type === "PAYMENT" && normal.some((x: any) => x.amount > 0)) {
+      // PAYMENT: mọi allocation phải <= 0
+      if (type === "PAYMENT" && allocations.some((x: any) => x.amount > 0)) {
         return res.status(400).json({
           message:
-            "Phiếu CHI (PAYMENT) không được có phân bổ NORMAL dương. Nếu là thu tiền hãy dùng phiếu THU (RECEIPT).",
+            "Phiếu CHI (PAYMENT) không được có phân bổ dương. Nếu là thu tiền hãy dùng phiếu THU (RECEIPT).",
         });
       }
 
       // ✅ check tổng tiền theo “cash amount”
-      const holdSum = hold.reduce(
-        (s: number, x: any) => s + Math.abs(Number(x.amount) || 0),
-        0
-      );
-
+      // - RECEIPT: sum(signed allocations) == amount
+      // - PAYMENT: sum(abs(allocation.amount)) == amount
       if (type === "RECEIPT") {
-        const normalSum = normal.reduce(
+        const expected = allocations.reduce(
           (s: number, x: any) => s + (Number(x.amount) || 0),
           0
-        ); // >=0
-        const expected = normalSum + holdSum;
-        const diff = Math.abs(expected - amount);
-        if (diff > 0.0001) {
+        );
+        if (!nearlyEqual(expected, amount)) {
           return res.status(400).json({
-            message: `Tổng phân bổ (NORMAL + HOLD) = ${expected} phải bằng số tiền phiếu = ${amount}.`,
+            message: `Tổng phân bổ (signed) = ${expected} phải bằng số tiền phiếu = ${amount}.`,
           });
         }
       } else {
-        // PAYMENT: normal là số âm => cash = abs(normal)
-        const normalAbs = normal.reduce(
+        const expected = allocations.reduce(
           (s: number, x: any) => s + Math.abs(Number(x.amount) || 0),
           0
         );
-        const expected = normalAbs + holdSum;
-        const diff = Math.abs(expected - amount);
-        if (diff > 0.0001) {
+        if (!nearlyEqual(expected, amount)) {
           return res.status(400).json({
-            message: `Tổng phân bổ (abs(NORMAL) + HOLD) = ${expected} phải bằng số tiền phiếu = ${amount}.`,
+            message: `Tổng phân bổ (sum abs allocations) = ${expected} phải bằng số tiền phiếu = ${amount}.`,
           });
         }
       }

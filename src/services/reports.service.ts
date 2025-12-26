@@ -271,16 +271,74 @@ export type SalesLedgerRow = {
   qty: number;
   unitPrice: number;  // đơn giá
   unitCost: number;   // đơn giá vốn
-  costTotal: number;  // tiền vốn
+  costTotal: number;  // tiền vốn (đã net theo trả hàng)
 
-  lineAmount: number; // thành tiền
+  lineAmount: number; // thành tiền (đã net theo trả hàng)
 
-  paid: number;       // đã thanh toán (phân bổ theo dòng)
-  debt: number;       // còn nợ
+  paid: number;       // đã thanh toán (phân bổ theo dòng - theo NET sau trả hàng)
+  debt: number;       // còn nợ (theo NET sau trả hàng)
 
   saleUserName: string;
   techUserName: string;
 };
+
+type ReturnAggByItem = { qty: number; amount: number };
+
+async function loadSalesReturnAgg(params: { invoiceIds: string[]; asOf?: Date }) {
+  const { invoiceIds, asOf } = params;
+  if (!invoiceIds.length) return new Map<string, Map<string, ReturnAggByItem>>();
+
+  const where: Prisma.InvoiceWhereInput = {
+    status: "APPROVED",
+    type: "SALES_RETURN",
+    refInvoiceId: { in: invoiceIds },
+  };
+
+  // as-of: để report “tới ngày” thì trả hàng sau ngày đó không tính vào
+  if (asOf) {
+    where.issueDate = { lte: asOf };
+  }
+
+  const returns = await prisma.invoice.findMany({
+    where,
+    select: {
+      id: true,
+      refInvoiceId: true,
+      lines: { select: { itemId: true, qty: true, price: true } },
+    },
+  });
+
+  // Map: salesInvoiceId -> (itemId -> {qty, amount})
+  const retMap = new Map<string, Map<string, ReturnAggByItem>>();
+
+  for (const r of returns as any[]) {
+    const sid = String(r.refInvoiceId || "");
+    if (!sid) continue;
+
+    let itemMap = retMap.get(sid);
+    if (!itemMap) {
+      itemMap = new Map<string, ReturnAggByItem>();
+      retMap.set(sid, itemMap);
+    }
+
+    const ls: any[] = Array.isArray(r.lines) ? r.lines : [];
+    for (const l of ls) {
+      const itemId = String(l.itemId || "");
+      if (!itemId) continue;
+
+      const qty = toNum(l.qty);
+      const price = toNum(l.price);
+      const amt = round2(qty * price);
+
+      const cur = itemMap.get(itemId) || { qty: 0, amount: 0 };
+      cur.qty = round2(cur.qty + qty);
+      cur.amount = round2(cur.amount + amt);
+      itemMap.set(itemId, cur);
+    }
+  }
+
+  return retMap;
+}
 
 export async function getSalesLedger(params: {
   from?: Date;
@@ -326,20 +384,16 @@ export async function getSalesLedger(params: {
     },
   });
 
+  const invoiceIds = (invoices as any[]).map((x) => String(x.id));
+  const asOf = params.to ? params.to : undefined;
+  const returnAgg = await loadSalesReturnAgg({ invoiceIds, asOf });
+
   const rows: SalesLedgerRow[] = [];
 
   for (const inv of invoices as any[]) {
-    const invSubtotal = toNum(inv.subtotal);
+    const invId = String(inv.id);
+
     const invPaid = toNum(inv.paidAmount);
-
-    // base để phân bổ paid xuống line: ưu tiên subtotal (sum line.amount)
-    const base =
-      invSubtotal > 0
-        ? invSubtotal
-        : (inv.lines || []).reduce((s: number, l: any) => s + toNum(l.amount), 0);
-
-    // paidAmount có thể theo total (gồm tax), clamp về base để tránh paidLine > lineAmount
-    const paidBase = Math.min(invPaid, base > 0 ? base : invPaid);
 
     const saleName =
       inv.saleUserName ||
@@ -360,32 +414,82 @@ export async function getSalesLedger(params: {
     const issueDateStr = new Date(inv.issueDate).toISOString().slice(0, 10);
     const partnerName = String(inv.partnerName || "");
 
-    let paidAllocatedSum = 0;
     const linesArr: any[] = Array.isArray(inv.lines) ? inv.lines : [];
+    if (linesArr.length === 0) continue;
 
-    for (let i = 0; i < linesArr.length; i++) {
-      const l = linesArr[i];
+    const retItemMap = returnAgg.get(invId); // may be undefined
 
+    // 1) Tính NET line theo trả hàng
+    const netLines = linesArr.map((l: any) => {
+      const itemId = String(l.itemId || "");
       const qty = toNum(l.qty);
       const unitPrice = toNum(l.price);
       const lineAmount = toNum(l.amount);
 
       const unitCost = toNum(l.unitCost);
-      const costTotal = toNum(l.costTotal);
+      const lineCostTotal = toNum(l.costTotal);
+
+      const ret = retItemMap?.get(itemId);
+      const retQty = ret ? toNum(ret.qty) : 0;
+      const retAmt = ret ? toNum(ret.amount) : 0;
+
+      // qty net
+      const netQty = Math.max(0, round2(qty - retQty));
+
+      // amount net: ưu tiên trừ theo amount trả hàng (qty*price trên phiếu return)
+      const netAmount = Math.max(0, round2(lineAmount - retAmt));
+
+      // cost net: giảm theo qty net (unitCost * netQty)
+      // nếu thiếu unitCost thì fallback theo tỉ lệ lineCostTotal/qty
+      let useUnitCost = unitCost;
+      if (!useUnitCost && qty > 0 && lineCostTotal > 0) useUnitCost = round2(lineCostTotal / qty);
+
+      const netCostTotal = round2(Math.max(0, useUnitCost * netQty));
+
+      return {
+        itemId,
+        itemName: String(l.itemName || ""),
+        itemSku: l.itemSku ?? null,
+        qty,
+        unitPrice,
+        unitCost: useUnitCost,
+        costTotal: netCostTotal,
+        lineAmount: netAmount,
+      };
+    });
+
+    const netBase = round2(netLines.reduce((s: number, x: any) => s + toNum(x.lineAmount), 0));
+
+    // ✅ FULL RETURN => bỏ khỏi bảng kê (không show “còn nợ” nữa)
+    if (netBase <= 0.0001) {
+      continue;
+    }
+
+    // 2) paidBase phân bổ theo NET base để không bị “paidLine > lineAmount”
+    const paidBase = Math.min(invPaid, netBase > 0 ? netBase : invPaid);
+
+    // 3) phân bổ paid xuống line theo NET lineAmount
+    let paidAllocatedSum = 0;
+
+    for (let i = 0; i < netLines.length; i++) {
+      const l = netLines[i];
+
+      // bỏ line đã trả hết (net = 0)
+      if (toNum(l.lineAmount) <= 0.0001) continue;
 
       let paidLine = 0;
-      if (base > 0 && paidBase > 0 && lineAmount > 0) {
-        paidLine = round2((paidBase * lineAmount) / base);
+      if (netBase > 0 && paidBase > 0 && toNum(l.lineAmount) > 0) {
+        paidLine = round2((paidBase * toNum(l.lineAmount)) / netBase);
       }
 
       // dòng cuối: chỉnh để tổng paidLine = paidBase (tránh lệch do làm tròn)
-      if (i === linesArr.length - 1) {
+      if (i === netLines.length - 1) {
         const remain = round2(paidBase - paidAllocatedSum);
-        paidLine = Math.max(0, Math.min(lineAmount, remain));
+        paidLine = Math.max(0, Math.min(toNum(l.lineAmount), remain));
       }
 
       paidAllocatedSum = round2(paidAllocatedSum + paidLine);
-      const debt = round2(Math.max(0, lineAmount - paidLine));
+      const debt = round2(Math.max(0, toNum(l.lineAmount) - paidLine));
 
       rows.push({
         issueDate: issueDateStr,
@@ -395,12 +499,12 @@ export async function getSalesLedger(params: {
         itemName: String(l.itemName || ""),
         itemSku: l.itemSku ?? null,
 
-        qty,
-        unitPrice,
-        unitCost,
-        costTotal,
+        qty: toNum(l.qty), // qty gốc (đang hiển thị giống hệ thống hiện tại)
+        unitPrice: toNum(l.unitPrice),
+        unitCost: toNum(l.unitCost),
+        costTotal: toNum(l.costTotal),
 
-        lineAmount,
+        lineAmount: toNum(l.lineAmount),
         paid: paidLine,
         debt,
 

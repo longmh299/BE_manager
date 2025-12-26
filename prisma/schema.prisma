@@ -1,14 +1,533 @@
-// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
-// ============== Enums ==============
+model User {
+  id                 String        @id @default(cuid())
+  username           String        @unique
+  password           String
+  role               UserRole      @default(staff)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  auditLogs          AuditLog[]
+  deviceTok          DeviceToken[]
+  approvedInvoices   Invoice[]     @relation("InvoiceApprovedBy")
+  cancelledInvoices  Invoice[]     @relation("InvoiceCancelledBy")
+  salesInvoices      Invoice[]     @relation("InvoiceSaleUser")
+  technicianInvoices Invoice[]     @relation("InvoiceTechUser")
+  createdPayments    Payment[]     @relation("UserCreatedPayments")
+  sessions           Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
+
+model Location {
+  id               String            @id @default(cuid())
+  code             String            @unique
+  name             String
+  kind             String            @default("warehouse")
+  parentId         String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  assetAssignments AssetAssignment[]
+  itemSerials      ItemSerial[]
+  parent           Location?         @relation("LocationToChildren", fields: [parentId], references: [id])
+  children         Location[]        @relation("LocationToChildren")
+  monthlyAvgCosts  MonthlyAvgCost[]
+  fromLines        MovementLine[]    @relation("FromLocation")
+  toLines          MovementLine[]    @relation("ToLocation")
+  stocks           Stock[]
+  stockCounts      StockCount[]
+  stockSnapshots   StockSnapshot[]
+}
+
+model Unit {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  name      String
+  note      String?
+  createdAt DateTime @default(now())
+  items     Item[]
+}
+
+model Item {
+  id              String           @id @default(cuid())
+  sku             String
+  name            String           @unique
+  unitId          String
+  price           Decimal          @db.Decimal(18, 2)
+  sellPrice       Decimal          @default(0) @db.Decimal(18, 2)
+  note            String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  kind            ItemKind         @default(PART)
+  isSerialized    Boolean          @default(false)
+  invoiceLines    InvoiceLine[]    @relation("ItemToInvoiceLines")
+  unit            Unit             @relation(fields: [unitId], references: [id])
+  serials         ItemSerial[]
+  machineParts    MachinePart[]    @relation("ItemMachineParts")
+  monthlyAvgCosts MonthlyAvgCost[]
+  moveLines       MovementLine[]
+  stocks          Stock[]
+  countLines      StockCountLine[]
+  stockSnapshots  StockSnapshot[]
+
+  @@index([unitId])
+  @@index([kind])
+  @@index([isSerialized])
+}
+
+model Stock {
+  itemId     String
+  locationId String
+  qty        Decimal  @db.Decimal(18, 3)
+  avgCost    Decimal  @default(0) @db.Decimal(18, 4)
+  updatedAt  DateTime @updatedAt
+  item       Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location   Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@id([itemId, locationId])
+  @@index([locationId])
+  @@index([itemId])
+}
+
+model ItemSerial {
+  id         String    @id @default(cuid())
+  itemId     String
+  serialNo   String    @unique
+  status     String    @default("in_stock")
+  locationId String?
+  note       String?
+  createdAt  DateTime  @default(now())
+  item       Item      @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location   Location? @relation(fields: [locationId], references: [id])
+
+  @@index([itemId])
+  @@index([locationId])
+  @@index([status])
+}
+
+model Asset {
+  id          String            @id @default(cuid())
+  assetCode   String            @unique
+  sku         String?
+  name        String
+  model       String?
+  serialNo    String?           @unique
+  status      String            @default("active")
+  note        String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  assignments AssetAssignment[]
+}
+
+model AssetAssignment {
+  id         String   @id @default(cuid())
+  assetCode  String
+  locationId String
+  assignedAt DateTime @default(now())
+  note       String?
+  asset      Asset    @relation(fields: [assetCode], references: [assetCode], onDelete: Cascade)
+  location   Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([assetCode])
+  @@index([locationId])
+}
+
+model Movement {
+  id        String         @id @default(cuid())
+  type      MovementType
+  refNo     String?        @unique
+  note      String?
+  posted    Boolean        @default(false)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  invoiceId String?
+  invoice   Invoice?       @relation(fields: [invoiceId], references: [id])
+  lines     MovementLine[]
+
+  @@index([type, createdAt])
+  @@index([invoiceId])
+}
+
+model MovementLine {
+  id             String    @id @default(cuid())
+  movementId     String
+  itemId         String
+  fromLocationId String?
+  toLocationId   String?
+  qty            Decimal   @db.Decimal(18, 3)
+  unitCost       Decimal?  @db.Decimal(18, 4)
+  costTotal      Decimal?  @db.Decimal(18, 4)
+  note           String?
+  fromLoc        Location? @relation("FromLocation", fields: [fromLocationId], references: [id])
+  item           Item      @relation(fields: [itemId], references: [id])
+  movement       Movement  @relation(fields: [movementId], references: [id])
+  toLoc          Location? @relation("ToLocation", fields: [toLocationId], references: [id])
+
+  @@index([movementId])
+  @@index([itemId])
+  @@index([fromLocationId])
+  @@index([toLocationId])
+}
+
+model StockCount {
+  id         String           @id @default(cuid())
+  locationId String
+  refNo      String           @unique
+  note       String?
+  status     String           @default("draft")
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+  location   Location         @relation(fields: [locationId], references: [id])
+  lines      StockCountLine[]
+}
+
+model StockCountLine {
+  id           String     @id @default(cuid())
+  stockCountId String
+  itemId       String
+  countedQty   Decimal    @db.Decimal(18, 3)
+  item         Item       @relation(fields: [itemId], references: [id])
+  stockCount   StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+
+  @@index([stockCountId])
+  @@index([itemId])
+}
+
+model Partner {
+  id        String    @id @default(cuid())
+  code      String?   @unique
+  name      String
+  taxCode   String?   @db.VarChar(20)
+  phone     String?   @db.VarChar(20)
+  email     String?
+  address   String?
+  type      String    @default("customer")
+  note      String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  invoices  Invoice[]
+  payments  Payment[]
+}
+
+model Invoice {
+  id                 String               @id @default(cuid())
+  code               String               @unique
+  type               InvoiceType
+  issueDate          DateTime
+  partnerId          String?
+  saleUserId         String?
+  techUserId         String?
+  receiveAccountId   String?
+  saleUserName       String?
+  techUserName       String?
+  partnerName        String?
+  partnerTax         String?
+  partnerPhone       String?
+  partnerAddr        String?
+  partnerCode        String?
+  currency           String               @default("VND")
+  subtotal           Decimal              @default(0) @db.Decimal(18, 2)
+  tax                Decimal              @default(0) @db.Decimal(18, 2)
+  total              Decimal              @default(0) @db.Decimal(18, 2)
+  totalCost          Decimal?             @db.Decimal(18, 2)
+  note               String?
+  attachment         String?
+  refInvoiceId       String?
+  hasWarrantyHold    Boolean              @default(false)
+  warrantyHoldPct    Decimal              @default(0) @db.Decimal(5, 2)
+  warrantyHoldAmount Decimal              @default(0) @db.Decimal(18, 2)
+  warrantyDueDate    DateTime?
+  approvedById       String?
+  approvedAt         DateTime?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  paymentStatus      PaymentStatus        @default(UNPAID)
+  paidAmount         Decimal              @default(0) @db.Decimal(18, 2)
+  status             InvoiceStatus        @default(DRAFT)
+  cancelReason       String?
+  cancelledAt        DateTime?
+  cancelledById      String?
+  netSubtotal        Decimal              @default(0) @db.Decimal(18, 2)
+  netTax             Decimal              @default(0) @db.Decimal(18, 2)
+  netTotal           Decimal              @default(0) @db.Decimal(18, 2)
+  returnedSubtotal   Decimal              @default(0) @db.Decimal(18, 2)
+  returnedTax        Decimal              @default(0) @db.Decimal(18, 2)
+  returnedTotal      Decimal              @default(0) @db.Decimal(18, 2)
+  approvedBy         User?                @relation("InvoiceApprovedBy", fields: [approvedById], references: [id])
+  cancelledBy        User?                @relation("InvoiceCancelledBy", fields: [cancelledById], references: [id])
+  partner            Partner?             @relation(fields: [partnerId], references: [id])
+  receiveAccount     PaymentAccount?      @relation("InvoiceReceiveAccount", fields: [receiveAccountId], references: [id])
+  refInvoice         Invoice?             @relation("InvoiceReturnRef", fields: [refInvoiceId], references: [id])
+  returns            Invoice[]            @relation("InvoiceReturnRef")
+  saleUser           User?                @relation("InvoiceSaleUser", fields: [saleUserId], references: [id])
+  techUser           User?                @relation("InvoiceTechUser", fields: [techUserId], references: [id])
+  lines              InvoiceLine[]
+  movements          Movement[]
+  allocations        PaymentAllocation[]
+  returnMapsTo       SalesReturnLineMap[] @relation("ReturnMap_OriginInvoice")
+  returnMapsFrom     SalesReturnLineMap[] @relation("ReturnMap_ReturnInvoice")
+  warrantyHold       WarrantyHold?
+
+  @@index([partnerId, issueDate])
+  @@index([saleUserId])
+  @@index([techUserId])
+  @@index([receiveAccountId])
+  @@index([refInvoiceId])
+  @@index([type, status, issueDate])
+  @@index([cancelledById])
+  @@index([cancelledAt])
+}
+
+model WarrantyHold {
+  id        String    @id @default(cuid())
+  invoiceId String    @unique
+  amount    Decimal   @db.Decimal(18, 2)
+  dueDate   DateTime
+  status    String    @default("OPEN")
+  paidAt    DateTime?
+  note      String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  invoice   Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([dueDate])
+  @@index([status])
+}
+
+model InvoiceLine {
+  id             String               @id @default(cuid())
+  invoiceId      String
+  itemId         String
+  qty            Decimal              @db.Decimal(18, 3)
+  price          Decimal              @db.Decimal(18, 2)
+  amount         Decimal              @db.Decimal(18, 2)
+  unitCost       Decimal?             @db.Decimal(18, 2)
+  costTotal      Decimal?             @db.Decimal(18, 2)
+  itemName       String?
+  itemSku        String?
+  invoice        Invoice              @relation(fields: [invoiceId], references: [id])
+  item           Item                 @relation("ItemToInvoiceLines", fields: [itemId], references: [id])
+  returnMapsTo   SalesReturnLineMap[] @relation("ReturnMap_OriginLine")
+  returnMapsFrom SalesReturnLineMap?  @relation("ReturnMap_ReturnLine")
+
+  @@index([invoiceId])
+  @@index([itemId])
+}
+
+model SalesReturnLineMap {
+  id              String      @id @default(cuid())
+  returnInvoiceId String
+  returnLineId    String      @unique
+  originInvoiceId String
+  originLineId    String
+  qtyReturn       Decimal     @db.Decimal(18, 3)
+  createdAt       DateTime    @default(now())
+  originInvoice   Invoice     @relation("ReturnMap_OriginInvoice", fields: [originInvoiceId], references: [id], onDelete: Cascade)
+  originLine      InvoiceLine @relation("ReturnMap_OriginLine", fields: [originLineId], references: [id], onDelete: Cascade)
+  returnInvoice   Invoice     @relation("ReturnMap_ReturnInvoice", fields: [returnInvoiceId], references: [id], onDelete: Cascade)
+  returnLine      InvoiceLine @relation("ReturnMap_ReturnLine", fields: [returnLineId], references: [id], onDelete: Cascade)
+
+  @@index([returnInvoiceId])
+  @@index([originInvoiceId])
+  @@index([returnLineId])
+  @@index([originLineId])
+}
+
+model StockSnapshot {
+  id         String   @id @default(cuid())
+  itemId     String
+  locationId String
+  date       DateTime
+  qty        Decimal  @db.Decimal(18, 3)
+  avgCost    Decimal? @db.Decimal(18, 4)
+  createdAt  DateTime @default(now())
+  item       Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location   Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, locationId, date])
+  @@index([itemId])
+  @@index([locationId])
+  @@index([date])
+}
+
+model MonthlyAvgCost {
+  id         String   @id @default(cuid())
+  itemId     String
+  locationId String
+  year       Int
+  month      Int
+  avgCost    Decimal  @db.Decimal(18, 4)
+  qtyTotal   Decimal  @db.Decimal(18, 3)
+  computedAt DateTime @default(now())
+  item       Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location   Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, locationId, year, month])
+  @@index([itemId])
+  @@index([locationId])
+  @@index([year, month])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  userRole  String?
+  action    String
+  entity    String
+  entityId  String?
+  before    Json?
+  after     Json?
+  meta      Json?
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([action])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model DeviceToken {
+  id        String   @id @default(cuid())
+  userId    String?
+  platform  String
+  token     String   @unique
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([platform])
+}
+
+model Machine {
+  id        String        @id @default(cuid())
+  code      String        @unique
+  name      String
+  note      String?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  parts     MachinePart[]
+}
+
+model MachinePart {
+  id        String  @id @default(cuid())
+  machineId String
+  itemId    String
+  qtyPerSet Int?
+  note      String?
+  item      Item    @relation("ItemMachineParts", fields: [itemId], references: [id])
+  machine   Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@unique([machineId, itemId])
+  @@index([machineId])
+  @@index([itemId])
+}
+
+model PaymentAccount {
+  id        String      @id @default(cuid())
+  code      String      @unique
+  name      String
+  type      AccountType @default(BANK)
+  bankName  String?
+  accountNo String?
+  holder    String?
+  isActive  Boolean     @default(true)
+  note      String?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  invoices  Invoice[]   @relation("InvoiceReceiveAccount")
+  payments  Payment[]
+}
+
+model Payment {
+  id          String              @id @default(cuid())
+  date        DateTime
+  partnerId   String
+  type        PaymentType
+  amount      Decimal             @db.Decimal(18, 2)
+  accountId   String?
+  method      String?
+  refNo       String?
+  note        String?
+  createdById String?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  account     PaymentAccount?     @relation(fields: [accountId], references: [id])
+  createdBy   User?               @relation("UserCreatedPayments", fields: [createdById], references: [id])
+  partner     Partner             @relation(fields: [partnerId], references: [id])
+  allocations PaymentAllocation[]
+
+  @@index([partnerId, date])
+  @@index([accountId])
+  @@index([type, date])
+}
+
+model PaymentAllocation {
+  id              String         @id @default(cuid())
+  paymentId       String
+  invoiceId       String
+  amount          Decimal        @db.Decimal(18, 2)
+  kind            AllocationKind @default(NORMAL)
+  createdAt       DateTime       @default(now())
+  returnInvoiceId String?
+  invoice         Invoice        @relation(fields: [invoiceId], references: [id])
+  payment         Payment        @relation(fields: [paymentId], references: [id])
+
+  @@index([invoiceId])
+  @@index([paymentId])
+  @@index([kind])
+  @@index([returnInvoiceId])
+  @@index([invoiceId, kind])
+  @@index([paymentId, kind])
+}
+
+model PeriodLock {
+  id          String   @id @default(cuid())
+  closedUntil DateTime
+  note        String?
+  createdAt   DateTime @default(now())
+}
+
+model ImportBatch {
+  id        String      @id @default(cuid())
+  batchId   String      @unique
+  fileName  String?
+  actorId   String?
+  createdAt DateTime    @default(now())
+  notes     String?
+  logs      ImportLog[]
+}
+
+model ImportLog {
+  id        String      @id @default(cuid())
+  batchId   String
+  rowIndex  Int
+  refNo     String?
+  itemId    String?
+  status    String
+  message   String?
+  createdAt DateTime    @default(now())
+  batch     ImportBatch @relation(fields: [batchId], references: [batchId], onDelete: Cascade)
+
+  @@index([batchId])
+  @@index([itemId])
+}
+
 enum UserRole {
   staff
   accountant
@@ -20,6 +539,7 @@ enum InvoiceStatus {
   SUBMITTED
   APPROVED
   REJECTED
+  CANCELLED
 }
 
 enum PaymentStatus {
@@ -52,7 +572,6 @@ enum ItemKind {
   MACHINE
 }
 
-// ✅ NEW: loại tài khoản tiền
 enum AccountType {
   CASH
   BANK
@@ -60,576 +579,8 @@ enum AccountType {
   OTHER
 }
 
-// ✅ NEW: phân loại khoản phân bổ thanh toán
 enum AllocationKind {
-  NORMAL        // thu/chi bình thường
-  WARRANTY_HOLD // thu/chi phần giữ lại bảo hành
-}
-
-// ============== Auth / Users ==============
-model User {
-  id        String   @id @default(cuid())
-  username  String   @unique
-  password  String
-  role      UserRole @default(staff)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  sessions           Session[]
-  auditLogs          AuditLog[]
-  deviceTok          DeviceToken[]
-  salesInvoices      Invoice[] @relation("InvoiceSaleUser")
-  technicianInvoices Invoice[] @relation("InvoiceTechUser")
-  approvedInvoices   Invoice[] @relation("InvoiceApprovedBy")
-  createdPayments    Payment[] @relation("UserCreatedPayments")
-}
-
-model Session {
-  id        String   @id @default(cuid())
-  userId    String
-  expiresAt DateTime
-  createdAt DateTime @default(now())
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId, expiresAt])
-}
-
-// ============== Master data ==============
-model Location {
-  id        String   @id @default(cuid())
-  code      String   @unique
-  name      String
-  kind      String   @default("warehouse")
-  parentId  String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  parent   Location?  @relation("LocationToChildren", fields: [parentId], references: [id])
-  children Location[] @relation("LocationToChildren")
-
-  stocks           Stock[]
-  assetAssignments AssetAssignment[]
-  fromLines        MovementLine[] @relation("FromLocation")
-  toLines          MovementLine[] @relation("ToLocation")
-  stockCounts      StockCount[]
-
-  itemSerials     ItemSerial[]
-  stockSnapshots  StockSnapshot[]
-  monthlyAvgCosts MonthlyAvgCost[]
-}
-
-// ✅ NEW: Đơn vị tính
-model Unit {
-  id        String   @id @default(cuid())
-  code      String   @unique // pcs, pair, m, kg...
-  name      String // Cái, Cặp, Mét...
-  note      String?
-  createdAt DateTime @default(now())
-
-  items Item[]
-}
-
-model Item {
-  id   String @id @default(cuid())
-  sku  String
-  name String @unique
-
-  // ✅ NEW: unit theo bảng Unit
-  unitId String
-  unit   Unit   @relation(fields: [unitId], references: [id], onDelete: Restrict)
-
-  // price = giá vốn gốc (PRIVATE: chỉ admin xem ở API)
-  price     Decimal @db.Decimal(18, 2)
-  // sellPrice = giá bán gợi ý (có thể có/không)
-  sellPrice Decimal @default(0) @db.Decimal(18, 2)
-
-  note      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  kind         ItemKind @default(PART)
-  isSerialized Boolean  @default(false)
-
-  stocks       Stock[]
-  moveLines    MovementLine[]
-  countLines   StockCountLine[]
-  invoiceLines InvoiceLine[] @relation("ItemToInvoiceLines")
-
-  serials         ItemSerial[]
-  machineParts    MachinePart[] @relation("ItemMachineParts")
-  stockSnapshots  StockSnapshot[]
-  monthlyAvgCosts MonthlyAvgCost[]
-
-  @@index([unitId])
-  @@index([kind])
-  @@index([isSerialized])
-}
-
-model Stock {
-  itemId     String
-  locationId String
-  qty        Decimal  @db.Decimal(18, 3)
-  avgCost    Decimal  @default(0) @db.Decimal(18, 4)
-  updatedAt  DateTime @updatedAt
-
-  item     Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
-
-  @@id([itemId, locationId])
-  @@index([locationId])
-  @@index([itemId])
-}
-
-model ItemSerial {
-  id         String   @id @default(cuid())
-  itemId     String
-  serialNo   String   @unique
-  status     String   @default("in_stock")
-  locationId String?
-  note       String?
-  createdAt  DateTime @default(now())
-
-  item     Item      @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  location Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
-
-  @@index([itemId])
-  @@index([locationId])
-  @@index([status])
-}
-
-//============== Assets (optional) ==============
-model Asset {
-  id        String   @id @default(cuid())
-  assetCode String   @unique
-  sku       String?
-  name      String
-  model     String?
-  serialNo  String?  @unique
-  status    String   @default("active")
-  note      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  assignments AssetAssignment[]
-}
-
-model AssetAssignment {
-  id         String   @id @default(cuid())
-  assetCode  String
-  locationId String
-  assignedAt DateTime @default(now())
-  note       String?
-
-  asset    Asset    @relation(fields: [assetCode], references: [assetCode], onDelete: Cascade)
-  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
-
-  @@index([assetCode])
-  @@index([locationId])
-}
-
-// ============== Movements (phiếu) ==============
-model Movement {
-  id        String       @id @default(cuid())
-  type      MovementType
-  refNo     String?      @unique
-  note      String?
-  posted    Boolean      @default(false)
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
-
-  invoiceId String?
-  invoice   Invoice? @relation(fields: [invoiceId], references: [id])
-
-  lines MovementLine[]
-
-  @@index([type, createdAt])
-  @@index([invoiceId])
-}
-
-model MovementLine {
-  id             String   @id @default(cuid())
-  movementId     String
-  itemId         String
-  fromLocationId String?
-  toLocationId   String?
-  qty            Decimal  @db.Decimal(18, 3)
-  unitCost       Decimal? @db.Decimal(18, 4)
-  costTotal      Decimal? @db.Decimal(18, 4)
-  note           String?
-
-  movement Movement @relation(fields: [movementId], references: [id])
-  item     Item     @relation(fields: [itemId], references: [id])
-
-  fromLoc Location? @relation("FromLocation", fields: [fromLocationId], references: [id])
-  toLoc   Location? @relation("ToLocation", fields: [toLocationId], references: [id])
-
-  @@index([movementId])
-  @@index([itemId])
-  @@index([fromLocationId])
-  @@index([toLocationId])
-}
-
-// ============== Stock Count (kiểm kê) ==============
-model StockCount {
-  id         String   @id @default(cuid())
-  locationId String
-  refNo      String   @unique
-  note       String?
-  status     String   @default("draft")
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  location Location         @relation(fields: [locationId], references: [id])
-  lines    StockCountLine[]
-}
-
-model StockCountLine {
-  id           String  @id @default(cuid())
-  stockCountId String
-  itemId       String
-  countedQty   Decimal @db.Decimal(18, 3)
-
-  stockCount StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
-  item       Item       @relation(fields: [itemId], references: [id])
-
-  @@index([stockCountId])
-  @@index([itemId])
-}
-
-//============== Partner ==============
-model Partner {
-  id        String   @id @default(cuid())
-  code      String?  @unique
-  name      String
-  taxCode   String?  @db.VarChar(20)
-  phone     String?  @db.VarChar(20)
-  email     String?
-  address   String?
-  type      String   @default("customer")
-  note      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  payments Payment[]
-  invoices Invoice[]
-}
-
-//============== Invoices ==============
-model Invoice {
-  id        String      @id @default(cuid())
-  code      String      @unique
-  type      InvoiceType
-  issueDate DateTime
-
-  partnerId String?
-  partner   Partner? @relation(fields: [partnerId], references: [id])
-
-  saleUserId String?
-  saleUser   User?   @relation("InvoiceSaleUser", fields: [saleUserId], references: [id])
-
-  techUserId String?
-  techUser   User?   @relation("InvoiceTechUser", fields: [techUserId], references: [id])
-
-  // ✅ tài khoản gắn vào hoá đơn (phân loại doanh thu theo TK)
-  receiveAccountId String?
-  receiveAccount   PaymentAccount? @relation("InvoiceReceiveAccount", fields: [receiveAccountId], references: [id], onDelete: SetNull)
-
-  saleUserName String?
-  techUserName String?
-
-  partnerName  String?
-  partnerTax   String?
-  partnerPhone String?
-  partnerAddr  String?
-  partnerCode  String?
-
-  currency   String   @default("VND")
-  subtotal   Decimal  @default(0) @db.Decimal(18, 2)
-  tax        Decimal  @default(0) @db.Decimal(18, 2)
-  total      Decimal  @default(0) @db.Decimal(18, 2)
-  totalCost  Decimal? @db.Decimal(18, 2) // admin-only in API
-  note       String?
-  attachment String?
-
-  refInvoiceId String?
-
-  // ===== Warranty hold (giữ lại bảo hành) =====
-  hasWarrantyHold     Boolean  @default(false)
-  warrantyHoldPct     Decimal  @default(0) @db.Decimal(5, 2)    // VD: 5.00
-  warrantyHoldAmount  Decimal  @default(0) @db.Decimal(18, 2)   // số tiền bị treo
-  warrantyDueDate     DateTime?
-
-  approvedById String?
-  approvedBy   User?     @relation("InvoiceApprovedBy", fields: [approvedById], references: [id])
-  approvedAt   DateTime?
-
-  movements Movement[]
-  lines     InvoiceLine[]
-
-  createdAt     DateTime            @default(now())
-  updatedAt     DateTime            @updatedAt
-  paymentStatus PaymentStatus       @default(UNPAID)
-  paidAmount    Decimal             @default(0) @db.Decimal(18, 2)
-  allocations   PaymentAllocation[]
-  status        InvoiceStatus       @default(DRAFT)
-
-  // ✅ relation tới công nợ bảo hành
-  warrantyHold WarrantyHold?
-
-  @@index([partnerId, issueDate])
-  @@index([saleUserId])
-  @@index([techUserId])
-  @@index([receiveAccountId])
-}
-
-model WarrantyHold {
-  id        String   @id @default(cuid())
-
-  invoiceId String   @unique
-  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
-
-  amount    Decimal  @db.Decimal(18, 2)
-  dueDate   DateTime
-  status    String   @default("OPEN") // OPEN | PAID | VOID
-  paidAt    DateTime?
-  note      String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([dueDate])
-  @@index([status])
-}
-
-model InvoiceLine {
-  id        String   @id @default(cuid())
-  invoiceId String
-  itemId    String
-  qty       Decimal  @db.Decimal(18, 3)
-  price     Decimal  @db.Decimal(18, 2) // giá bán thực tế (staff nhập)
-  amount    Decimal  @db.Decimal(18, 2)
-  unitCost  Decimal? @db.Decimal(18, 2) // admin-only in API
-  costTotal Decimal? @db.Decimal(18, 2) // admin-only in API
-  itemName  String?
-  itemSku   String?
-
-  invoice Invoice @relation(fields: [invoiceId], references: [id])
-  item    Item    @relation("ItemToInvoiceLines", fields: [itemId], references: [id])
-
-  @@index([invoiceId])
-  @@index([itemId])
-}
-
-// ============== Stock Snapshot ==============
-model StockSnapshot {
-  id         String   @id @default(cuid())
-  itemId     String
-  locationId String
-  date       DateTime
-  qty        Decimal  @db.Decimal(18, 3)
-  avgCost    Decimal? @db.Decimal(18, 4)
-  createdAt  DateTime @default(now())
-
-  item     Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
-
-  @@unique([itemId, locationId, date])
-  @@index([itemId])
-  @@index([locationId])
-  @@index([date])
-}
-
-// ============== Monthly Avg Cost ==============
-model MonthlyAvgCost {
-  id         String   @id @default(cuid())
-  itemId     String
-  locationId String
-  year       Int
-  month      Int
-  avgCost    Decimal  @db.Decimal(18, 4)
-  qtyTotal   Decimal  @db.Decimal(18, 3)
-  computedAt DateTime @default(now())
-
-  item     Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
-
-  @@unique([itemId, locationId, year, month])
-  @@index([itemId])
-  @@index([locationId])
-  @@index([year, month])
-}
-
-//============== Logs & Device tokens ==============
-model AuditLog {
-  id        String   @id @default(cuid())
-
-  // Ai làm
-  userId    String?
-  userRole  String?
-
-  // Làm gì
-  action    String   // PAYMENT_CREATE, MOVEMENT_POST, STOCKCOUNT_ADJUST...
-  entity    String   // Payment, Movement, Invoice, Stock...
-  entityId  String?
-
-  // Trước / sau (snapshot gọn)
-  before    Json?
-  after     Json?
-
-  // Ngữ cảnh
-  meta      Json?    // ip, userAgent, path, method, reason...
-
-  createdAt DateTime @default(now())
-
-  user User? @relation(fields: [userId], references: [id])
-
-  @@index([entity, entityId])
-  @@index([action])
-  @@index([userId])
-  @@index([createdAt])
-}
-
-
-model DeviceToken {
-  id        String   @id @default(cuid())
-  userId    String?
-  platform  String
-  token     String   @unique
-  createdAt DateTime @default(now())
-  user      User?    @relation(fields: [userId], references: [id])
-
-  @@index([platform])
-}
-
-model Machine {
-  id   String  @id @default(cuid())
-  code String  @unique
-  name String
-  note String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  parts MachinePart[]
-}
-
-model MachinePart {
-  id String @id @default(cuid())
-
-  machineId String
-  itemId    String
-
-  qtyPerSet Int?
-  note      String?
-
-  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
-  item    Item    @relation("ItemMachineParts", fields: [itemId], references: [id], onDelete: Restrict)
-
-  @@unique([machineId, itemId])
-  @@index([machineId])
-  @@index([itemId])
-}
-
-// ✅ NEW: Master tài khoản tiền (CASH/BANK1/BANK2...)
-model PaymentAccount {
-  id   String      @id @default(cuid())
-  code String      @unique // VD: CASH, BANK1, BANK2
-  name String // VD: Tiền mặt, Vietcombank - TK1
-  type AccountType @default(BANK)
-
-  bankName  String?
-  accountNo String?
-  holder    String?
-
-  isActive Boolean @default(true)
-  note     String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  payments Payment[]
-
-  // ✅ opposite relation cho Invoice.receiveAccount
-  invoices Invoice[] @relation("InvoiceReceiveAccount")
-}
-
-model Payment {
-  id   String   @id @default(cuid())
-  date DateTime
-
-  partnerId String
-  partner   Partner @relation(fields: [partnerId], references: [id])
-
-  type   PaymentType
-  amount Decimal     @db.Decimal(18, 2)
-
-  // ✅ tiền vào/ra tài khoản nào
-  accountId String?
-  account   PaymentAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
-
-  method String?
-  refNo  String?
-  note   String?
-
-  createdById String?
-  createdBy   User?   @relation("UserCreatedPayments", fields: [createdById], references: [id])
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  allocations PaymentAllocation[]
-
-  @@index([partnerId, date])
-  @@index([accountId])
-}
-
-model PaymentAllocation {
-  id        String  @id @default(cuid())
-  paymentId String
-  payment   Payment @relation(fields: [paymentId], references: [id])
-
-  invoiceId String
-  invoice   Invoice @relation(fields: [invoiceId], references: [id])
-
-  amount    Decimal  @db.Decimal(18, 2)
-  kind      AllocationKind @default(NORMAL)
-
-  createdAt DateTime @default(now())
-
-  @@index([invoiceId])
-  @@index([paymentId])
-  @@index([kind])
-}
-
-model PeriodLock {
-  id          String   @id @default(cuid())
-  closedUntil DateTime
-  note        String?
-  createdAt   DateTime @default(now())
-}
-
-model ImportBatch {
-  id        String   @id @default(cuid())
-  batchId   String   @unique
-  fileName  String?
-  actorId   String?
-  createdAt DateTime @default(now())
-  notes     String?
-
-  logs ImportLog[]
-}
-
-model ImportLog {
-  id        String      @id @default(cuid())
-  batchId   String
-  batch     ImportBatch @relation(fields: [batchId], references: [batchId], onDelete: Cascade)
-  rowIndex  Int
-  refNo     String?
-  itemId    String?
-  status    String
-  message   String?
-  createdAt DateTime    @default(now())
-
-  @@index([batchId])
-  @@index([itemId])
+  NORMAL
+  WARRANTY_HOLD
+  TAX
 }

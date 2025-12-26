@@ -62,6 +62,20 @@ function roundMoney(n: number) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
 }
 
+/** round pct to 2 decimals */
+function roundPct(n: number) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+/** parse optional number from body (accept string/number, ignore empty) */
+function parseOptionalNumber(x: any): number | undefined {
+  if (x === undefined || x === null) return undefined;
+  if (typeof x === "string" && x.trim() === "") return undefined;
+  const n = Number(x);
+  if (!Number.isFinite(n)) return undefined;
+  return n;
+}
+
 /**
  * tax:
  * - ưu tiên taxPercent
@@ -90,46 +104,103 @@ function calcTaxFromBody(subtotal: number, body: any): number {
 /**
  * ✅ helper: tính holdAmount + collectible (tiền cần thu ngay)
  *
- * ✅ CHỐT THEO PHƯƠNG ÁN MỚI:
- * - warrantyHoldAmount tính trên DOANH THU KHÔNG VAT (subtotal)
- * - collectible (tiền cần thu ngay) vẫn là tiền khách cần trả: total - holdAmount
- *   (VAT vẫn thu đủ ngay, chỉ "giữ lại" phần BH theo subtotal)
+ * ✅ CHỐT:
+ * - warrantyHoldAmount tính trên subtotal (không VAT)
+ * - collectibleNow = total - holdAmount
+ *
+ * ✅ NEW:
+ * - ưu tiên nhập trực tiếp warrantyHoldAmount
+ * - nếu không có amount thì dùng pct
+ * - nếu không có cả 2 mà hasWarrantyHold=true => fallback legacyPct (mặc định 5)
  */
 function computeWarrantyHoldAndCollectible(params: {
   subtotal: number;
   total: number;
   hasWarrantyHold: boolean;
-  warrantyHoldPct: number;
+
+  // optional inputs
+  warrantyHoldPct?: number;
+  warrantyHoldAmount?: number;
+
+  // legacy fallback
+  legacyPct?: number;
 }) {
   const subtotal = roundMoney(params.subtotal || 0);
   const total = roundMoney(params.total || 0);
 
-  const pct =
-    params.hasWarrantyHold && Number.isFinite(params.warrantyHoldPct) && params.warrantyHoldPct > 0
-      ? params.warrantyHoldPct
-      : params.hasWarrantyHold
-        ? 5
-        : 0;
+  if (!params.hasWarrantyHold) {
+    return { pct: 0, holdAmount: 0, collectible: roundMoney(total) };
+  }
 
-  // ✅ HOLD tính trên subtotal (không VAT)
-  const holdAmount = params.hasWarrantyHold ? roundMoney((subtotal * pct) / 100) : 0;
+  const legacyPct = Number.isFinite(params.legacyPct ?? NaN) ? (params.legacyPct as number) : 5;
 
-  // ✅ collectible vẫn theo total (khách trả VAT đầy đủ), trừ đi phần hold
+  const rawAmount =
+    Number.isFinite(params.warrantyHoldAmount ?? NaN) && (params.warrantyHoldAmount as number) >= 0
+      ? (params.warrantyHoldAmount as number)
+      : undefined;
+
+  const rawPct =
+    Number.isFinite(params.warrantyHoldPct ?? NaN) && (params.warrantyHoldPct as number) >= 0
+      ? (params.warrantyHoldPct as number)
+      : undefined;
+
+  let holdAmount = 0;
+  let pct = 0;
+
+  // ✅ ưu tiên nhập amount
+  if (rawAmount !== undefined) {
+    holdAmount = roundMoney(Math.max(0, rawAmount));
+    if (holdAmount > subtotal + 0.0001) {
+      throw httpError(400, `Số tiền BH treo không được vượt quá subtotal (${subtotal}).`);
+    }
+    pct = subtotal > 0 ? roundPct((holdAmount / subtotal) * 100) : 0;
+  } else if (rawPct !== undefined && rawPct > 0) {
+    if (rawPct > 100) throw httpError(400, "warrantyHoldPct không hợp lệ (0..100).");
+    pct = rawPct;
+    holdAmount = roundMoney((subtotal * pct) / 100);
+  } else {
+    // legacy fallback nếu bật treo mà không nhập gì
+    pct = legacyPct;
+    holdAmount = roundMoney((subtotal * pct) / 100);
+  }
+
   const collectible = Math.max(0, roundMoney(total - holdAmount));
-
   return { pct, holdAmount, collectible };
 }
 
 /**
- * ✅ Chuẩn hoá payment (legacy: khi tạo invoice cho phép set paidAmount)
- * - UNPAID => paidAmount = 0
- * - PAID => paidAmount = total
- * - PARTIAL => paidAmount = body.paidAmount (bắt buộc)
- * - nếu không gửi paymentStatus => suy luận từ paidAmount
+ * ✅ VAT return fallback: nếu SALES_RETURN bị lưu thiếu VAT (tax=0),
+ * thì tự suy ra VAT theo tỷ lệ VAT của hóa đơn gốc.
  *
- * NOTE: normalizePayment chỉ xử lý theo "total" (gross).
- * Với treo BH, status thực sự sẽ được quyết định theo "collectible"
- * ở các bước phía dưới (create/approve/sync allocations).
+ * returnTax = returnSubtotal * (originTax / originSubtotal)
+ */
+function computeReturnTaxFromOrigin(params: {
+  originSubtotal: number;
+  originTax: number;
+  returnSubtotal: number;
+}) {
+  const oSub = Math.max(0, roundMoney(params.originSubtotal || 0));
+  const oTax = Math.max(0, roundMoney(params.originTax || 0));
+  const rSub = Math.max(0, roundMoney(params.returnSubtotal || 0));
+
+  if (oSub <= 0.0001 || oTax <= 0.0001 || rSub <= 0.0001) return 0;
+
+  const rate = oTax / oSub;
+  let rTax = roundMoney(rSub * rate);
+
+  // cap không vượt VAT gốc
+  if (rTax > oTax) rTax = oTax;
+  if (rTax < 0) rTax = 0;
+
+  return rTax;
+}
+
+/**
+ * Chuẩn hoá payment (legacy: khi tạo invoice cho phép set paidAmount)
+ *
+ * ⚠️ IMPORTANT:
+ * - Chỉ dùng cho PURCHASE / SALES (không dùng cho return types)
+ * - Return types (SALES_RETURN/PURCHASE_RETURN) phải đi qua /payments theo Option A
  */
 function normalizePayment(subtotal: number, tax: number, body: any) {
   const total = subtotal + tax;
@@ -195,9 +266,7 @@ async function validateReceiveAccountId(
 }
 
 /**
- * ✅ NEW: Validate & load invoice gốc cho SALES_RETURN (hướng A)
- * - SALES_RETURN bắt buộc có refInvoiceId
- * - invoice gốc phải là SALES và đã APPROVED
+ * Validate & load invoice gốc cho SALES_RETURN
  */
 async function requireValidRefInvoiceForSalesReturn(
   tx: Prisma.TransactionClient | PrismaClient,
@@ -233,6 +302,24 @@ async function requireValidRefInvoiceForSalesReturn(
       receiveAccountId: true,
       code: true,
       issueDate: true,
+
+      subtotal: true,
+      tax: true,
+      total: true,
+
+      returnedSubtotal: true,
+      returnedTax: true,
+      returnedTotal: true,
+
+      netSubtotal: true,
+      netTax: true,
+      netTotal: true,
+
+      hasWarrantyHold: true,
+      warrantyHoldPct: true,
+      warrantyHoldAmount: true,
+
+      cancelledAt: true,
     },
   });
 
@@ -242,21 +329,76 @@ async function requireValidRefInvoiceForSalesReturn(
     throw httpError(400, "Hóa đơn gốc của phiếu trả hàng phải là hóa đơn BÁN (SALES).");
   }
 
-  if (origin.status !== "APPROVED") {
+  if (origin.status !== "APPROVED" && origin.status !== "CANCELLED") {
     throw httpError(400, "Hóa đơn gốc chưa được DUYỆT nên chưa thể tạo/duyệt phiếu trả hàng.");
+  }
+
+  if (origin.status === "CANCELLED") {
+    throw httpError(409, "Hóa đơn gốc đã bị HỦY (CANCELLED), không thể tạo thêm phiếu trả hàng.");
   }
 
   return origin;
 }
 
 /**
- * ✅ (CÁCH B) Sync invoice.paidAmount/paymentStatus từ allocations (NORMAL)
- * - Với treo BH: PAID khi đã thu đủ collectible = total - hold(subtotal)
- * - Đảm bảo hold được tính cả khi warrantyHoldAmount đang 0 (do legacy)
+ * Compute collectible cho SALES dựa trên NET sau trả
+ */
+function computeCollectibleForSalesWithNet(inv: {
+  subtotal: number;
+  tax: number;
+  total: number;
+  netSubtotal?: number;
+  netTotal?: number;
+  hasWarrantyHold: boolean;
+  warrantyHoldPct: number;
+  warrantyHoldAmount: number;
+}) {
+  const baseTotal =
+    Number.isFinite(inv.netTotal ?? NaN) && (inv.netTotal as number) >= 0
+      ? roundMoney(inv.netTotal as number)
+      : roundMoney(inv.total);
+
+  const baseSubtotal =
+    Number.isFinite(inv.netSubtotal ?? NaN) && (inv.netSubtotal as number) >= 0
+      ? roundMoney(inv.netSubtotal as number)
+      : roundMoney(inv.subtotal);
+
+  const hasHold = inv.hasWarrantyHold === true;
+
+  if (!hasHold) {
+    return { baseSubtotal, baseTotal, pct: 0, holdAmount: 0, collectible: baseTotal };
+  }
+
+  const pct =
+    Number.isFinite(inv.warrantyHoldPct) && inv.warrantyHoldPct > 0 ? inv.warrantyHoldPct : 5;
+
+  let holdAmount =
+    Number.isFinite(inv.warrantyHoldAmount) && inv.warrantyHoldAmount > 0
+      ? roundMoney(inv.warrantyHoldAmount)
+      : roundMoney((baseSubtotal * pct) / 100);
+
+  if (holdAmount > baseSubtotal) holdAmount = baseSubtotal;
+
+  const collectible = Math.max(0, roundMoney(baseTotal - holdAmount));
+  return { baseSubtotal, baseTotal, pct: roundPct(pct), holdAmount, collectible };
+}
+
+/**
+ * ✅ Sync invoice.paidAmount/paymentStatus từ allocations (NORMAL)
  *
- * QUY ƯỚC TRONG FILE NÀY:
- * - invoice.paidAmount = số NORMAL đã thu (đã clamp theo collectible)
- *   (HOLD tiền treo BH không cộng vào paidAmount ở invoice)
+ * QUY ƯỚC:
+ * - invoice.paidAmount = tổng NORMAL net đã thu (>=0) cho invoice đó (refund làm giảm)
+ * - với SALES: collectible dựa trên netTotal/netSubtotal sau trả (nếu có)
+ * - HOLD không cộng vào paidAmount
+ *
+ * ✅ FIX LONG-TERM:
+ * - Nếu SALES đã trả hàng FULL (netTotal <= 0) => coi như đã tất toán:
+ *   paymentStatus = PAID, paidAmount = 0 (tránh bị hiện UNPAID sau refund full)
+ *
+ * ✅ IMPORTANT (Option A):
+ * - SALES_RETURN/PURCHASE_RETURN không được dùng allocations để thể hiện refund.
+ *   Refund phải apply vào SALES gốc qua /payments.
+ *   => Vì vậy, return invoice sẽ luôn "UNPAID/0" (hoặc bạn có thể set PAID), nhưng không ảnh hưởng công nợ.
  */
 async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invoiceId: string) {
   const inv = await tx.invoice.findUnique({
@@ -267,63 +409,116 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
       subtotal: true,
       tax: true,
       total: true,
+
+      netSubtotal: true,
+      netTax: true,
+      netTotal: true,
+
       hasWarrantyHold: true,
       warrantyHoldPct: true,
       warrantyHoldAmount: true,
+
+      status: true,
     },
   });
   if (!inv) throw httpError(404, "Invoice not found");
+
+  // ✅ Option A: bỏ qua sync payment cho return invoice (tránh return invoice có paidAmount ảo)
+  if (inv.type === "SALES_RETURN" || inv.type === "PURCHASE_RETURN") {
+    await tx.invoice.update({
+      where: { id: invoiceId },
+      data: {
+        paidAmount: new Prisma.Decimal(0),
+        paymentStatus: "UNPAID",
+      },
+    });
+    return;
+  }
 
   const agg = await tx.paymentAllocation.aggregate({
     where: { invoiceId, kind: "NORMAL" },
     _sum: { amount: true },
   });
 
-  const sumNormal = toNum(agg._sum.amount); // can be negative for SALES_RETURN
-  const paidAbs = Math.abs(sumNormal);
+  const sumNormalSigned = toNum(agg._sum.amount); // signed sum (refund làm giảm)
+  const paidNormalNet = Math.max(0, sumNormalSigned); // ✅ không dùng abs()
 
   const total = toNum(inv.total);
-
-  // ✅ subtotal robust: ưu tiên field subtotal, fallback total - tax
+  const tax = toNum(inv.tax);
   const subtotal =
-    toNum(inv.subtotal) > 0
-      ? toNum(inv.subtotal)
-      : Math.max(0, roundMoney(total - toNum(inv.tax)));
+    toNum(inv.subtotal) > 0 ? toNum(inv.subtotal) : Math.max(0, roundMoney(total - tax));
 
-  // ✅ robust hold derive: nếu hasHold mà warrantyHoldAmount chưa set thì derive theo pct (trên subtotal)
-  const pct = toNum(inv.warrantyHoldPct);
-  const derived = computeWarrantyHoldAndCollectible({
-    subtotal,
-    total,
-    hasWarrantyHold: inv.hasWarrantyHold === true,
-    warrantyHoldPct: pct,
-  });
+  const netSubtotal = toNum((inv as any).netSubtotal);
+  const netTotal = toNum((inv as any).netTotal);
 
-  const hold =
-    inv.hasWarrantyHold === true
-      ? toNum(inv.warrantyHoldAmount) > 0
-        ? toNum(inv.warrantyHoldAmount)
-        : derived.holdAmount
-      : 0;
+  // ✅ FIX: FULL RETURN => netTotal = 0 => phải là PAID (đã tất toán), không phải UNPAID
+  if (inv.type === "SALES" && netTotal <= 0.0001) {
+    await tx.invoice.update({
+      where: { id: invoiceId },
+      data: {
+        paidAmount: new Prisma.Decimal(0),
+        paymentStatus: "PAID",
+      },
+    });
+    return;
+  }
 
-  const collectible = Math.max(0, roundMoney(total - hold));
+  // ✅ SALES dùng NET để tính collectible
+  let collectible = total;
+  let holdPct = toNum(inv.warrantyHoldPct);
+  let holdAmount = toNum(inv.warrantyHoldAmount);
+
+  if (inv.type === "SALES") {
+    const calc = computeCollectibleForSalesWithNet({
+      subtotal,
+      tax,
+      total,
+      netSubtotal: Number.isFinite(netSubtotal) ? netSubtotal : undefined,
+      netTotal: Number.isFinite(netTotal) ? netTotal : undefined,
+      hasWarrantyHold: inv.hasWarrantyHold === true,
+      warrantyHoldPct: holdPct,
+      warrantyHoldAmount: holdAmount,
+    });
+    collectible = calc.collectible;
+    holdPct = calc.pct;
+    holdAmount = calc.holdAmount;
+  } else {
+    collectible = total;
+  }
+
+  const paidClamped = Math.min(paidNormalNet, collectible);
 
   let paymentStatus: PaymentStatus = "UNPAID";
-  if (paidAbs <= 0) paymentStatus = "UNPAID";
-  else if (paidAbs + 0.0001 < collectible) paymentStatus = "PARTIAL";
+  if (paidClamped <= 0) paymentStatus = "UNPAID";
+  else if (paidClamped + 0.0001 < collectible) paymentStatus = "PARTIAL";
   else paymentStatus = "PAID";
+
+  if (collectible <= 0.0001) {
+    paymentStatus = "PAID";
+  }
 
   await tx.invoice.update({
     where: { id: invoiceId },
     data: {
-      paidAmount: new Prisma.Decimal(Math.min(paidAbs, collectible)),
+      paidAmount: new Prisma.Decimal(paidClamped),
       paymentStatus,
+
+      ...(inv.type === "SALES" && inv.hasWarrantyHold
+        ? {
+            warrantyHoldPct: new Prisma.Decimal(holdPct),
+            warrantyHoldAmount: new Prisma.Decimal(holdAmount),
+          }
+        : {}),
     },
   });
 }
 
 /**
- * ✅ (CÁCH B) Nếu lúc tạo invoice có paidAmount > 0 => tạo Payment + Allocation
+ * Nếu lúc tạo invoice có paidAmount > 0 => tạo Payment + Allocation
+ *
+ * ✅ FIX (Option A):
+ * - KHÔNG tạo payment lúc tạo SALES_RETURN/PURCHASE_RETURN.
+ * - Refund phải đi qua /payments và allocate âm vào SALES gốc.
  */
 async function createInitialPaymentIfNeeded(
   tx: Prisma.TransactionClient,
@@ -340,10 +535,6 @@ async function createInitialPaymentIfNeeded(
   const paid = roundMoney(params.paidAmount || 0);
   if (paid <= 0) return 0;
 
-  if (!params.partnerId) {
-    throw httpError(400, "Hóa đơn có 'Đã thu' nhưng chưa chọn khách hàng (partner).");
-  }
-
   const inv = await tx.invoice.findUnique({
     where: { id: invoiceId },
     select: {
@@ -352,6 +543,10 @@ async function createInitialPaymentIfNeeded(
       subtotal: true,
       tax: true,
       total: true,
+
+      netSubtotal: true,
+      netTotal: true,
+
       hasWarrantyHold: true,
       warrantyHoldPct: true,
       warrantyHoldAmount: true,
@@ -359,28 +554,38 @@ async function createInitialPaymentIfNeeded(
   });
   if (!inv) throw httpError(404, "Invoice not found");
 
+  // ✅ block return types
+  if (inv.type === "SALES_RETURN" || inv.type === "PURCHASE_RETURN") {
+    return 0;
+  }
+
+  if (!params.partnerId) {
+    throw httpError(400, "Hóa đơn có 'Đã thu' nhưng chưa chọn khách hàng (partner).");
+  }
+
   const paymentType =
-    inv.type === "PURCHASE" || inv.type === "SALES_RETURN" ? "PAYMENT" : "RECEIPT";
+    inv.type === "PURCHASE" /* || inv.type === "SALES_RETURN" */ ? "PAYMENT" : "RECEIPT";
 
   const total = toNum(inv.total);
+  const tax = toNum(inv.tax);
   const subtotal =
-    toNum(inv.subtotal) > 0 ? toNum(inv.subtotal) : Math.max(0, roundMoney(total - toNum(inv.tax)));
+    toNum(inv.subtotal) > 0 ? toNum(inv.subtotal) : Math.max(0, roundMoney(total - tax));
 
-  const derived = computeWarrantyHoldAndCollectible({
-    subtotal,
-    total,
-    hasWarrantyHold: inv.hasWarrantyHold === true,
-    warrantyHoldPct: toNum(inv.warrantyHoldPct),
-  });
+  let collectible = total;
 
-  const hold =
-    inv.hasWarrantyHold === true
-      ? toNum(inv.warrantyHoldAmount) > 0
-        ? toNum(inv.warrantyHoldAmount)
-        : derived.holdAmount
-      : 0;
-
-  const collectible = Math.max(0, roundMoney(total - hold));
+  if (inv.type === "SALES") {
+    const calc = computeCollectibleForSalesWithNet({
+      subtotal,
+      tax,
+      total,
+      netSubtotal: toNum((inv as any).netSubtotal) || subtotal,
+      netTotal: toNum((inv as any).netTotal) || total,
+      hasWarrantyHold: inv.hasWarrantyHold === true,
+      warrantyHoldPct: toNum(inv.warrantyHoldPct),
+      warrantyHoldAmount: toNum(inv.warrantyHoldAmount),
+    });
+    collectible = calc.collectible;
+  }
 
   const paidClamped = Math.min(paid, collectible);
   const allocAmount = paymentType === "PAYMENT" ? -paidClamped : paidClamped;
@@ -408,11 +613,7 @@ async function createInitialPaymentIfNeeded(
 }
 
 /**
- * Recompute subtotal / total cho một invoice:
- * ✅ Đồng thời chuẩn hoá lại paidAmount theo rule legacy
- *
- * NOTE: hàm này chỉ dùng khi add/update/delete line ở DRAFT.
- * Với treo BH, status sẽ được sync theo allocations khi cần.
+ * Recompute subtotal / total cho một invoice (DRAFT)
  */
 async function recomputeInvoiceTotals(invoiceId: string) {
   const [invoice, lines] = await Promise.all([
@@ -450,7 +651,7 @@ async function recomputeInvoiceTotals(invoiceId: string) {
 }
 
 /**
- * ✅ CHỈ cho sửa khi DRAFT
+ * CHỈ cho sửa khi DRAFT
  */
 async function assertInvoiceEditable(tx: Prisma.TransactionClient | PrismaClient, invoiceId: string) {
   const inv = await tx.invoice.findUnique({
@@ -547,6 +748,13 @@ async function getInvoiceAuditSnapshot(
       tax: true,
       total: true,
 
+      returnedSubtotal: true,
+      returnedTax: true,
+      returnedTotal: true,
+      netSubtotal: true,
+      netTax: true,
+      netTotal: true,
+
       paymentStatus: true,
       paidAmount: true,
 
@@ -565,6 +773,10 @@ async function getInvoiceAuditSnapshot(
       note: true,
       createdAt: true,
       updatedAt: true,
+
+      cancelledAt: true,
+      cancelledById: true,
+      cancelReason: true,
     },
   });
 
@@ -577,15 +789,222 @@ async function getInvoiceAuditSnapshot(
     approvedAt: inv.approvedAt ? inv.approvedAt.toISOString() : null,
     createdAt: inv.createdAt ? inv.createdAt.toISOString() : null,
     updatedAt: inv.updatedAt ? inv.updatedAt.toISOString() : null,
+    cancelledAt: inv.cancelledAt ? inv.cancelledAt.toISOString() : null,
 
     subtotal: toNum(inv.subtotal),
     tax: toNum(inv.tax),
     total: toNum(inv.total),
+
+    returnedSubtotal: toNum((inv as any).returnedSubtotal),
+    returnedTax: toNum((inv as any).returnedTax),
+    returnedTotal: toNum((inv as any).returnedTotal),
+
+    netSubtotal: toNum((inv as any).netSubtotal),
+    netTax: toNum((inv as any).netTax),
+    netTotal: toNum((inv as any).netTotal),
+
     paidAmount: toNum(inv.paidAmount),
     warrantyHoldPct: toNum(inv.warrantyHoldPct),
     warrantyHoldAmount: toNum(inv.warrantyHoldAmount),
     totalCost: toNum(inv.totalCost),
   };
+}
+
+/**
+ * Apply SALES_RETURN vào hóa đơn SALES gốc
+ *
+ * ✅ FIX theo rule bạn chốt:
+ * - Trả hàng FULL phải trả cả VAT.
+ * - Không tin tuyệt đối ret.tax (UI/BE có thể lưu 0), nếu (ret.total != ret.subtotal + ret.tax)
+ *   => lấy VAT của phiếu trả = ret.total - ret.subtotal.
+ * - Nếu phiếu trả bị lưu thiếu VAT (tax=0, total=subtotal) => tự tính VAT theo VAT của hóa đơn gốc.
+ * - Không auto set CANCELLED nữa. "Tag đã trả" sẽ thể hiện bằng returnedTotal/netTotal ở FE.
+ */
+async function applySalesReturnToOrigin(
+  tx: Prisma.TransactionClient,
+  params: {
+    returnInvoiceId: string;
+    originInvoiceId: string;
+    actorId: string;
+    auditCtx?: AuditCtx;
+  }
+) {
+  const ret = await tx.invoice.findUnique({
+    where: { id: params.returnInvoiceId },
+    select: {
+      id: true,
+      code: true,
+      type: true,
+      status: true,
+      subtotal: true,
+      tax: true,
+      total: true,
+      issueDate: true,
+      approvedAt: true,
+      refInvoiceId: true,
+    },
+  });
+  if (!ret) throw httpError(404, "Không tìm thấy phiếu trả hàng");
+  if (ret.type !== "SALES_RETURN") throw httpError(400, "Không phải phiếu SALES_RETURN");
+
+  const origin = await tx.invoice.findUnique({
+    where: { id: params.originInvoiceId },
+    select: {
+      id: true,
+      code: true,
+      type: true,
+      status: true,
+
+      subtotal: true,
+      tax: true,
+      total: true,
+
+      returnedSubtotal: true,
+      returnedTax: true,
+      returnedTotal: true,
+
+      netSubtotal: true,
+      netTax: true,
+      netTotal: true,
+
+      hasWarrantyHold: true,
+      warrantyHoldPct: true,
+      warrantyHoldAmount: true,
+      warrantyDueDate: true,
+
+      paidAmount: true,
+
+      cancelledAt: true,
+    },
+  });
+  if (!origin) throw httpError(404, "Không tìm thấy hóa đơn gốc");
+  if (origin.type !== "SALES") throw httpError(400, "Hóa đơn gốc không phải SALES");
+
+  const originBefore = await getInvoiceAuditSnapshot(tx, origin.id);
+
+  const oSubtotal = roundMoney(toNum(origin.subtotal));
+  const oTax = roundMoney(toNum(origin.tax));
+  const oTotal = roundMoney(toNum(origin.total));
+
+  // --- ✅ normalize return amounts ---
+  let rSubtotal = roundMoney(toNum(ret.subtotal));
+  let rTax = roundMoney(toNum(ret.tax));
+  let rTotal = roundMoney(toNum(ret.total));
+
+  // fallback: nếu total bị 0 nhưng subtotal/tax có => tính lại
+  if (rTotal <= 0 && (rSubtotal > 0 || rTax > 0)) {
+    rTotal = roundMoney(rSubtotal + rTax);
+  }
+
+  // ✅ CORE FIX #1: nếu mismatch thì tin total+subtotal => derive tax = total - subtotal
+  if (rTotal > 0) {
+    const diff = roundMoney(rTotal - (rSubtotal + rTax));
+    if (Math.abs(diff) > 0.01) {
+      const derivedTax = roundMoney(rTotal - rSubtotal);
+      rTax = Math.max(0, derivedTax);
+    }
+  }
+
+  // ✅ CORE FIX #2: nếu phiếu trả bị lưu thiếu VAT (tax ~ 0, total ~ subtotal) nhưng hóa đơn gốc có VAT
+  if (rSubtotal > 0.0001 && rTax <= 0.0001 && oTax > 0.0001 && oSubtotal > 0.0001) {
+    rTax = computeReturnTaxFromOrigin({
+      originSubtotal: oSubtotal,
+      originTax: oTax,
+      returnSubtotal: rSubtotal,
+    });
+    rTotal = roundMoney(rSubtotal + rTax);
+  }
+
+  // ensure non-negative
+  rSubtotal = Math.max(0, rSubtotal);
+  rTax = Math.max(0, rTax);
+  rTotal = Math.max(0, roundMoney(rSubtotal + rTax));
+
+  // Basic caps: không cho trả vượt tổng gốc
+  const oldReturnedSubtotal = roundMoney(toNum((origin as any).returnedSubtotal));
+  const oldReturnedTax = roundMoney(toNum((origin as any).returnedTax));
+  const oldReturnedTotal = roundMoney(toNum((origin as any).returnedTotal));
+
+  const nextReturnedSubtotal = Math.min(oSubtotal, roundMoney(oldReturnedSubtotal + rSubtotal));
+  const nextReturnedTax = Math.min(oTax, roundMoney(oldReturnedTax + rTax));
+  const nextReturnedTotal = Math.min(oTotal, roundMoney(oldReturnedTotal + rTotal));
+
+  const nextNetSubtotal = Math.max(0, roundMoney(oSubtotal - nextReturnedSubtotal));
+  const nextNetTax = Math.max(0, roundMoney(oTax - nextReturnedTax));
+  const nextNetTotal = Math.max(0, roundMoney(oTotal - nextReturnedTotal));
+
+  // recompute hold theo netSubtotal
+  let nextHoldPct = roundPct(toNum(origin.warrantyHoldPct));
+  let nextHoldAmount = roundMoney(toNum(origin.warrantyHoldAmount));
+
+  if (origin.hasWarrantyHold === true) {
+    if (!(nextHoldPct > 0)) nextHoldPct = 5;
+    nextHoldAmount = roundMoney((nextNetSubtotal * nextHoldPct) / 100);
+    if (nextHoldAmount > nextNetSubtotal) nextHoldAmount = nextNetSubtotal;
+  } else {
+    nextHoldPct = 0;
+    nextHoldAmount = 0;
+  }
+
+  await tx.invoice.update({
+    where: { id: origin.id },
+    data: {
+      returnedSubtotal: new Prisma.Decimal(nextReturnedSubtotal),
+      returnedTax: new Prisma.Decimal(nextReturnedTax),
+      returnedTotal: new Prisma.Decimal(nextReturnedTotal),
+
+      netSubtotal: new Prisma.Decimal(nextNetSubtotal),
+      netTax: new Prisma.Decimal(nextNetTax),
+      netTotal: new Prisma.Decimal(nextNetTotal),
+
+      ...(origin.hasWarrantyHold
+        ? {
+            warrantyHoldPct: new Prisma.Decimal(nextHoldPct),
+            warrantyHoldAmount: new Prisma.Decimal(nextHoldAmount),
+          }
+        : {
+            warrantyHoldPct: new Prisma.Decimal(0),
+            warrantyHoldAmount: new Prisma.Decimal(0),
+          }),
+    },
+  });
+
+  // ✅ sync paid/status theo allocations NORMAL (chỉ trên SALES gốc)
+  await syncInvoicePaidFromAllocations(tx, origin.id);
+
+  const originAfter = await getInvoiceAuditSnapshot(tx, origin.id);
+
+  await auditLog(tx, {
+    userId: params.auditCtx?.userId ?? params.actorId,
+    userRole: params.auditCtx?.userRole,
+    action: "INVOICE_ORIGIN_APPLY_RETURN",
+    entity: "Invoice",
+    entityId: origin.id,
+    before: originBefore,
+    after: originAfter,
+    meta: mergeMeta(params.auditCtx?.meta, {
+      originInvoiceId: origin.id,
+      originCode: origin.code,
+      returnInvoiceId: ret.id,
+      returnCode: ret.code,
+      delta: { returnedSubtotal: rSubtotal, returnedTax: rTax, returnedTotal: rTotal },
+      next: {
+        returnedSubtotal: nextReturnedSubtotal,
+        returnedTax: nextReturnedTax,
+        returnedTotal: nextReturnedTotal,
+        netSubtotal: nextNetSubtotal,
+        netTax: nextNetTax,
+        netTotal: nextNetTotal,
+      },
+      normalize: {
+        retSubtotal: toNum(ret.subtotal),
+        retTax: toNum(ret.tax),
+        retTotal: toNum(ret.total),
+        used: { rSubtotal, rTax, rTotal },
+        originRate: oSubtotal > 0 ? oTax / oSubtotal : null,
+      },
+    }),
+  });
 }
 
 /** ========================= Public APIs ========================= **/
@@ -691,9 +1110,15 @@ export async function updateInvoiceNote(id: string, note: string, auditCtx?: Aud
 }
 
 /**
- * ✅ (CÁCH B) Create invoice
- * ✅ FIX: nếu hasWarrantyHold => tính warrantyHoldAmount ngay (không đợi approve)
- * ✅ FIX: paymentStatus khi paidClamped >0 phải so với collectible (total - hold(subtotal))
+ * Create invoice
+ *
+ * ✅ FIX (Option A):
+ * - SALES_RETURN/PURCHASE_RETURN: ignore paidAmount/paymentStatus on invoice create
+ *   (refund không gắn vào return invoice)
+ *
+ * ✅ FIX VAT RETURN:
+ * - SALES_RETURN: tax/total sẽ được suy ra từ VAT của hóa đơn gốc (tỷ lệ originTax/originSubtotal)
+ *   để tránh trường hợp phiếu trả bị lưu thiếu VAT => origin còn thiếu VAT như bug bạn gặp.
  */
 export async function createInvoice(body: any, auditCtx?: AuditCtx) {
   const issueDate = body.issueDate ? new Date(body.issueDate) : new Date();
@@ -714,22 +1139,20 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
   const type: InvoiceType = (body.type ?? "SALES") as InvoiceType;
 
   const subtotal = validLines.reduce((s, l) => s + l.qty * l.price, 0);
-  const tax = calcTaxFromBody(subtotal, body);
-  const { total, paidAmount } = normalizePayment(subtotal, tax, body);
+  const taxFromBody = calcTaxFromBody(subtotal, body);
+  const totalFromBody = subtotal + taxFromBody;
+
+  // ✅ Only SALES/PURCHASE allow legacy paidAmount-on-create
+  const isReturnType = type === "SALES_RETURN" || type === "PURCHASE_RETURN";
+  const normalized = !isReturnType
+    ? normalizePayment(subtotal, taxFromBody, body)
+    : { total: totalFromBody, paidAmount: 0, paymentStatus: "UNPAID" as PaymentStatus };
+  const paidAmount = normalized.paidAmount;
 
   const hasWarrantyHold = body?.hasWarrantyHold === true;
-  const warrantyHoldPctRaw =
-    body?.warrantyHoldPct !== undefined &&
-    body?.warrantyHoldPct !== null &&
-    body?.warrantyHoldPct !== ""
-      ? Number(body.warrantyHoldPct)
-      : 0;
 
-  const warrantyHoldPct = hasWarrantyHold
-    ? Number.isFinite(warrantyHoldPctRaw) && warrantyHoldPctRaw > 0
-      ? warrantyHoldPctRaw
-      : 5
-    : 0;
+  const inputHoldAmount = parseOptionalNumber(body?.warrantyHoldAmount);
+  const inputHoldPct = parseOptionalNumber(body?.warrantyHoldPct);
 
   try {
     const created = await prisma.$transaction(
@@ -737,15 +1160,29 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
         const receiveAccountId = await validateReceiveAccountId(tx, body.receiveAccountId);
 
         let origin: Awaited<ReturnType<typeof requireValidRefInvoiceForSalesReturn>> | null = null;
+
+        // ✅ totals effective (đặc biệt cho SALES_RETURN cần suy VAT theo origin)
+        let effectiveTax = taxFromBody;
+        let effectiveTotal = totalFromBody;
+
         if (type === "SALES_RETURN") {
           origin = await requireValidRefInvoiceForSalesReturn(tx, body.refInvoiceId);
 
+          // fill partner
           if (!body.partnerId) body.partnerId = origin.partnerId ?? null;
           if (!body.partnerName) body.partnerName = origin.partnerName ?? null;
 
           if (body.partnerPhone == null) body.partnerPhone = origin.partnerPhone ?? null;
           if (body.partnerTax == null) body.partnerTax = origin.partnerTax ?? null;
           if (body.partnerAddr == null) body.partnerAddr = origin.partnerAddr ?? null;
+
+          // ✅ VAT return = theo tỷ lệ VAT hóa đơn gốc
+          effectiveTax = computeReturnTaxFromOrigin({
+            originSubtotal: toNum(origin.subtotal),
+            originTax: toNum(origin.tax),
+            returnSubtotal: subtotal,
+          });
+          effectiveTotal = roundMoney(subtotal + effectiveTax);
         }
 
         if (type === "SALES_RETURN" && !body.partnerId) {
@@ -755,12 +1192,13 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
           );
         }
 
-        // ✅ tính warrantyHoldAmount ngay khi tạo (để UI/logic không hiểu nhầm)
         const holdCalc = computeWarrantyHoldAndCollectible({
           subtotal,
-          total,
+          total: effectiveTotal,
           hasWarrantyHold: type === "SALES" && hasWarrantyHold,
-          warrantyHoldPct,
+          warrantyHoldPct: inputHoldPct,
+          warrantyHoldAmount: inputHoldAmount,
+          legacyPct: 5,
         });
 
         const due =
@@ -799,9 +1237,18 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
             currency: body.currency ?? "VND",
 
             subtotal: new Prisma.Decimal(subtotal),
-            tax: new Prisma.Decimal(tax),
-            total: new Prisma.Decimal(total),
+            tax: new Prisma.Decimal(effectiveTax),
+            total: new Prisma.Decimal(effectiveTotal),
 
+            returnedSubtotal: new Prisma.Decimal(0),
+            returnedTax: new Prisma.Decimal(0),
+            returnedTotal: new Prisma.Decimal(0),
+
+            netSubtotal: new Prisma.Decimal(subtotal),
+            netTax: new Prisma.Decimal(effectiveTax),
+            netTotal: new Prisma.Decimal(effectiveTotal),
+
+            // ✅ return types always start unpaid/0 (refund goes via /payments to origin)
             paymentStatus: "UNPAID",
             paidAmount: new Prisma.Decimal(0),
 
@@ -811,7 +1258,11 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
             warrantyDueDate: type === "SALES" ? due : null,
 
             status: "DRAFT",
-          },
+
+            cancelledAt: null,
+            cancelledById: null,
+            cancelReason: null,
+          } as any,
         });
 
         await tx.invoiceLine.createMany({
@@ -829,8 +1280,9 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
           }),
         });
 
+        // ✅ Only non-return types can create initial payment
         let paidClamped = 0;
-        if (paidAmount > 0) {
+        if (!isReturnType && paidAmount > 0) {
           paidClamped = await createInitialPaymentIfNeeded(tx, inv.id, {
             paidAmount,
             issueDate,
@@ -842,7 +1294,6 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
         }
 
         if (paidClamped > 0) {
-          // ✅ FIX: so với collectible (total - hold(subtotal)), không phải total
           const collectible = holdCalc.collectible;
           const st: PaymentStatus = paidClamped + 0.0001 >= collectible ? "PAID" : "PARTIAL";
 
@@ -855,7 +1306,6 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
           });
         }
 
-        // ✅ AUDIT create
         const after = await getInvoiceAuditSnapshot(tx, inv.id);
         await auditLog(tx, {
           userId: auditCtx?.userId ?? body.createdById,
@@ -869,6 +1319,10 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
             safeCode,
             originInvoiceId: origin?.id ?? null,
             lineCount: validLines.length,
+            isReturnType,
+            note: isReturnType
+              ? "Return invoice does not create payments; refund must go via /payments to origin."
+              : undefined,
           }),
         });
 
@@ -885,7 +1339,9 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
 
 /**
  * Update invoice + replace lines
- * ✅ FIX: nếu đổi lines/tax/total hoặc warrantyHoldPct/hasWarrantyHold => recompute warrantyHoldAmount (trên subtotal)
+ *
+ * ✅ FIX: Nếu invoice không phải SALES => ép warrantyHold fields = 0 (tránh return bị set hold)
+ * ✅ FIX VAT RETURN: nếu SALES_RETURN, tax/total được suy theo VAT hóa đơn gốc
  */
 export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) {
   const before = await getInvoiceAuditSnapshot(prisma, id);
@@ -914,17 +1370,18 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
 
         const nextType: InvoiceType = (body.type ?? current.type) as InvoiceType;
 
+        let originForReturn: Awaited<ReturnType<typeof requireValidRefInvoiceForSalesReturn>> | null =
+          null;
+
         if (nextType === "SALES_RETURN") {
-          const refId =
-            body.refInvoiceId !== undefined ? body.refInvoiceId : current.refInvoiceId;
+          const refId = body.refInvoiceId !== undefined ? body.refInvoiceId : current.refInvoiceId;
+          originForReturn = await requireValidRefInvoiceForSalesReturn(tx, refId);
 
-          const origin = await requireValidRefInvoiceForSalesReturn(tx, refId);
-
-          if (body.partnerId == null) body.partnerId = origin.partnerId ?? null;
-          if (body.partnerName == null) body.partnerName = origin.partnerName ?? null;
-          if (body.partnerPhone == null) body.partnerPhone = origin.partnerPhone ?? null;
-          if (body.partnerTax == null) body.partnerTax = origin.partnerTax ?? null;
-          if (body.partnerAddr == null) body.partnerAddr = origin.partnerAddr ?? null;
+          if (body.partnerId == null) body.partnerId = originForReturn.partnerId ?? null;
+          if (body.partnerName == null) body.partnerName = originForReturn.partnerName ?? null;
+          if (body.partnerPhone == null) body.partnerPhone = originForReturn.partnerPhone ?? null;
+          if (body.partnerTax == null) body.partnerTax = originForReturn.partnerTax ?? null;
+          if (body.partnerAddr == null) body.partnerAddr = originForReturn.partnerAddr ?? null;
 
           if (!body.partnerId) {
             throw httpError(
@@ -962,20 +1419,39 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
           data.refInvoiceId = body.refInvoiceId ? String(body.refInvoiceId).trim() : null;
         }
 
-        if (body.hasWarrantyHold !== undefined) {
-          data.hasWarrantyHold = body.hasWarrantyHold === true;
-          if (data.hasWarrantyHold !== true) {
-            data.warrantyHoldPct = new Prisma.Decimal(0);
-            data.warrantyHoldAmount = new Prisma.Decimal(0);
-            data.warrantyDueDate = null;
+        // ✅ warrantyHold chỉ hợp lệ cho SALES
+        if (nextType !== "SALES") {
+          data.hasWarrantyHold = false;
+          data.warrantyHoldPct = new Prisma.Decimal(0);
+          data.warrantyHoldAmount = new Prisma.Decimal(0);
+          data.warrantyDueDate = null;
+        } else {
+          if (body.hasWarrantyHold !== undefined) {
+            data.hasWarrantyHold = body.hasWarrantyHold === true;
+            if (data.hasWarrantyHold !== true) {
+              data.warrantyHoldPct = new Prisma.Decimal(0);
+              data.warrantyHoldAmount = new Prisma.Decimal(0);
+              data.warrantyDueDate = null;
+            }
           }
-        }
-        if (body.warrantyHoldPct !== undefined) {
-          const pct = Number(body.warrantyHoldPct);
-          if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
-            throw httpError(400, "warrantyHoldPct không hợp lệ (0..100).");
+
+          if (body.warrantyHoldPct !== undefined) {
+            const pct = Number(body.warrantyHoldPct);
+            if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+              throw httpError(400, "warrantyHoldPct không hợp lệ (0..100).");
+            }
+            data.warrantyHoldPct = new Prisma.Decimal(pct);
           }
-          data.warrantyHoldPct = new Prisma.Decimal(pct);
+
+          if (body.warrantyHoldAmount !== undefined) {
+            const amt = parseOptionalNumber(body.warrantyHoldAmount);
+            if (amt === undefined) {
+              data.warrantyHoldAmount = new Prisma.Decimal(0);
+            } else {
+              if (amt < 0) throw httpError(400, "warrantyHoldAmount không hợp lệ (>= 0).");
+              data.warrantyHoldAmount = new Prisma.Decimal(roundMoney(amt));
+            }
+          }
         }
 
         await tx.invoice.update({ where: { id }, data });
@@ -1015,8 +1491,17 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
 
           await tx.invoiceLine.createMany({ data: linesData });
 
-          const tax = calcTaxFromBody(subtotal, body);
-          const total = subtotal + tax;
+          // ✅ VAT return
+          let tax = calcTaxFromBody(subtotal, body);
+          if (nextType === "SALES_RETURN" && originForReturn) {
+            tax = computeReturnTaxFromOrigin({
+              originSubtotal: toNum(originForReturn.subtotal),
+              originTax: toNum(originForReturn.tax),
+              returnSubtotal: subtotal,
+            });
+          }
+
+          const total = roundMoney(subtotal + tax);
 
           await tx.invoice.update({
             where: { id },
@@ -1024,13 +1509,17 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
               subtotal: new Prisma.Decimal(subtotal),
               tax: new Prisma.Decimal(tax),
               total: new Prisma.Decimal(total),
-            },
+
+              // giữ net* đồng bộ trong DRAFT
+              netSubtotal: new Prisma.Decimal(subtotal),
+              netTax: new Prisma.Decimal(tax),
+              netTotal: new Prisma.Decimal(total),
+            } as any,
           });
 
           changedTotals = true;
         }
 
-        // ✅ recompute warrantyHoldAmount nếu invoice SALES và có hold (trên subtotal)
         const fresh = await tx.invoice.findUnique({
           where: { id },
           select: {
@@ -1039,23 +1528,32 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
             tax: true,
             total: true,
             issueDate: true,
+
+            netSubtotal: true,
+            netTotal: true,
+
             hasWarrantyHold: true,
             warrantyHoldPct: true,
+            warrantyHoldAmount: true,
           },
         });
 
         if (fresh && fresh.type === "SALES") {
           const total = toNum(fresh.total);
+          const tax = toNum(fresh.tax);
           const subtotal =
             toNum(fresh.subtotal) > 0
               ? toNum(fresh.subtotal)
-              : Math.max(0, roundMoney(total - toNum(fresh.tax)));
+              : Math.max(0, roundMoney(total - tax));
 
           const calc = computeWarrantyHoldAndCollectible({
             subtotal,
             total,
             hasWarrantyHold: fresh.hasWarrantyHold === true,
             warrantyHoldPct: toNum(fresh.warrantyHoldPct),
+            warrantyHoldAmount:
+              toNum(fresh.warrantyHoldAmount) > 0 ? toNum(fresh.warrantyHoldAmount) : undefined,
+            legacyPct: 5,
           });
 
           const due =
@@ -1077,11 +1575,11 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
           });
         }
 
-        // sync paid/status theo allocations (đặc biệt quan trọng khi total/hold đổi)
         if (
           Array.isArray(body.lines) ||
           body.hasWarrantyHold !== undefined ||
           body.warrantyHoldPct !== undefined ||
+          body.warrantyHoldAmount !== undefined ||
           changedTotals
         ) {
           await syncInvoicePaidFromAllocations(tx, id);
@@ -1301,53 +1799,95 @@ export async function approveInvoice(
       const existingMv = await tx.movement.count({ where: { invoiceId: invoice.id } });
       if (existingMv > 0) throw httpError(409, "Hóa đơn đã có movement, không thể duyệt lại.");
 
+      let originForReturn: Awaited<ReturnType<typeof requireValidRefInvoiceForSalesReturn>> | null =
+        null;
+
       if (invoice.type === "SALES_RETURN") {
-        const origin = await requireValidRefInvoiceForSalesReturn(tx, (invoice as any).refInvoiceId);
+        originForReturn = await requireValidRefInvoiceForSalesReturn(
+          tx,
+          (invoice as any).refInvoiceId
+        );
+
+        // ✅ FIX VAT RETURN: ép tax/total của phiếu trả theo VAT hóa đơn gốc
+        const retSubtotal = roundMoney(toNum((invoice as any).subtotal));
+        const retTax = computeReturnTaxFromOrigin({
+          originSubtotal: toNum(originForReturn.subtotal),
+          originTax: toNum(originForReturn.tax),
+          returnSubtotal: retSubtotal,
+        });
+        const retTotal = roundMoney(retSubtotal + retTax);
 
         await tx.invoice.update({
           where: { id: invoice.id },
           data: {
-            refInvoiceId: origin.id,
+            refInvoiceId: originForReturn.id,
 
-            partnerId: origin.partnerId ?? null,
-            partnerName: origin.partnerName ?? null,
-            partnerPhone: origin.partnerPhone ?? null,
-            partnerTax: origin.partnerTax ?? null,
-            partnerAddr: origin.partnerAddr ?? null,
+            partnerId: originForReturn.partnerId ?? null,
+            partnerName: originForReturn.partnerName ?? null,
+            partnerPhone: originForReturn.partnerPhone ?? null,
+            partnerTax: originForReturn.partnerTax ?? null,
+            partnerAddr: originForReturn.partnerAddr ?? null,
 
-            saleUserId: origin.saleUserId ?? null,
-            saleUserName: origin.saleUserName ?? null,
-            techUserId: origin.techUserId ?? null,
-            techUserName: origin.techUserName ?? null,
+            saleUserId: originForReturn.saleUserId ?? null,
+            saleUserName: originForReturn.saleUserName ?? null,
+            techUserId: originForReturn.techUserId ?? null,
+            techUserName: originForReturn.techUserName ?? null,
 
-            receiveAccountId: invoice.receiveAccountId ?? origin.receiveAccountId ?? null,
-          },
+            receiveAccountId: invoice.receiveAccountId ?? originForReturn.receiveAccountId ?? null,
+
+            // ✅ return invoice never has hold
+            hasWarrantyHold: false,
+            warrantyHoldPct: new Prisma.Decimal(0),
+            warrantyHoldAmount: new Prisma.Decimal(0),
+            warrantyDueDate: null,
+
+            // ✅ totals corrected
+            tax: new Prisma.Decimal(retTax),
+            total: new Prisma.Decimal(retTotal),
+            netSubtotal: new Prisma.Decimal(retSubtotal),
+            netTax: new Prisma.Decimal(retTax),
+            netTotal: new Prisma.Decimal(retTotal),
+          } as any,
         });
       }
 
       /**
-       * ✅ SALES: tính lại warrantyHold fields ngay trước khi approve để đảm bảo data đúng
-       * ✅ HOLD tính trên subtotal (không VAT)
+       * SALES: tính lại warrantyHold fields ngay trước khi approve
        */
       if (invoice.type === "SALES") {
         const hasHold = invoice.hasWarrantyHold === true;
 
+        const total = toNum((invoice as any).total);
+        const tax = toNum((invoice as any).tax);
+        const subtotal =
+          toNum((invoice as any).subtotal) > 0
+            ? toNum((invoice as any).subtotal)
+            : Math.max(0, total - tax);
+
+        await tx.invoice.update({
+          where: { id: invoice.id },
+          data: {
+            returnedSubtotal: new Prisma.Decimal(0),
+            returnedTax: new Prisma.Decimal(0),
+            returnedTotal: new Prisma.Decimal(0),
+            netSubtotal: new Prisma.Decimal(subtotal),
+            netTax: new Prisma.Decimal(tax),
+            netTotal: new Prisma.Decimal(total),
+          } as any,
+        });
+
         if (hasHold) {
-          const pct = (() => {
-            const p = toNum((invoice as any).warrantyHoldPct);
-            if (p > 0) return p;
-            return 5;
-          })();
-
-          if (pct < 0 || pct > 100) throw httpError(400, "warrantyHoldPct không hợp lệ (0..100).");
-
-          const total = toNum((invoice as any).total);
-          const subtotal =
-            toNum((invoice as any).subtotal) > 0
-              ? toNum((invoice as any).subtotal)
-              : Math.max(0, roundMoney(total - toNum((invoice as any).tax)));
-
-          const holdAmount = roundMoney((subtotal * pct) / 100);
+          const calc = computeWarrantyHoldAndCollectible({
+            subtotal,
+            total,
+            hasWarrantyHold: true,
+            warrantyHoldPct: toNum((invoice as any).warrantyHoldPct),
+            warrantyHoldAmount:
+              toNum((invoice as any).warrantyHoldAmount) > 0
+                ? toNum((invoice as any).warrantyHoldAmount)
+                : undefined,
+            legacyPct: 5,
+          });
 
           const due = new Date((invoice as any).issueDate);
           due.setFullYear(due.getFullYear() + 1);
@@ -1356,8 +1896,8 @@ export async function approveInvoice(
             where: { id: invoice.id },
             data: {
               hasWarrantyHold: true,
-              warrantyHoldPct: new Prisma.Decimal(pct),
-              warrantyHoldAmount: new Prisma.Decimal(holdAmount),
+              warrantyHoldPct: new Prisma.Decimal(calc.pct),
+              warrantyHoldAmount: new Prisma.Decimal(calc.holdAmount),
               warrantyDueDate: due,
             },
           });
@@ -1385,8 +1925,7 @@ export async function approveInvoice(
       });
 
       const stockMap = new Map<string, { qty: number; avgCost: number }>();
-      for (const s of stocks)
-        stockMap.set(s.itemId, { qty: toNum(s.qty), avgCost: toNum(s.avgCost) });
+      for (const s of stocks) stockMap.set(s.itemId, { qty: toNum(s.qty), avgCost: toNum(s.avgCost) });
 
       if (isOutType(invoice.type as InvoiceType)) {
         const items = await tx.item.findMany({
@@ -1560,7 +2099,6 @@ export async function approveInvoice(
         },
       });
 
-      // ✅ Set APPROVED
       await tx.invoice.update({
         where: { id: invoice.id },
         data: {
@@ -1570,15 +2108,28 @@ export async function approveInvoice(
         },
       });
 
-      // ✅ Create/Update/Void WarrantyHold theo invoice đã approve (có audit)
       await ensureWarrantyHoldOnApprove(tx, invoice.id, {
         userId: auditCtx?.userId ?? params.approvedById,
         userRole: auditCtx?.userRole,
         meta: auditCtx?.meta,
       });
 
-      // ✅ Sync paid/status theo allocations NORMAL (đã clamp theo collectible)
+      // ✅ Sync allocations:
+      // - for SALES/PURCHASE only
+      // - return types are forced to 0/unpaid by syncInvoicePaidFromAllocations()
       await syncInvoicePaidFromAllocations(tx, invoice.id);
+
+      if (invoice.type === "SALES_RETURN") {
+        const originId = originForReturn?.id || String((invoice as any).refInvoiceId || "");
+        if (!originId) throw httpError(400, "Thiếu refInvoiceId để cập nhật hóa đơn gốc.");
+
+        await applySalesReturnToOrigin(tx, {
+          returnInvoiceId: invoice.id,
+          originInvoiceId: originId,
+          actorId: auditCtx?.userId ?? params.approvedById,
+          auditCtx,
+        });
+      }
 
       const after = await getInvoiceAuditSnapshot(tx, params.invoiceId);
 
@@ -1592,6 +2143,7 @@ export async function approveInvoice(
         after,
         meta: mergeMeta(auditCtx?.meta, {
           warehouseId: warehouse.id,
+          originInvoiceId: originForReturn?.id ?? null,
         }),
       });
 
@@ -1711,14 +2263,6 @@ function revenueSign(t: InvoiceType) {
   return 0;
 }
 
-/**
- * ✅ FIX CHUẨN THEO YÊU CẦU:
- * - HOLD tính trên subtotal (không VAT)
- * - Doanh thu nhân viên = total - tax - hold(subtotal)
- *
- * Lưu ý:
- * - Nếu DB chưa có warrantyHoldAmount nhưng có hasWarrantyHold + pct => derive lại theo subtotal.
- */
 export async function aggregateRevenue(params: {
   from?: Date;
   to?: Date;
@@ -1769,6 +2313,10 @@ export async function aggregateRevenue(params: {
       tax: true,
       total: true,
 
+      netSubtotal: true,
+      netTax: true,
+      netTotal: true,
+
       paidAmount: true,
 
       saleUserId: true,
@@ -1783,8 +2331,8 @@ export async function aggregateRevenue(params: {
     orderBy: { approvedAt: "asc" },
   });
 
-  let netRevenue = 0;   // ✅ net revenue (total - tax - hold(subtotal))
-  let netCollected = 0; // thực thu NORMAL (paidAmount) (signed)
+  let netRevenue = 0;
+  let netCollected = 0;
 
   const bySale = new Map<
     string,
@@ -1804,28 +2352,26 @@ export async function aggregateRevenue(params: {
     const subtotal =
       toNum(r.subtotal) > 0 ? toNum(r.subtotal) : Math.max(0, roundMoney(total - tax));
 
-    // ✅ hold robust (derive nếu bị 0 do legacy) — derive trên subtotal
-    let hold = 0;
-    if (r.hasWarrantyHold === true) {
-      const holdDb = toNum(r.warrantyHoldAmount);
-      if (holdDb > 0) {
-        hold = holdDb;
-      } else {
-        const derived = computeWarrantyHoldAndCollectible({
-          subtotal,
-          total,
-          hasWarrantyHold: true,
-          warrantyHoldPct: toNum(r.warrantyHoldPct),
-        });
-        hold = derived.holdAmount;
-      }
-    }
+    const netTotal = toNum((r as any).netTotal);
+    const netSubtotal = toNum((r as any).netSubtotal);
 
-    // ✅ doanh thu thuần cho nhân viên: total - tax - hold(subtotal)
-    const net = Math.max(0, roundMoney(total - tax - hold));
-    const recognizedRevenue = sign * net;
+    const baseTotal = Number.isFinite(netTotal) && netTotal >= 0 ? netTotal : total;
+    const baseSubtotal2 = Number.isFinite(netSubtotal) && netSubtotal >= 0 ? netSubtotal : subtotal;
 
-    // ✅ collected: lấy theo paidAmount (đang là NORMAL đã thu, đã clamp theo collectible)
+    const calc = computeWarrantyHoldAndCollectible({
+      subtotal: baseSubtotal2,
+      total: baseTotal,
+      hasWarrantyHold: r.hasWarrantyHold === true,
+      warrantyHoldPct: toNum(r.warrantyHoldPct),
+      warrantyHoldAmount: toNum(r.warrantyHoldAmount) > 0 ? toNum(r.warrantyHoldAmount) : undefined,
+      legacyPct: 5,
+    });
+
+    const hold = r.hasWarrantyHold ? calc.holdAmount : 0;
+
+    const recognizedNet = Math.max(0, roundMoney(baseTotal - toNum(r.tax) - hold));
+    const recognizedRevenue = sign * recognizedNet;
+
     const collected = sign * toNum(r.paidAmount);
 
     netRevenue += recognizedRevenue;
@@ -1915,178 +2461,10 @@ export async function recallInvoice(
   return getInvoiceById(params.invoiceId);
 }
 
-/** ========================= Sales Ledger + Payment deprecated ========================= **/
-
-export type SalesLedgerRow = {
-  issueDate: string;
-  code: string;
-  partnerName: string;
-
-  itemName: string;
-  itemSku?: string | null;
-
-  qty: number;
-  unitPrice: number;
-  unitCost: number;
-  costTotal: number;
-
-  lineAmount: number;
-
-  paid: number;
-  debt: number;
-
-  saleUserName: string;
-  techUserName: string;
-};
-
-function round2(n: number) {
-  return Math.round((n + Number.EPSILON) * 100) / 100;
-}
-
-export async function listSalesLedger(params: {
-  from?: Date;
-  to?: Date;
-  q?: string;
-  saleUserId?: string;
-  techUserId?: string;
-  paymentStatus?: PaymentStatus;
-}) {
-  const where: Prisma.InvoiceWhereInput = {
-    status: "APPROVED",
-    type: "SALES",
-  };
-
-  if (params.saleUserId) where.saleUserId = params.saleUserId as any;
-  if (params.techUserId) where.techUserId = params.techUserId as any;
-  if (params.paymentStatus) where.paymentStatus = params.paymentStatus;
-
-  if (params.from || params.to) {
-    where.issueDate = {};
-    if (params.from) (where.issueDate as any).gte = params.from;
-    if (params.to) (where.issueDate as any).lte = params.to;
-  }
-
-  if (params.q && params.q.trim()) {
-    const q = params.q.trim();
-    where.OR = [
-      { code: { contains: q, mode: "insensitive" } },
-      { partnerName: { contains: q, mode: "insensitive" } },
-      { lines: { some: { itemName: { contains: q, mode: "insensitive" } } } },
-      { lines: { some: { itemSku: { contains: q, mode: "insensitive" } } } },
-    ];
-  }
-
-  const invoices = await prisma.invoice.findMany({
-    where,
-    orderBy: { issueDate: "desc" },
-    include: {
-      saleUser: true,
-      techUser: true,
-      lines: true,
-      warrantyHold: true,
-    },
-  });
-
-  const rows: SalesLedgerRow[] = [];
-
-  for (const inv of invoices as any[]) {
-    const invSubtotal = toNum(inv.subtotal);
-    const invPaidNormal = toNum(inv.paidAmount);
-
-    const base =
-      invSubtotal > 0
-        ? invSubtotal
-        : (inv.lines || []).reduce((s: number, l: any) => s + toNum(l.amount), 0);
-
-    const paidBase = Math.min(invPaidNormal, base > 0 ? base : invPaidNormal);
-
-    const saleName =
-      inv.saleUserName ||
-      inv.saleUser?.username ||
-      inv.saleUser?.name ||
-      inv.saleUser?.email ||
-      inv.saleUser?.id ||
-      "";
-
-    const techName =
-      inv.techUserName ||
-      inv.techUser?.username ||
-      inv.techUser?.name ||
-      inv.techUser?.email ||
-      inv.techUser?.id ||
-      "";
-
-    const issueDateStr = new Date(inv.issueDate).toISOString().slice(0, 10);
-    const partnerName = String(inv.partnerName || "");
-
-    let paidAllocatedSum = 0;
-
-    const linesArr: any[] = Array.isArray(inv.lines) ? inv.lines : [];
-    for (let i = 0; i < linesArr.length; i++) {
-      const l = linesArr[i];
-
-      const qty = toNum(l.qty);
-      const unitPrice = toNum(l.price);
-      const lineAmount = toNum(l.amount);
-
-      const unitCost = toNum(l.unitCost);
-      const costTotal = toNum(l.costTotal);
-
-      let paidLine = 0;
-      if (base > 0 && paidBase > 0 && lineAmount > 0) {
-        paidLine = round2((paidBase * lineAmount) / base);
-      }
-
-      if (i === linesArr.length - 1) {
-        const remain = round2(paidBase - paidAllocatedSum);
-        paidLine = Math.max(0, Math.min(lineAmount, remain));
-      }
-
-      paidAllocatedSum = round2(paidAllocatedSum + paidLine);
-      const debt = round2(Math.max(0, lineAmount - paidLine));
-
-      rows.push({
-        issueDate: issueDateStr,
-        code: String(inv.code),
-        partnerName,
-
-        itemName: String(l.itemName || ""),
-        itemSku: l.itemSku ?? null,
-
-        qty,
-        unitPrice,
-        unitCost,
-        costTotal,
-
-        lineAmount,
-
-        paid: paidLine,
-        debt,
-
-        saleUserName: saleName,
-        techUserName: techName,
-      });
-    }
-  }
-
-  const totals = rows.reduce(
-    (acc, r) => {
-      acc.totalRevenue = round2(acc.totalRevenue + r.lineAmount);
-      acc.totalCost = round2(acc.totalCost + r.costTotal);
-      acc.totalPaid = round2(acc.totalPaid + r.paid);
-      acc.totalDebt = round2(acc.totalDebt + r.debt);
-      return acc;
-    },
-    { totalRevenue: 0, totalCost: 0, totalPaid: 0, totalDebt: 0 }
-  );
-
-  return { rows, totals };
-}
-
 /**
- * ✅ NEW: khóa cập nhật thanh toán trực tiếp trên invoice
+ * khóa cập nhật thanh toán trực tiếp trên invoice
  */
-export async function updateInvoicePayment(params: {
+export async function updateInvoicePayment(_params: {
   invoiceId: string;
   paidAmount: number;
   receiveAccountId?: string | null;
