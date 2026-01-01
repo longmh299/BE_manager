@@ -1,18 +1,40 @@
 // src/services/movements.service.ts
 import { Prisma, PrismaClient, MovementType } from "@prisma/client";
 import { auditLog, type AuditCtx } from "./audit.service";
+import {
+  ensureDateNotLocked,
+  ensureMovementLineNotLocked,
+  ensureMovementNotLocked,
+} from "./periodLock.service";
 
 const prisma = new PrismaClient();
 
+function httpError(status: number, message: string) {
+  const err: any = new Error(message);
+  err.status = status;
+  err.statusCode = status;
+  return err;
+}
+
 /** Chuẩn hoá về Prisma.Decimal */
-function toDecimal(n: string | number | Prisma.Decimal | null | undefined): Prisma.Decimal {
+function toDecimal(
+  n: string | number | Prisma.Decimal | null | undefined
+): Prisma.Decimal {
   if (n instanceof Prisma.Decimal) return n;
   if (typeof n === "number") return new Prisma.Decimal(n);
   return new Prisma.Decimal((n ?? "0").toString().trim() || "0");
 }
 
 function assertPositive(d: Prisma.Decimal, msg: string) {
-  if (d.lte(0)) throw new Error(msg);
+  if (d.lte(0)) throw httpError(400, msg);
+}
+
+function parseDateInput(v: any): Date | null {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  const d = new Date(String(v));
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
 }
 
 /** Decimal -> number an toàn cho audit JSON */
@@ -43,7 +65,10 @@ export async function listMovements(q = "", page = 1, pageSize = 20) {
   const [rows, total] = await Promise.all([
     prisma.movement.findMany({
       where,
-      orderBy: { createdAt: "desc" },
+      orderBy: [
+        { occurredAt: "desc" }, // ✅ chuẩn theo ngày phát sinh
+        { createdAt: "desc" },
+      ],
       skip: (page - 1) * pageSize,
       take: pageSize,
       include: {
@@ -86,19 +111,26 @@ export async function getMovementById(
 /** ------------------------------------------------------------------
  * CREATE DRAFT
  * Nếu refNo trùng (P2002) sẽ tự thêm -01, -02...
+ * ✅ occurredAt (ngày phát sinh) để lock kỳ theo ngày chứng từ
  * ------------------------------------------------------------------ */
 export async function createDraft(
   type: MovementType,
-  payload: { refNo?: string; note?: string },
+  payload: { refNo?: string; note?: string; occurredAt?: string | Date },
   auditCtx?: AuditCtx
 ) {
   let baseRef = payload.refNo?.trim();
   if (!baseRef || baseRef.length < 3) baseRef = `MV-${Date.now()}`;
 
+  const occurredAt = parseDateInput(payload.occurredAt) ?? new Date();
+
+  // ✅ chặn tạo chứng từ backdate vào kỳ đã khóa
+  await ensureDateNotLocked(occurredAt, "tạo chứng từ");
+
   let attempt = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const refNo = attempt === 0 ? baseRef : `${baseRef}-${String(attempt).padStart(2, "0")}`;
+    const refNo =
+      attempt === 0 ? baseRef : `${baseRef}-${String(attempt).padStart(2, "0")}`;
 
     try {
       const created = await prisma.movement.create({
@@ -107,6 +139,8 @@ export async function createDraft(
           refNo,
           note: payload.note ?? null,
           posted: false,
+          occurredAt,
+          postedAt: null,
         },
       });
 
@@ -123,6 +157,7 @@ export async function createDraft(
           refNo: created.refNo,
           note: created.note,
           posted: created.posted,
+          occurredAt: (created as any).occurredAt?.toISOString?.() ?? null,
         },
         meta: auditCtx?.meta,
       });
@@ -145,6 +180,7 @@ export async function createDraft(
 
 /** ------------------------------------------------------------------
  * ADD LINE
+ * ✅ chặn nếu movement thuộc kỳ khóa hoặc đã posted
  * ------------------------------------------------------------------ */
 export async function addLine(
   movementId: string,
@@ -158,6 +194,16 @@ export async function addLine(
   },
   auditCtx?: AuditCtx
 ) {
+  // ✅ lock theo occurredAt
+  await ensureMovementNotLocked(movementId);
+
+  const mv = await prisma.movement.findUnique({
+    where: { id: movementId },
+    select: { posted: true },
+  });
+  if (!mv) throw httpError(404, "Movement not found");
+  if (mv.posted) throw httpError(409, "Chứng từ đã post, không được thêm dòng.");
+
   const created = await prisma.movementLine.create({
     data: {
       movementId,
@@ -197,6 +243,7 @@ export async function addLine(
 
 /** ------------------------------------------------------------------
  * UPDATE LINE
+ * ✅ chặn nếu line thuộc kỳ khóa hoặc movement đã posted
  * ------------------------------------------------------------------ */
 export async function updateLine(
   lineId: string,
@@ -210,7 +257,15 @@ export async function updateLine(
   },
   auditCtx?: AuditCtx
 ) {
-  const before = await prisma.movementLine.findUnique({ where: { id: lineId } });
+  await ensureMovementLineNotLocked(lineId);
+
+  const before = await prisma.movementLine.findUnique({
+    where: { id: lineId },
+    include: { movement: { select: { posted: true } } },
+  });
+  if (!before) throw httpError(404, "Movement line not found");
+  if ((before as any).movement?.posted)
+    throw httpError(409, "Chứng từ đã post, không được sửa dòng.");
 
   const data: Prisma.MovementLineUpdateInput = {};
 
@@ -225,7 +280,9 @@ export async function updateLine(
   }
 
   if (patch.toLocationId !== undefined) {
-    data.toLoc = patch.toLocationId ? { connect: { id: patch.toLocationId } } : { disconnect: true };
+    data.toLoc = patch.toLocationId
+      ? { connect: { id: patch.toLocationId } }
+      : { disconnect: true };
   }
 
   if (patch.qty !== undefined) data.qty = toDecimal(patch.qty);
@@ -234,7 +291,6 @@ export async function updateLine(
     data.unitCost = patch.unitCost == null ? null : toDecimal(patch.unitCost);
   }
 
-  // costTotal sẽ được tính lại khi postMovement
   const updated = await prisma.movementLine.update({ where: { id: lineId }, data });
 
   await auditLog(prisma, {
@@ -242,22 +298,21 @@ export async function updateLine(
     userRole: auditCtx?.userRole,
     action: "MOVEMENT_LINE_UPDATE",
     entity: "Movement",
-    entityId: before?.movementId,
-    before: before
-      ? {
-          line: {
-            id: before.id,
-            movementId: before.movementId,
-            itemId: before.itemId,
-            fromLocationId: before.fromLocationId,
-            toLocationId: before.toLocationId,
-            qty: decToNum(before.qty),
-            unitCost: before.unitCost == null ? null : decToNum(before.unitCost),
-            costTotal: (before as any).costTotal == null ? null : decToNum((before as any).costTotal),
-            note: before.note,
-          },
-        }
-      : null,
+    entityId: before.movementId,
+    before: {
+      line: {
+        id: before.id,
+        movementId: before.movementId,
+        itemId: before.itemId,
+        fromLocationId: before.fromLocationId,
+        toLocationId: before.toLocationId,
+        qty: decToNum(before.qty),
+        unitCost: before.unitCost == null ? null : decToNum(before.unitCost),
+        costTotal:
+          (before as any).costTotal == null ? null : decToNum((before as any).costTotal),
+        note: before.note,
+      },
+    },
     after: {
       line: {
         id: updated.id,
@@ -280,9 +335,19 @@ export async function updateLine(
 
 /** ------------------------------------------------------------------
  * DELETE LINE
+ * ✅ chặn nếu line thuộc kỳ khóa hoặc movement đã posted
  * ------------------------------------------------------------------ */
 export async function deleteLine(lineId: string, auditCtx?: AuditCtx) {
-  const before = await prisma.movementLine.findUnique({ where: { id: lineId } });
+  await ensureMovementLineNotLocked(lineId);
+
+  const before = await prisma.movementLine.findUnique({
+    where: { id: lineId },
+    include: { movement: { select: { posted: true } } },
+  });
+  if (!before) throw httpError(404, "Movement line not found");
+  if ((before as any).movement?.posted)
+    throw httpError(409, "Chứng từ đã post, không được xóa dòng.");
+
   const deleted = await prisma.movementLine.delete({ where: { id: lineId } });
 
   await auditLog(prisma, {
@@ -290,22 +355,21 @@ export async function deleteLine(lineId: string, auditCtx?: AuditCtx) {
     userRole: auditCtx?.userRole,
     action: "MOVEMENT_LINE_DELETE",
     entity: "Movement",
-    entityId: before?.movementId,
-    before: before
-      ? {
-          line: {
-            id: before.id,
-            movementId: before.movementId,
-            itemId: before.itemId,
-            fromLocationId: before.fromLocationId,
-            toLocationId: before.toLocationId,
-            qty: decToNum(before.qty),
-            unitCost: before.unitCost == null ? null : decToNum(before.unitCost),
-            costTotal: (before as any).costTotal == null ? null : decToNum((before as any).costTotal),
-            note: before.note,
-          },
-        }
-      : null,
+    entityId: before.movementId,
+    before: {
+      line: {
+        id: before.id,
+        movementId: before.movementId,
+        itemId: before.itemId,
+        fromLocationId: before.fromLocationId,
+        toLocationId: before.toLocationId,
+        qty: decToNum(before.qty),
+        unitCost: before.unitCost == null ? null : decToNum(before.unitCost),
+        costTotal:
+          (before as any).costTotal == null ? null : decToNum((before as any).costTotal),
+        note: before.note,
+      },
+    },
     after: { deletedLineId: deleted.id },
     meta: auditCtx?.meta,
   });
@@ -315,22 +379,18 @@ export async function deleteLine(lineId: string, auditCtx?: AuditCtx) {
 
 /** ------------------------------------------------------------------
  * POST MOVEMENT (APPLY STOCK + AVG COST)
- * - IN: yêu cầu toLocationId + unitCost
- * - OUT: yêu cầu fromLocationId, snapshot unitCost = stock.avgCost
- * - TRANSFER: OUT from + IN to, unitCost = avgCost kho from
- * - ADJUST:
- *    - toLocationId => tăng tồn (cần unitCost)
- *    - fromLocationId => giảm tồn (unitCost = avgCost)
  * ------------------------------------------------------------------ */
 export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
+  // ✅ lock theo occurredAt
+  await ensureMovementNotLocked(movementId);
+
   const result = await prisma.$transaction(async (tx) => {
     const mv = await tx.movement.findUnique({
       where: { id: movementId },
       include: { lines: true },
     });
-    if (!mv) throw new Error("Movement not found");
+    if (!mv) throw httpError(404, "Movement not found");
 
-    // nếu đã posted thì trả luôn dữ liệu đầy đủ
     if (mv.posted) {
       const full = await tx.movement.findUniqueOrThrow({
         where: { id: movementId },
@@ -339,7 +399,6 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
           invoice: true,
         },
       });
-
       return {
         alreadyPosted: true as const,
         movement: full,
@@ -347,7 +406,6 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
       };
     }
 
-    // helper upsert stock
     async function getOrCreateStock(itemId: string, locationId: string) {
       return tx.stock.upsert({
         where: { itemId_locationId: { itemId, locationId } },
@@ -361,7 +419,6 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
       });
     }
 
-    // ===== collect affected (itemId, locationId) =====
     type Pair = { itemId: string; locationId: string };
     const pairsMap = new Map<string, Pair>();
 
@@ -382,7 +439,6 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
 
     const pairs = Array.from(pairsMap.values());
 
-    // ===== snapshot BEFORE stocks (serialize for JSON) =====
     const beforeStocks = await Promise.all(
       pairs.map(async (p) => {
         const s = await tx.stock.findUnique({
@@ -407,7 +463,6 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
       })
     );
 
-    // ===== apply lines =====
     for (const line of mv.lines) {
       const qty = toDecimal(line.qty);
       assertPositive(qty, "Qty must be > 0");
@@ -415,19 +470,20 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
       // TRANSFER
       if (mv.type === "TRANSFER") {
         if (!line.fromLocationId || !line.toLocationId) {
-          throw new Error("TRANSFER requires fromLocationId and toLocationId");
+          throw httpError(400, "TRANSFER requires fromLocationId and toLocationId");
         }
         if (line.fromLocationId === line.toLocationId) {
-          throw new Error("TRANSFER from/to cannot be same");
+          throw httpError(400, "TRANSFER from/to cannot be same");
         }
 
         const fromStock = await getOrCreateStock(line.itemId, line.fromLocationId);
-        if (fromStock.qty.lt(qty)) throw new Error("Not enough stock to transfer");
+        if (fromStock.qty.lt(qty)) throw httpError(400, "Not enough stock to transfer");
 
         const unitCost = fromStock.avgCost;
         const costTotal = qty.mul(unitCost);
 
-        // OUT
+        // OUT (✅ KHÔNG reset avgCost khi qty -> 0, để giữ giá vốn gần nhất)
+        const newFromQty = fromStock.qty.sub(qty);
         await tx.stock.update({
           where: {
             itemId_locationId: {
@@ -435,7 +491,7 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
               locationId: line.fromLocationId,
             },
           },
-          data: { qty: fromStock.qty.sub(qty) },
+          data: { qty: newFromQty },
         });
 
         // IN
@@ -465,8 +521,8 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
 
       // IN
       if (mv.type === "IN") {
-        if (!line.toLocationId) throw new Error("IN requires toLocationId");
-        if (line.unitCost == null) throw new Error("IN requires unitCost");
+        if (!line.toLocationId) throw httpError(400, "IN requires toLocationId");
+        if (line.unitCost == null) throw httpError(400, "IN requires unitCost");
 
         const unitCost = toDecimal(line.unitCost);
         const costTotal = qty.mul(unitCost);
@@ -497,14 +553,17 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
 
       // OUT
       if (mv.type === "OUT") {
-        if (!line.fromLocationId) throw new Error("OUT requires fromLocationId");
+        if (!line.fromLocationId) throw httpError(400, "OUT requires fromLocationId");
 
         const stock = await getOrCreateStock(line.itemId, line.fromLocationId);
-        if (stock.qty.lt(qty)) throw new Error("Not enough stock");
+        if (stock.qty.lt(qty)) throw httpError(400, "Not enough stock");
 
         const unitCost = stock.avgCost;
         const costTotal = qty.mul(unitCost);
 
+        const newQty = stock.qty.sub(qty);
+
+        // ✅ KHÔNG reset avgCost khi qty -> 0
         await tx.stock.update({
           where: {
             itemId_locationId: {
@@ -512,7 +571,7 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
               locationId: line.fromLocationId,
             },
           },
-          data: { qty: stock.qty.sub(qty) },
+          data: { qty: newQty },
         });
 
         await tx.movementLine.update({
@@ -527,17 +586,28 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
       if (mv.type === "ADJUST") {
         const hasIn = !!line.toLocationId;
         const hasOut = !!line.fromLocationId;
+
         if (!hasIn && !hasOut) {
-          throw new Error("ADJUST requires fromLocationId or toLocationId");
+          throw httpError(400, "ADJUST requires fromLocationId or toLocationId");
+        }
+
+        if (hasIn && hasOut) {
+          throw httpError(
+            400,
+            "ADJUST chỉ cho phép 1 chiều (IN hoặc OUT). Nếu chuyển kho hãy dùng TRANSFER."
+          );
         }
 
         if (hasOut) {
           const stock = await getOrCreateStock(line.itemId, line.fromLocationId!);
-          if (stock.qty.lt(qty)) throw new Error("Not enough stock for ADJUST OUT");
+          if (stock.qty.lt(qty)) throw httpError(400, "Not enough stock for ADJUST OUT");
 
           const unitCost = stock.avgCost;
           const costTotal = qty.mul(unitCost);
 
+          const newQty = stock.qty.sub(qty);
+
+          // ✅ KHÔNG reset avgCost khi qty -> 0
           await tx.stock.update({
             where: {
               itemId_locationId: {
@@ -545,7 +615,7 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
                 locationId: line.fromLocationId!,
               },
             },
-            data: { qty: stock.qty.sub(qty) },
+            data: { qty: newQty },
           });
 
           await tx.movementLine.update({
@@ -555,7 +625,7 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
         }
 
         if (hasIn) {
-          if (line.unitCost == null) throw new Error("ADJUST IN requires unitCost");
+          if (line.unitCost == null) throw httpError(400, "ADJUST IN requires unitCost");
 
           const unitCost = toDecimal(line.unitCost);
           const costTotal = qty.mul(unitCost);
@@ -585,13 +655,12 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
         continue;
       }
 
-      throw new Error(`Unsupported movement type: ${mv.type}`);
+      throw httpError(400, `Unsupported movement type: ${mv.type}`);
     }
 
-    // mark posted
     await tx.movement.update({
       where: { id: movementId },
-      data: { posted: true },
+      data: { posted: true, postedAt: new Date() },
     });
 
     const movementAfter = await tx.movement.findUniqueOrThrow({
@@ -602,7 +671,6 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
       },
     });
 
-    // ===== snapshot AFTER stocks (serialize for JSON) =====
     const afterStocks = await Promise.all(
       pairs.map(async (p) => {
         const s = await tx.stock.findUnique({
@@ -643,7 +711,6 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
 
   if (result.alreadyPosted) return result.movement;
 
-  // Audit sau transaction (an toàn, tránh mọi issue ngoài ý muốn)
   await auditLog(prisma, {
     userId: auditCtx?.userId,
     userRole: auditCtx?.userRole,
@@ -658,6 +725,8 @@ export async function postMovement(movementId: string, auditCtx?: AuditCtx) {
         refNo: result.movement.refNo,
         type: result.movement.type,
         posted: result.movement.posted,
+        postedAt: (result.movement as any).postedAt?.toISOString?.() ?? null,
+        occurredAt: (result.movement as any).occurredAt?.toISOString?.() ?? null,
       },
     },
     meta: auditCtx?.meta,

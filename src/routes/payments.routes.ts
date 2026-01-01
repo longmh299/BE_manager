@@ -1,3 +1,4 @@
+
 // src/routes/payments.routes.ts
 import { Router } from "express";
 import { requireAuth } from "../middlewares/auth";
@@ -24,7 +25,6 @@ function buildAuditMeta(req: any) {
     userAgent: req.headers?.["user-agent"],
     path: req.originalUrl || req.url,
     method: req.method,
-    // thêm chút context để trace (nhẹ)
     params: req.params,
     query: req.query,
   };
@@ -56,7 +56,6 @@ function normalizeKind(k: any) {
 /**
  * NOTE:
  * - vẫn giữ normalizePaymentType để tương thích legacy
- * - nhưng phía dưới sẽ có "auto-fix" theo dấu của amountRaw để tránh nhập âm mà vẫn THU
  */
 function normalizePaymentType(t: any) {
   const v = String(t ?? "").toUpperCase();
@@ -71,6 +70,19 @@ function isValidDateString(s: any) {
 
 function nearlyEqual(a: number, b: number, eps = 0.0001) {
   return Math.abs(a - b) <= eps;
+}
+
+/**
+ * ✅ AUTO-FIX SIGN for allocations by type
+ * - RECEIPT: allocations must be >= 0  (thu)
+ * - PAYMENT: allocations must be <= 0  (chi)
+ *
+ * FE có thể gửi dương/âm lẫn lộn -> route sẽ chuẩn hoá để không bị chặn.
+ */
+function normalizeAllocSign(type: "RECEIPT" | "PAYMENT", amt: number) {
+  if (!Number.isFinite(amt) || amt === 0) return 0;
+  if (type === "PAYMENT") return amt > 0 ? -amt : amt; // đảm bảo âm
+  return amt < 0 ? Math.abs(amt) : amt; // đảm bảo dương
 }
 
 r.post("/", async (req, res) => {
@@ -100,15 +112,17 @@ r.post("/", async (req, res) => {
     }
 
     /**
-     * ✅ FIX: type phải khớp chiều tiền
-     * - Nếu user nhập amount âm => auto chuyển thành PAYMENT (phiếu CHI)
-     * - Nếu user nhập amount dương => giữ normalizePaymentType(body.type) (default RECEIPT)
+     * ✅ type:
+     * - amountRaw âm => PAYMENT
+     * - amountRaw dương => dùng body.type (default RECEIPT)
      *
-     * Lý do: route luôn dùng amount dương (cash amount), còn chiều thu/chi nằm ở type + allocations signed.
+     * Payment.amount lưu dương (cash), chiều thu/chi nằm ở type + allocations signed.
      */
-    const type = amountRaw < 0 ? "PAYMENT" : normalizePaymentType(body.type);
+    const type = (amountRaw < 0 ? "PAYMENT" : normalizePaymentType(body.type)) as
+      | "RECEIPT"
+      | "PAYMENT";
 
-    // ✅ Payment.amount luôn dương (tiền thực thu/chi)
+    // ✅ Payment.amount luôn dương
     const amount = Math.abs(amountRaw);
 
     const allocations = Array.isArray(body.allocations)
@@ -116,11 +130,14 @@ r.post("/", async (req, res) => {
           .map((a: any) => {
             const invoiceId = a?.invoiceId ? String(a.invoiceId) : "";
             const kind = normalizeKind(a?.kind);
-            const amt = Number(a?.amount ?? 0);
+            const amtRaw = Number(a?.amount ?? 0);
+
+            // ✅ auto-fix sign theo type
+            const amt = normalizeAllocSign(type, amtRaw);
 
             return {
               invoiceId,
-              amount: amt, // ✅ signed (RECEIPT +, PAYMENT -)
+              amount: amt, // signed
               kind,
             };
           })
@@ -128,17 +145,14 @@ r.post("/", async (req, res) => {
             if (!a.invoiceId) return false;
             if (!Number.isFinite(a.amount)) return false;
             if (a.amount === 0) return false;
-
-            // ✅ IMPORTANT:
-            // HOLD/WARRANTY_HOLD cho phép signed. (RECEIPT dương, PAYMENT âm) -> service sẽ validate theo type.
             return true;
           })
       : undefined;
 
-    // ========= quick validations ở route (nhẹ, không ép kind) =========
-    // Mục tiêu: bắt lỗi obvious (sign sai), còn lại để service validate/cap.
+    // ========= quick validations (nhẹ) =========
     if (allocations && allocations.length > 0) {
-      // RECEIPT: mọi allocation phải >= 0
+      // Sau normalizeAllocSign thì 2 check này gần như luôn pass,
+      // nhưng giữ lại để bắt case input NaN/0 kỳ quặc.
       if (type === "RECEIPT" && allocations.some((x: any) => x.amount < 0)) {
         return res.status(400).json({
           message:
@@ -146,7 +160,6 @@ r.post("/", async (req, res) => {
         });
       }
 
-      // PAYMENT: mọi allocation phải <= 0
       if (type === "PAYMENT" && allocations.some((x: any) => x.amount > 0)) {
         return res.status(400).json({
           message:
@@ -155,8 +168,6 @@ r.post("/", async (req, res) => {
       }
 
       // ✅ check tổng tiền theo “cash amount”
-      // - RECEIPT: sum(signed allocations) == amount
-      // - PAYMENT: sum(abs(allocation.amount)) == amount
       if (type === "RECEIPT") {
         const expected = allocations.reduce(
           (s: number, x: any) => s + (Number(x.amount) || 0),
@@ -185,7 +196,7 @@ r.post("/", async (req, res) => {
         date: body.date,
         partnerId: body.partnerId,
         type,
-        amount, // ✅ dương
+        amount, // dương
         accountId: body.accountId || undefined,
         method: body.method,
         refNo: body.refNo,
@@ -193,7 +204,6 @@ r.post("/", async (req, res) => {
         allocations,
         createdById: userId,
       },
-      // ✅ audit context
       auditCtx ?? { userId, userRole, meta: buildAuditMeta(req) }
     );
 

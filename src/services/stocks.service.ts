@@ -42,7 +42,9 @@ export async function getStocks(params: GetStocksParams) {
 
   if (kind) {
     const k =
-      typeof kind === "string" ? (kind.toUpperCase() as ItemKind) : (kind as ItemKind);
+      typeof kind === "string"
+        ? (kind.toUpperCase() as ItemKind)
+        : (kind as ItemKind);
     where.item = {
       ...(where.item || {}),
       kind: k,
@@ -80,10 +82,8 @@ export async function getStocks(params: GetStocksParams) {
 /**
  * -------- TỔNG HỢP TỒN THEO ITEM (/stocks/summary-by-item) --------
  *
- * ✅ FIX LỖ HỔNG:
- * - Nếu totalQty = 0 thì KHÔNG trả avgCost=0 nữa.
- * - Thay vào đó lấy "avgCost gần nhất" từ stock (updatedAt mới nhất).
- * - Vì avgCost là master-cost theo tồn/movement, hết hàng vẫn nên giữ giá vốn gần nhất để dashboard không bị 0.
+ * - totalQty > 0: avgCost = sum(qty*avgCost)/sum(qty)
+ * - totalQty = 0: lấy "avgCost gần nhất", ưu tiên avgCost != 0 để tránh pick nhầm kho mới (avgCost=0)
  */
 export type GetStockSummaryParams = {
   q?: string;
@@ -107,7 +107,9 @@ export async function getStockSummaryByItem(params: GetStockSummaryParams = {}) 
 
   if (kind) {
     const k =
-      typeof kind === "string" ? (kind.toUpperCase() as ItemKind) : (kind as ItemKind);
+      typeof kind === "string"
+        ? (kind.toUpperCase() as ItemKind)
+        : (kind as ItemKind);
     whereItem.kind = k;
   }
 
@@ -122,7 +124,6 @@ export async function getStockSummaryByItem(params: GetStockSummaryParams = {}) 
       take,
       include: {
         unit: true,
-        // ✅ lấy cả qty + avgCost + updatedAt để tính giá vốn TB + giá trị tồn + fallback giá vốn khi qty=0
         stocks: { select: { qty: true, avgCost: true, updatedAt: true } },
       },
     }),
@@ -134,24 +135,31 @@ export async function getStockSummaryByItem(params: GetStockSummaryParams = {}) 
 
     const totalQty = stocks.reduce((sum, s) => sum + toNum(s.qty as any), 0);
 
-    // ✅ bình quân gia quyền theo tồn: sum(qty*avgCost)/sum(qty)
+    // giá trị tồn theo từng kho: sum(qty * avgCost)
     const totalValue = stocks.reduce((sum, s) => {
       const qty = toNum(s.qty as any);
       const avg = toNum(s.avgCost as any);
       return sum + qty * avg;
     }, 0);
 
-    // ✅ FIX: nếu hết hàng (totalQty=0) thì lấy avgCost gần nhất theo updatedAt
     let avgCost = 0;
+
     if (totalQty > 0) {
       avgCost = totalValue / totalQty;
     } else {
-      if (stocks.length > 0) {
-        const latest = [...stocks].sort((a, b) => {
-          const ta = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
-          const tb = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
-          return tb - ta;
-        })[0];
+      // totalQty = 0: ưu tiên stock row có avgCost != 0
+      const candidates =
+        stocks.filter((s) => toNum((s as any).avgCost) > 0).length > 0
+          ? stocks.filter((s) => toNum((s as any).avgCost) > 0)
+          : stocks;
+
+      if (candidates.length > 0) {
+        const latest = candidates.reduce((best, cur) => {
+          const tb = best?.updatedAt ? new Date(best.updatedAt).getTime() : 0;
+          const tc = cur?.updatedAt ? new Date(cur.updatedAt).getTime() : 0;
+          return tc > tb ? cur : best;
+        }, candidates[0]);
+
         avgCost = toNum((latest as any).avgCost);
       } else {
         avgCost = 0;
@@ -168,9 +176,8 @@ export async function getStockSummaryByItem(params: GetStockSummaryParams = {}) 
       sellPrice: item.sellPrice,
       totalQty,
 
-      // ✅ NEW cho FE admin
       avgCost, // giá vốn TB (hoặc giá vốn gần nhất nếu qty=0)
-      stockValue: totalValue, // giá trị tồn (qty=0 => 0 là đúng)
+      stockValue: totalValue, // giá trị tồn
     };
   });
 

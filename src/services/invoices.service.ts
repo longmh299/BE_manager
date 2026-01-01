@@ -9,6 +9,7 @@ import {
 } from "@prisma/client";
 import { auditLog, type AuditCtx } from "./audit.service";
 import { ensureWarrantyHoldOnApprove } from "./warrantyHold.service";
+import { ensureDateNotLocked } from "./periodLock.service"; // ✅ NEW: period lock
 
 const prisma = new PrismaClient();
 
@@ -32,10 +33,34 @@ function handleUniqueInvoiceError(e: unknown) {
     const target = (e.meta as any)?.target;
     const targetStr = Array.isArray(target) ? target.join(",") : String(target || "");
     if (targetStr.includes("code")) {
-      throw httpError(400, "Mã hoá đơn đã tồn tại");
+      throw httpError(400, "Mã hoá đơn đã tồn tại (trùng trong cùng năm + loại hoá đơn).");
     }
   }
   throw e;
+}
+
+const INVOICE_CODE_PAD = 4; // đổi 4 -> 0 nếu muốn lưu "1" thay vì "0001"
+
+function isDigitsOnly(s: string) {
+  return /^[0-9]+$/.test(s);
+}
+
+async function allocateInvoiceCode(
+  tx: Prisma.TransactionClient,
+  year: number,
+  type: InvoiceType
+): Promise<string> {
+  // InvoiceCounter: @@id([year, type])
+  const row = await tx.invoiceCounter.upsert({
+    where: { year_type: { year, type } },
+    create: { year, type, nextNo: 2 }, // phát số 1, và set nextNo=2
+    update: { nextNo: { increment: 1 } }, // tăng nextNo lên 1
+    select: { nextNo: true },
+  });
+
+  const usedNo = row.nextNo - 1; // vì row.nextNo là số "tiếp theo"
+  if (INVOICE_CODE_PAD > 0) return String(usedNo).padStart(INVOICE_CODE_PAD, "0");
+  return String(usedNo);
 }
 
 async function ensureWarehouse(warehouseId?: string) {
@@ -67,13 +92,38 @@ function roundPct(n: number) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
 }
 
-/** parse optional number from body (accept string/number, ignore empty) */
+/**
+ * ✅ parse optional number from body (accept number/string, accept VN money "270.000.000")
+ * - ignore empty string
+ */
 function parseOptionalNumber(x: any): number | undefined {
   if (x === undefined || x === null) return undefined;
-  if (typeof x === "string" && x.trim() === "") return undefined;
-  const n = Number(x);
-  if (!Number.isFinite(n)) return undefined;
-  return n;
+  if (typeof x === "number") return Number.isFinite(x) ? x : undefined;
+
+  const s0 = String(x).trim();
+  if (!s0) return undefined;
+
+  const s = s0.replace(/\s+/g, "");
+
+  // 1) plain decimal dot
+  if (/^-?\d+(\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  // 2) decimal comma
+  if (/^-?\d+(,\d+)?$/.test(s)) {
+    const n = Number(s.replace(",", "."));
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  // 3) money formatted: "270.000.000", "270,000,000", "270.000.000đ"
+  const neg = s.includes("-") ? "-" : "";
+  const digits = s.replace(/[^\d]/g, "");
+  if (!digits) return undefined;
+
+  const n = Number(neg + digits);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 /**
@@ -207,10 +257,8 @@ function normalizePayment(subtotal: number, tax: number, body: any) {
 
   const status = (body?.paymentStatus as PaymentStatus | undefined) ?? undefined;
 
-  const rawPaid =
-    body?.paidAmount !== undefined && body?.paidAmount !== null && body?.paidAmount !== ""
-      ? Number(body.paidAmount) || 0
-      : undefined;
+  // ✅ FIX: parse được "270.000.000"
+  const rawPaid = parseOptionalNumber(body?.paidAmount);
 
   let paidAmount = 0;
   let paymentStatus: PaymentStatus = "UNPAID";
@@ -387,18 +435,14 @@ function computeCollectibleForSalesWithNet(inv: {
  * ✅ Sync invoice.paidAmount/paymentStatus từ allocations (NORMAL)
  *
  * QUY ƯỚC:
- * - invoice.paidAmount = tổng NORMAL net đã thu (>=0) cho invoice đó (refund làm giảm)
- * - với SALES: collectible dựa trên netTotal/netSubtotal sau trả (nếu có)
- * - HOLD không cộng vào paidAmount
- *
- * ✅ FIX LONG-TERM:
- * - Nếu SALES đã trả hàng FULL (netTotal <= 0) => coi như đã tất toán:
- *   paymentStatus = PAID, paidAmount = 0 (tránh bị hiện UNPAID sau refund full)
+ * - allocations là signed:
+ *   - SALES (thu): +amount
+ *   - PURCHASE (chi): -amount
+ * - invoice.paidAmount luôn là số dương biểu thị "đã thu/đã chi" (>=0)
  *
  * ✅ IMPORTANT (Option A):
  * - SALES_RETURN/PURCHASE_RETURN không được dùng allocations để thể hiện refund.
- *   Refund phải apply vào SALES gốc qua /payments.
- *   => Vì vậy, return invoice sẽ luôn "UNPAID/0" (hoặc bạn có thể set PAID), nhưng không ảnh hưởng công nợ.
+ *   Refund phải apply vào invoice gốc qua /payments.
  */
 async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invoiceId: string) {
   const inv = await tx.invoice.findUnique({
@@ -440,8 +484,14 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
     _sum: { amount: true },
   });
 
-  const sumNormalSigned = toNum(agg._sum.amount); // signed sum (refund làm giảm)
-  const paidNormalNet = Math.max(0, sumNormalSigned); // ✅ không dùng abs()
+  const sumNormalSigned = toNum(agg._sum.amount); // signed sum
+
+  // ✅ FIX BUG PURCHASE:
+  // - SALES: allocation dương = đã thu
+  // - PURCHASE: allocation âm = đã chi
+  // => paidAmount trên invoice phải là số dương biểu thị "đã thu/đã chi"
+  const paidNormalNet =
+    inv.type === "PURCHASE" ? Math.max(0, -sumNormalSigned) : Math.max(0, sumNormalSigned);
 
   const total = toNum(inv.total);
   const tax = toNum(inv.tax);
@@ -463,7 +513,7 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
     return;
   }
 
-  // ✅ SALES dùng NET để tính collectible
+  // ✅ SALES dùng NET để tính collectible (vì có trả hàng + warranty hold)
   let collectible = total;
   let holdPct = toNum(inv.warrantyHoldPct);
   let holdAmount = toNum(inv.warrantyHoldAmount);
@@ -483,6 +533,7 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
     holdPct = calc.pct;
     holdAmount = calc.holdAmount;
   } else {
+    // PURCHASE: collectible = total
     collectible = total;
   }
 
@@ -560,11 +611,10 @@ async function createInitialPaymentIfNeeded(
   }
 
   if (!params.partnerId) {
-    throw httpError(400, "Hóa đơn có 'Đã thu' nhưng chưa chọn khách hàng (partner).");
+    throw httpError(400, "Hóa đơn có 'Đã thu/chi' nhưng chưa chọn khách hàng (partner).");
   }
 
-  const paymentType =
-    inv.type === "PURCHASE" /* || inv.type === "SALES_RETURN" */ ? "PAYMENT" : "RECEIPT";
+  const paymentType = inv.type === "PURCHASE" ? "PAYMENT" : "RECEIPT";
 
   const total = toNum(inv.total);
   const tax = toNum(inv.tax);
@@ -588,6 +638,8 @@ async function createInitialPaymentIfNeeded(
   }
 
   const paidClamped = Math.min(paid, collectible);
+
+  // ✅ QUY ƯỚC: PURCHASE là CHI TIỀN => allocation âm
   const allocAmount = paymentType === "PAYMENT" ? -paidClamped : paidClamped;
 
   await tx.payment.create({
@@ -610,6 +662,109 @@ async function createInitialPaymentIfNeeded(
   });
 
   return paidClamped;
+}
+
+/**
+ * ✅ FIX BUG #1 (approve bị rớt về UNPAID):
+ * Nếu invoice (SALES/PURCHASE) đang có paidAmount/paymentStatus legacy
+ * nhưng chưa có allocations NORMAL => auto tạo Payment+Allocation trước khi sync.
+ */
+async function ensureLegacyPaymentAllocationOnApprove(
+  tx: Prisma.TransactionClient,
+  invoiceId: string,
+  actorId: string
+) {
+  const inv = await tx.invoice.findUnique({
+    where: { id: invoiceId },
+    select: {
+      id: true,
+      type: true,
+      code: true,
+      issueDate: true,
+      partnerId: true,
+      receiveAccountId: true,
+      subtotal: true,
+      tax: true,
+      total: true,
+      netSubtotal: true,
+      netTotal: true,
+      hasWarrantyHold: true,
+      warrantyHoldPct: true,
+      warrantyHoldAmount: true,
+      paymentStatus: true,
+      paidAmount: true,
+    },
+  });
+  if (!inv) throw httpError(404, "Invoice not found");
+
+  if (inv.type !== "SALES" && inv.type !== "PURCHASE") return;
+
+  const paidField = roundMoney(toNum(inv.paidAmount));
+  const st = inv.paymentStatus as PaymentStatus;
+
+  if (paidField <= 0 || st === "UNPAID") return;
+
+  const agg = await tx.paymentAllocation.aggregate({
+    where: { invoiceId: inv.id, kind: "NORMAL" },
+    _sum: { amount: true },
+  });
+  const sumSigned = toNum(agg._sum.amount);
+  if (Math.abs(sumSigned) > 0.0001) return; // already has allocations
+
+  if (!inv.partnerId) {
+    throw httpError(
+      400,
+      "Hóa đơn đang có 'Đã thu/chi' nhưng chưa chọn đối tác (partner). Vui lòng chọn đối tác trước khi duyệt."
+    );
+  }
+
+  const total = roundMoney(toNum(inv.total));
+  const tax = roundMoney(toNum(inv.tax));
+  const subtotal =
+    roundMoney(toNum(inv.subtotal)) > 0
+      ? roundMoney(toNum(inv.subtotal))
+      : Math.max(0, roundMoney(total - tax));
+
+  let collectible = total;
+
+  if (inv.type === "SALES") {
+    const calc = computeCollectibleForSalesWithNet({
+      subtotal,
+      tax,
+      total,
+      netSubtotal: Number.isFinite(toNum(inv.netSubtotal)) ? toNum(inv.netSubtotal) : undefined,
+      netTotal: Number.isFinite(toNum(inv.netTotal)) ? toNum(inv.netTotal) : undefined,
+      hasWarrantyHold: inv.hasWarrantyHold === true,
+      warrantyHoldPct: toNum(inv.warrantyHoldPct),
+      warrantyHoldAmount: toNum(inv.warrantyHoldAmount),
+    });
+    collectible = calc.collectible;
+  }
+
+  const paidClamped = Math.min(paidField, collectible);
+  if (paidClamped <= 0) return;
+
+  const paymentType = inv.type === "PURCHASE" ? "PAYMENT" : "RECEIPT";
+  const allocAmount = paymentType === "PAYMENT" ? -paidClamped : paidClamped;
+
+  await tx.payment.create({
+    data: {
+      date: inv.issueDate ?? new Date(),
+      partnerId: inv.partnerId,
+      type: paymentType as any,
+      amount: new Prisma.Decimal(paidClamped),
+      accountId: inv.receiveAccountId ?? null,
+      note: `Auto migrate payment on approve for invoice ${inv.code}`,
+      createdById: actorId,
+      allocations: {
+        create: {
+          invoiceId: inv.id,
+          amount: new Prisma.Decimal(allocAmount),
+          kind: "NORMAL",
+        },
+      },
+    },
+  });
 }
 
 /**
@@ -1122,9 +1277,8 @@ export async function updateInvoiceNote(id: string, note: string, auditCtx?: Aud
  */
 export async function createInvoice(body: any, auditCtx?: AuditCtx) {
   const issueDate = body.issueDate ? new Date(body.issueDate) : new Date();
-
-  const safeCode =
-    body.code && String(body.code).trim().length > 0 ? String(body.code).trim() : `INV-${Date.now()}`;
+  const inputCode =
+    body.code && String(body.code).trim().length > 0 ? String(body.code).trim() : undefined;
 
   const rawLines: any[] = Array.isArray(body.lines) ? body.lines : [];
 
@@ -1210,9 +1364,22 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
               })()
             : null;
 
+        const codeYear = issueDate.getFullYear();
+        let invoiceCode: string;
+
+        if (inputCode) {
+          if (!isDigitsOnly(inputCode)) {
+            throw httpError(400, "Mã hoá đơn chỉ được chứa số (0-9).");
+          }
+          invoiceCode = inputCode;
+        } else {
+          invoiceCode = await allocateInvoiceCode(tx, codeYear, type);
+        }
+
         const inv = await tx.invoice.create({
           data: {
-            code: safeCode,
+            code: invoiceCode,
+            codeYear,
             type,
             issueDate,
 
@@ -1316,7 +1483,7 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
           before: null,
           after,
           meta: mergeMeta(auditCtx?.meta, {
-            safeCode,
+            invoiceCode,
             originInvoiceId: origin?.id ?? null,
             lineCount: validLines.length,
             isReturnType,
@@ -1542,9 +1709,7 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
           const total = toNum(fresh.total);
           const tax = toNum(fresh.tax);
           const subtotal =
-            toNum(fresh.subtotal) > 0
-              ? toNum(fresh.subtotal)
-              : Math.max(0, roundMoney(total - tax));
+            toNum(fresh.subtotal) > 0 ? toNum(fresh.subtotal) : Math.max(0, roundMoney(total - tax));
 
           const calc = computeWarrantyHoldAndCollectible({
             subtotal,
@@ -1626,7 +1791,20 @@ export async function deleteInvoice(id: string, auditCtx?: AuditCtx) {
     throw httpError(409, "Không thể xoá hoá đơn đã post tồn (đã có movement liên kết).");
   }
 
+  // ✅ nếu có phiếu trả hàng/tham chiếu (refInvoiceId), cần xoá các phiếu đó trước
+  const refCount = await prisma.invoice.count({ where: { refInvoiceId: id } });
+  if (refCount > 0) {
+    throw httpError(
+      409,
+      "Không thể xoá hoá đơn đang được tham chiếu bởi phiếu trả hàng (refInvoice). Hãy xoá/huỷ phiếu trả hàng trước."
+    );
+  }
+
   await prisma.warrantyHold.deleteMany({ where: { invoiceId: id } });
+  // ✅ remove payment allocations that reference this invoice (draft/submitted) so FK doesn't block delete
+  await prisma.paymentAllocation.deleteMany({
+    where: { OR: [{ invoiceId: id }, { returnInvoiceId: id }] },
+  });
   await prisma.invoiceLine.deleteMany({ where: { invoiceId: id } });
   const deleted = await prisma.invoice.delete({ where: { id } });
 
@@ -1738,9 +1916,13 @@ export async function submitInvoice(
 
       const inv = await tx.invoice.findUnique({
         where: { id: params.invoiceId },
-        select: { id: true, status: true },
+        select: { id: true, status: true, issueDate: true }, // ✅ add issueDate
       });
       if (!inv) throw httpError(404, "Invoice not found");
+
+      // ✅ NEW: block submit into locked period (không ảnh hưởng logic cũ)
+      await ensureDateNotLocked(inv.issueDate ?? new Date(), "gửi duyệt hóa đơn");
+
       if (inv.status === "APPROVED") throw httpError(409, "Hóa đơn đã duyệt rồi.");
       if (inv.status === "REJECTED") throw httpError(409, "Hóa đơn đã bị từ chối.");
       if (inv.status === "SUBMITTED") throw httpError(409, "Hóa đơn đã gửi duyệt rồi.");
@@ -1787,6 +1969,9 @@ export async function approveInvoice(
         include: { lines: true, warrantyHold: true },
       });
       if (!invoice) throw httpError(404, "Invoice not found");
+
+      // ✅ NEW: block approve (post stock/cost) if issueDate in locked period
+      await ensureDateNotLocked((invoice as any).issueDate ?? new Date(), "duyệt hóa đơn");
 
       if (invoice.status === "APPROVED") throw httpError(409, "Hóa đơn đã duyệt rồi.");
       if (invoice.status === "REJECTED") throw httpError(409, "Hóa đơn đã bị từ chối.");
@@ -1862,7 +2047,7 @@ export async function approveInvoice(
         const subtotal =
           toNum((invoice as any).subtotal) > 0
             ? toNum((invoice as any).subtotal)
-            : Math.max(0, total - tax);
+            : Math.max(0, roundMoney(total - tax));
 
         await tx.invoice.update({
           where: { id: invoice.id },
@@ -2061,10 +2246,16 @@ export async function approveInvoice(
 
       const mvType: MovementType = isInType(invoice.type as InvoiceType) ? "IN" : "OUT";
 
+      // ✅ NEW: đồng bộ timestamp approve/post
+      const now = new Date();
+
       await tx.movement.create({
         data: {
           type: mvType,
           posted: true,
+          postedAt: now, // ✅ NEW
+          occurredAt: invoice.issueDate, // ✅ NEW: khóa kỳ theo ngày phát sinh
+
           invoiceId: invoice.id,
           lines: {
             createMany: {
@@ -2104,7 +2295,7 @@ export async function approveInvoice(
         data: {
           status: "APPROVED",
           approvedById: params.approvedById,
-          approvedAt: new Date(),
+          approvedAt: now, // ✅ same timestamp
         },
       });
 
@@ -2113,6 +2304,13 @@ export async function approveInvoice(
         userRole: auditCtx?.userRole,
         meta: auditCtx?.meta,
       });
+
+      // ✅ FIX BUG #1: nếu invoice có paid legacy nhưng chưa có allocations => tạo allocations trước khi sync
+      await ensureLegacyPaymentAllocationOnApprove(
+        tx,
+        invoice.id,
+        auditCtx?.userId ?? params.approvedById
+      );
 
       // ✅ Sync allocations:
       // - for SALES/PURCHASE only
@@ -2245,9 +2443,17 @@ export async function hardDeleteInvoice(id: string) {
   const mvCount = await prisma.movement.count({ where: { invoiceId: id } });
   if (mvCount > 0) throw httpError(409, "Invoice đã có movement, không hard delete.");
 
+  const refCount = await prisma.invoice.count({ where: { refInvoiceId: id } });
+  if (refCount > 0)
+    throw httpError(409, "Invoice đang được tham chiếu bởi phiếu trả hàng (refInvoice). Không hard delete.");
+
   await prisma.$transaction(async (tx) => {
     await tx.movement.deleteMany({ where: { invoiceId: id } });
     await tx.warrantyHold.deleteMany({ where: { invoiceId: id } });
+    // ✅ remove payment allocations that reference this invoice so FK doesn't block delete
+    await tx.paymentAllocation.deleteMany({
+      where: { OR: [{ invoiceId: id }, { returnInvoiceId: id }] },
+    });
     await tx.invoiceLine.deleteMany({ where: { invoiceId: id } });
     await tx.invoice.delete({ where: { id } });
   });

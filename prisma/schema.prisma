@@ -1,3 +1,4 @@
+// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -154,13 +155,16 @@ model Movement {
   refNo     String?        @unique
   note      String?
   posted    Boolean        @default(false)
+  postedAt  DateTime?    // ✅ thêm dòng này
+  occurredAt DateTime     @default(now()) // ✅ ngày phát sinh (có thể sửa)
   createdAt DateTime       @default(now())
   updatedAt DateTime       @updatedAt
   invoiceId String?
   invoice   Invoice?       @relation(fields: [invoiceId], references: [id])
   lines     MovementLine[]
-
+  @@index([posted, postedAt]) // ✅ nên thêm index này
   @@index([type, createdAt])
+  @@index([type, occurredAt])
   @@index([invoiceId])
 }
 
@@ -227,7 +231,13 @@ model Partner {
 
 model Invoice {
   id                 String               @id @default(cuid())
-  code               String               @unique
+
+  // ✅ code không unique toàn bảng nữa (để reset theo năm)
+  code               String
+
+  // ✅ năm dương lịch để unique + reset (vd 2026)
+  codeYear           Int                  @default(0)
+
   type               InvoiceType
   issueDate          DateTime
   partnerId          String?
@@ -292,6 +302,21 @@ model Invoice {
   @@index([type, status, issueDate])
   @@index([cancelledById])
   @@index([cancelledAt])
+
+  // ✅ unique theo năm + loại chứng từ + code
+  @@unique([codeYear, type, code])
+  @@index([codeYear, type, code])
+}
+
+model InvoiceCounter {
+  // ✅ counter theo năm + loại hoá đơn (SALES/PURCHASE/RETURN...)
+  year      Int
+  type      InvoiceType
+  nextNo    Int      @default(1)
+  updatedAt DateTime @updatedAt
+
+  @@id([year, type])
+  @@index([year])
 }
 
 model WarrantyHold {

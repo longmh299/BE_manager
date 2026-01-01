@@ -15,6 +15,7 @@ import invoiceRoutes from './routes/invoices.routes';
 import stockImportRoutes from './routes/stocks_import.routes';
 import partnersRoutes from './routes/partners.routes';
 import { reportsRouter } from './routes/reports.routes';
+import stockInOutReportRoutes from './routes/stockInOutReport.routes'; // ✅ ADD
 import usersRoutes from './routes/users.routes';
 import machinesRoutes from './routes/machines.routes';
 import locksRoutes from './routes/locks.routes';
@@ -85,7 +86,11 @@ api.use('/assets', assetRoutes);
 api.use('/invoices', invoiceRoutes);
 api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
+
+// ✅ Reports: mount chung prefix /reports
 api.use('/reports', reportsRouter);
+api.use('/reports', stockInOutReportRoutes); // ✅ ADD (endpoint /api/reports/stock-inout)
+
 api.use('/locks', locksRoutes);
 api.use("/payment-accounts", paymentAccountsRoutes);
 

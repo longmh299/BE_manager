@@ -1,13 +1,53 @@
-// src/services/revenue.service.ts
 import { PrismaClient, Prisma, InvoiceStatus, InvoiceType } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
 /** ---------------- helpers ---------------- **/
-function toDate(s?: string) {
+
+function parseDateLoose(s?: string) {
   if (!s) return null;
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
+  const str = String(s).trim();
+
+  // yyyy-mm-dd  -> parse LOCAL (tránh lệch TZ)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    const [y, m, d] = str.split("-").map((x) => Number(x));
+    const dt = new Date(y, (m || 1) - 1, d || 1, 0, 0, 0, 0);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // mm/dd/yyyy hoặc m/d/yyyy -> parse LOCAL
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
+    const [mm, dd, yyyy] = str.split("/").map((x) => Number(x));
+    const dt = new Date(yyyy, (mm || 1) - 1, dd || 1, 0, 0, 0, 0);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  const d = new Date(str);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function toDateStart(s?: string) {
+  const str = String(s || "").trim();
+  const d = parseDateLoose(str);
+  if (!d) return null;
+
+  // nếu là date-only thì set startOfDay
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str) || /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+  }
+  return d;
+}
+
+function toDateEnd(s?: string) {
+  const str = String(s || "").trim();
+  const d = parseDateLoose(str);
+  if (!d) return null;
+
+  // nếu là date-only thì set endOfDay
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str) || /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+  }
+  return d;
 }
 
 function n(x: any): number {
@@ -23,11 +63,9 @@ function revenueSign(t: InvoiceType) {
   return 0;
 }
 
-// ✅ Prisma-safe conditional SQL
 const sqlEmpty = Prisma.sql``;
 const sqlIf = (cond: any, frag: Prisma.Sql) => (cond ? frag : sqlEmpty);
 
-// ✅ Cast enum param để Postgres không lỗi enum = text
 const INV_STATUS_APPROVED = Prisma.sql`${InvoiceStatus.APPROVED}::"InvoiceStatus"`;
 const INV_TYPE_SALES = Prisma.sql`${InvoiceType.SALES}::"InvoiceType"`;
 const INV_TYPE_SALES_RETURN = Prisma.sql`${InvoiceType.SALES_RETURN}::"InvoiceType"`;
@@ -40,39 +78,46 @@ export type RevenueQuery = {
   staffRole?: "SALE" | "TECH";
   staffUserId?: string;
   receiveAccountId?: string;
+
+  includeStaffInvoices?: boolean;
 };
 
 type StaffRow = {
-  userId: string; // có thể là id thật hoặc "__NAME__:..."
+  userId: string;
   name: string;
   role: "SALE" | "TECH";
 
-  /**
-   * ✅ Doanh thu cá nhân theo dòng tiền, quy về NET (chưa VAT)
-   * - NORMAL: quy đổi gross -> net theo tỷ lệ subtotalNet/total
-   * - WARRANTY_HOLD: không cộng vào personalRevenue ngay, chỉ bonus khi NORMAL thu đủ "need"
-   * => khi thu đủ need, nhân viên hưởng 100% giá trị hóa đơn (NET, không VAT)
-   */
-  personalRevenue: number;
-
-  /** ✅ NET thu từ NORMAL (để hiển thị cùng hệ quy chiếu với doanh thu) */
-  collectedNormal: number;
-
-  /** ✅ BONUS NET (phần BH treo quy đổi net) */
-  bonusWarranty: number;
-
-  /** ✅ GROSS tiền thực thu (NORMAL + WARRANTY_HOLD, có thể gồm VAT) */
-  collectedGross?: number;
+  personalRevenue: number; // NET
+  collectedNormal: number; // NET (NORMAL)
+  bonusWarranty: number; // NET
+  collectedGross?: number; // GROSS
 };
 
-/**
- * ✅ Fix quan trọng:
- * Một số dữ liệu bị lưu sai subtotal (bằng gross), dẫn tới net = gross.
- * Quy ước tính subtotalNet:
- * - Nếu có VAT và |(subtotal + tax) - total| lệch đáng kể -> subtotalNet = total - tax
- * - Else ưu tiên subtotal nếu > 0
- * - Nếu subtotal = 0 -> fallback SUM(InvoiceLine.amount)
- */
+export type StaffInvoiceRow = {
+  invoiceId: string;
+  code: string;
+  issueDate: string;
+  partnerName: string;
+
+  net: number;
+  vat: number;
+  gross: number;
+
+  need: number;
+
+  paidNormal: number; // GROSS NORMAL
+  paidNormalGross: number; // alias
+
+  dsDate: string;
+  dsNet: number;
+};
+
+/** =========================================================
+ * getStaffPersonalRevenue
+ * ✅ FIX: tính doanh số theo ds_date (ngày đủ need) giống popup
+ *    personalRevenue = SUM(ds_net) trong range ds_date
+ *    collectedNormal = personalRevenue (ẩn breakdown bonus/hold)
+ * ========================================================= */
 async function getStaffPersonalRevenue(params: {
   from?: Date;
   to?: Date;
@@ -83,238 +128,32 @@ async function getStaffPersonalRevenue(params: {
 }) {
   const { from, to, staffRole, staffUserId, receiveAccountId } = params;
 
-  if (staffRole === "SALE") {
-    const rows: Array<{
-      userId: string;
-      name: string;
-      personal: any; // NET
-      collected_gross: any; // GROSS (NORMAL + HOLD)
-      collected_net: any; // NET (NORMAL only)
-      bonus: any; // NET
-    }> = await prisma.$queryRaw`
-      WITH inv AS (
-        SELECT
-          i."id",
-          i."type",
+  const isNameKey = String(staffUserId || "").startsWith("__NAME__:");
+  const staffNameOnly = isNameKey ? String(staffUserId).slice("__NAME__:".length) : undefined;
 
-          -- staffId có thể NULL (data cũ)
-          i."saleUserId" AS "staffId",
-          COALESCE(NULLIF(i."saleUserName", ''), NULLIF(u."username", ''), 'Unknown') AS "staffName",
+  const staffIdField = staffRole === "SALE" ? Prisma.sql`i."saleUserId"` : Prisma.sql`i."techUserId"`;
+  const staffNameField =
+    staffRole === "SALE"
+      ? Prisma.sql`COALESCE(NULLIF(i."saleUserName", ''), NULLIF(u."username", ''), 'Unknown')`
+      : Prisma.sql`COALESCE(NULLIF(i."techUserName", ''), NULLIF(u."username", ''), 'Unknown')`;
+  const staffJoinField = staffRole === "SALE" ? Prisma.sql`i."saleUserId"` : Prisma.sql`i."techUserId"`;
 
-          i."receiveAccountId",
-
-          COALESCE(i."subtotal",0) AS subtotal_raw,
-          COALESCE(i."tax",0)      AS tax_raw,
-          COALESCE(i."total",0)    AS total,
-
-          -- fallback subtotal theo dòng hàng
-          (
-            SELECT COALESCE(SUM(il."amount"),0)
-            FROM "InvoiceLine" il
-            WHERE il."invoiceId" = i."id"
-          ) AS line_subtotal,
-
-          COALESCE(i."warrantyHoldAmount",0) AS hold,
-          (COALESCE(i."total",0) - COALESCE(i."warrantyHoldAmount",0)) AS need,
-
-          -- ✅ subtotalNet (chưa VAT)
-          (
-            CASE
-              WHEN COALESCE(i."total",0) > 0
-                   AND COALESCE(i."tax",0) > 0
-                   AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
-                THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
-              WHEN COALESCE(i."subtotal",0) > 0
-                THEN COALESCE(i."subtotal",0)
-              ELSE (
-                SELECT COALESCE(SUM(il."amount"),0)
-                FROM "InvoiceLine" il
-                WHERE il."invoiceId" = i."id"
-              )
-            END
-          ) AS subtotal_net
-        FROM "Invoice" i
-        LEFT JOIN "User" u ON u."id" = i."saleUserId"
-        WHERE
-          i."status" = ${INV_STATUS_APPROVED}
-          AND i."type" IN (${INV_TYPE_SALES}, ${INV_TYPE_SALES_RETURN})
-          AND i."approvedAt" IS NOT NULL
-          ${sqlIf(receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${receiveAccountId}`)}
-          ${sqlIf(staffUserId, Prisma.sql`AND i."saleUserId" = ${staffUserId}`)}
-      ),
-      pay AS (
-        SELECT
-          pa."invoiceId",
-          p."date" AS pay_date,
-          p."id"   AS pay_id,
-          pa."kind"::text AS kind,
-          COALESCE(pa."amount",0) AS amt
-        FROM "PaymentAllocation" pa
-        JOIN "Payment" p ON p."id" = pa."paymentId"
-        WHERE pa."kind"::text IN ('NORMAL','WARRANTY_HOLD')
-      ),
-      seq AS (
-        SELECT
-          inv."id" AS invoice_id,
-          inv."type",
-
-          inv."staffId",
-          inv."staffName",
-
-          inv.subtotal_net,
-          inv.total,
-          inv.hold,
-          inv.need,
-
-          pay.pay_date,
-          pay.pay_id,
-          pay.kind,
-          pay.amt,
-
-          -- ✅ chỉ cộng dồn NORMAL để xác định đủ need (không tính BH treo)
-          SUM(
-            CASE WHEN pay.kind = 'NORMAL' THEN pay.amt ELSE 0 END
-          ) OVER (
-            PARTITION BY inv."id"
-            ORDER BY pay.pay_date, pay.pay_id
-            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-          ) AS cum_amt_normal
-        FROM inv
-        JOIN pay ON pay."invoiceId" = inv."id"
-      ),
-      hit AS (
-        SELECT
-          s.invoice_id,
-          MIN(s.pay_date) AS hit_date
-        FROM seq s
-        WHERE s.hold > 0 AND s.need > 0 AND s.cum_amt_normal >= s.need
-        GROUP BY s.invoice_id
-      ),
-      cash AS (
-        SELECT
-          COALESCE(s."staffId", ('__NAME__:' || s."staffName")) AS userId,
-          MAX(s."staffName") AS name,
-
-          -- ✅ GROSS thực thu = NORMAL + WARRANTY_HOLD
-          COALESCE(SUM(s.amt),0) AS collected_gross,
-
-          -- ✅ NET thu từ NORMAL (loại VAT theo subtotalNet/total)
-          COALESCE(SUM(
-            CASE
-              WHEN s.kind = 'NORMAL' AND COALESCE(s.total,0) > 0
-                THEN (s.amt * (s.subtotal_net / NULLIF(s.total,0)))
-              ELSE 0
-            END
-          ),0) AS collected_net
-        FROM seq s
-        WHERE 1=1
-          ${sqlIf(from, Prisma.sql`AND s.pay_date >= ${from}`)}
-          ${sqlIf(to, Prisma.sql`AND s.pay_date <= ${to}`)}
-        GROUP BY COALESCE(s."staffId", ('__NAME__:' || s."staffName"))
-      ),
-      bonus AS (
-        SELECT
-          COALESCE(i."saleUserId", ('__NAME__:' || COALESCE(NULLIF(i."saleUserName", ''), 'Unknown'))) AS userId,
-          MAX(COALESCE(NULLIF(i."saleUserName", ''), NULLIF(u."username", ''), 'Unknown')) AS name,
-
-          -- ✅ BONUS NET = holdGross * (subtotalNet/total)
-          COALESCE(SUM(
-            CASE
-              WHEN COALESCE(i."total",0) <= 0 THEN 0
-              ELSE (
-                -- subtotalNet same rule as above
-                (
-                  CASE
-                    WHEN COALESCE(i."total",0) > 0
-                         AND COALESCE(i."tax",0) > 0
-                         AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
-                      THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
-                    WHEN COALESCE(i."subtotal",0) > 0
-                      THEN COALESCE(i."subtotal",0)
-                    ELSE (
-                      SELECT COALESCE(SUM(il."amount"),0)
-                      FROM "InvoiceLine" il
-                      WHERE il."invoiceId" = i."id"
-                    )
-                  END
-                ) / NULLIF(COALESCE(i."total",0),0)
-              ) * (
-                CASE i."type"
-                  WHEN 'SALES' THEN COALESCE(i."warrantyHoldAmount",0)
-                  WHEN 'SALES_RETURN' THEN -COALESCE(i."warrantyHoldAmount",0)
-                  ELSE 0
-                END
-              )
-            END
-          ),0) AS bonus_net
-        FROM hit h
-        JOIN "Invoice" i ON i."id" = h.invoice_id
-        LEFT JOIN "User" u ON u."id" = i."saleUserId"
-        WHERE 1=1
-          ${sqlIf(from, Prisma.sql`AND h.hit_date >= ${from}`)}
-          ${sqlIf(to, Prisma.sql`AND h.hit_date <= ${to}`)}
-          ${sqlIf(receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${receiveAccountId}`)}
-          ${sqlIf(staffUserId, Prisma.sql`AND i."saleUserId" = ${staffUserId}`)}
-        GROUP BY COALESCE(i."saleUserId", ('__NAME__:' || COALESCE(NULLIF(i."saleUserName", ''), 'Unknown')))
-      )
-      SELECT
-        COALESCE(c.userId, b.userId) AS "userId",
-        COALESCE(c.name, b.name) AS name,
-        COALESCE(c.collected_gross,0) AS collected_gross,
-        COALESCE(c.collected_net,0) AS collected_net,
-        COALESCE(b.bonus_net,0) AS bonus,
-        (COALESCE(c.collected_net,0) + COALESCE(b.bonus_net,0)) AS personal
-      FROM cash c
-      FULL JOIN bonus b ON b.userId = c.userId
-      ORDER BY personal DESC
-      LIMIT 50
-    `;
-
-    const out: StaffRow[] = rows.map((r) => ({
-      userId: String(r.userId),
-      name: String(r.name || "Unknown"),
-      role: "SALE",
-      personalRevenue: n(r.personal), // NET
-      collectedNormal: n(r.collected_net), // NET (NORMAL)
-      bonusWarranty: n(r.bonus), // NET
-      collectedGross: n(r.collected_gross), // GROSS (NORMAL + HOLD)
-    }));
-
-    return out;
-  }
-
-  // TECH
   const rows: Array<{
     userId: string;
     name: string;
-    personal: any; // NET
-    collected_gross: any; // GROSS (NORMAL + HOLD)
-    collected_net: any; // NET (NORMAL)
-    bonus: any; // NET
+    personal: any;
   }> = await prisma.$queryRaw`
     WITH inv AS (
       SELECT
-        i."id",
+        i."id" AS invoice_id,
         i."type",
-
-        i."techUserId" AS "staffId",
-        COALESCE(NULLIF(i."techUserName", ''), NULLIF(u."username", ''), 'Unknown') AS "staffName",
-
+        ${staffIdField} AS staff_id,
+        ${staffNameField} AS staff_name,
         i."receiveAccountId",
-
         COALESCE(i."subtotal",0) AS subtotal_raw,
-        COALESCE(i."tax",0)      AS tax_raw,
-        COALESCE(i."total",0)    AS total,
-
-        (
-          SELECT COALESCE(SUM(il."amount"),0)
-          FROM "InvoiceLine" il
-          WHERE il."invoiceId" = i."id"
-        ) AS line_subtotal,
-
+        COALESCE(i."tax",0)      AS vat,
+        COALESCE(i."total",0)    AS gross,
         COALESCE(i."warrantyHoldAmount",0) AS hold,
-        (COALESCE(i."total",0) - COALESCE(i."warrantyHoldAmount",0)) AS need,
-
         (
           CASE
             WHEN COALESCE(i."total",0) > 0
@@ -329,162 +168,271 @@ async function getStaffPersonalRevenue(params: {
               WHERE il."invoiceId" = i."id"
             )
           END
-        ) AS subtotal_net
+        ) AS net,
+        CASE
+          WHEN COALESCE(i."warrantyHoldAmount",0) > 0
+            THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."warrantyHoldAmount",0), 0)
+          ELSE COALESCE(i."total",0)
+        END AS need
       FROM "Invoice" i
-      LEFT JOIN "User" u ON u."id" = i."techUserId"
+      LEFT JOIN "User" u ON u."id" = ${staffJoinField}
       WHERE
         i."status" = ${INV_STATUS_APPROVED}
         AND i."type" IN (${INV_TYPE_SALES}, ${INV_TYPE_SALES_RETURN})
         AND i."approvedAt" IS NOT NULL
         ${sqlIf(receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${receiveAccountId}`)}
-        ${sqlIf(staffUserId, Prisma.sql`AND i."techUserId" = ${staffUserId}`)}
+        ${
+          staffUserId
+            ? isNameKey
+              ? Prisma.sql`AND ${staffIdField} IS NULL AND ${staffNameField} = ${staffNameOnly}`
+              : Prisma.sql`AND ${staffIdField} = ${staffUserId}`
+            : sqlEmpty
+        }
     ),
     pay AS (
       SELECT
-        pa."invoiceId",
+        pa."invoiceId" AS invoice_id,
         p."date" AS pay_date,
         p."id"   AS pay_id,
-        pa."kind"::text AS kind,
         COALESCE(pa."amount",0) AS amt
       FROM "PaymentAllocation" pa
       JOIN "Payment" p ON p."id" = pa."paymentId"
-      WHERE pa."kind"::text IN ('NORMAL','WARRANTY_HOLD')
+      WHERE pa."kind"::text = 'NORMAL'
     ),
     seq AS (
       SELECT
-        inv."id" AS invoice_id,
+        inv.invoice_id,
         inv."type",
-
-        inv."staffId",
-        inv."staffName",
-
-        inv.subtotal_net,
-        inv.total,
-        inv.hold,
+        inv.staff_id,
+        inv.staff_name,
+        inv.net,
         inv.need,
-
         pay.pay_date,
         pay.pay_id,
-        pay.kind,
         pay.amt,
-
-        SUM(
-          CASE WHEN pay.kind = 'NORMAL' THEN pay.amt ELSE 0 END
-        ) OVER (
-          PARTITION BY inv."id"
+        SUM(pay.amt) OVER (
+          PARTITION BY inv.invoice_id
           ORDER BY pay.pay_date, pay.pay_id
           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ) AS cum_amt_normal
+        ) AS cum_amt
       FROM inv
-      JOIN pay ON pay."invoiceId" = inv."id"
+      JOIN pay ON pay.invoice_id = inv.invoice_id
     ),
-    hit AS (
+    ds AS (
       SELECT
         s.invoice_id,
-        MIN(s.pay_date) AS hit_date
+        MIN(s.pay_date) AS ds_date,
+        MAX(s."type") AS type,
+        MAX(s.staff_id) AS staff_id,
+        MAX(s.staff_name) AS staff_name,
+        MAX(s.net) AS net
       FROM seq s
-      WHERE s.hold > 0 AND s.need > 0 AND s.cum_amt_normal >= s.need
+      WHERE s.cum_amt >= s.need
       GROUP BY s.invoice_id
-    ),
-    cash AS (
-      SELECT
-        COALESCE(s."staffId", ('__NAME__:' || s."staffName")) AS userId,
-        MAX(s."staffName") AS name,
-
-        COALESCE(SUM(s.amt),0) AS collected_gross,
-
-        COALESCE(SUM(
-          CASE
-            WHEN s.kind = 'NORMAL' AND COALESCE(s.total,0) > 0
-              THEN (s.amt * (s.subtotal_net / NULLIF(s.total,0)))
-            ELSE 0
-          END
-        ),0) AS collected_net
-      FROM seq s
-      WHERE 1=1
-        ${sqlIf(from, Prisma.sql`AND s.pay_date >= ${from}`)}
-        ${sqlIf(to, Prisma.sql`AND s.pay_date <= ${to}`)}
-      GROUP BY COALESCE(s."staffId", ('__NAME__:' || s."staffName"))
-    ),
-    bonus AS (
-      SELECT
-        COALESCE(i."techUserId", ('__NAME__:' || COALESCE(NULLIF(i."techUserName", ''), 'Unknown'))) AS userId,
-        MAX(COALESCE(NULLIF(i."techUserName", ''), NULLIF(u."username", ''), 'Unknown')) AS name,
-
-        COALESCE(SUM(
-          CASE
-            WHEN COALESCE(i."total",0) <= 0 THEN 0
-            ELSE (
-              (
-                CASE
-                  WHEN COALESCE(i."total",0) > 0
-                       AND COALESCE(i."tax",0) > 0
-                       AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
-                    THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
-                  WHEN COALESCE(i."subtotal",0) > 0
-                    THEN COALESCE(i."subtotal",0)
-                  ELSE (
-                    SELECT COALESCE(SUM(il."amount"),0)
-                    FROM "InvoiceLine" il
-                    WHERE il."invoiceId" = i."id"
-                  )
-                END
-              ) / NULLIF(COALESCE(i."total",0),0)
-            ) * (
-              CASE i."type"
-                WHEN 'SALES' THEN COALESCE(i."warrantyHoldAmount",0)
-                WHEN 'SALES_RETURN' THEN -COALESCE(i."warrantyHoldAmount",0)
-                ELSE 0
-              END
-            )
-          END
-        ),0) AS bonus_net
-      FROM hit h
-      JOIN "Invoice" i ON i."id" = h.invoice_id
-      LEFT JOIN "User" u ON u."id" = i."techUserId"
-      WHERE 1=1
-        ${sqlIf(from, Prisma.sql`AND h.hit_date >= ${from}`)}
-        ${sqlIf(to, Prisma.sql`AND h.hit_date <= ${to}`)}
-        ${sqlIf(receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${receiveAccountId}`)}
-        ${sqlIf(staffUserId, Prisma.sql`AND i."techUserId" = ${staffUserId}`)}
-      GROUP BY COALESCE(i."techUserId", ('__NAME__:' || COALESCE(NULLIF(i."techUserName", ''), 'Unknown')))
     )
     SELECT
-      COALESCE(c.userId, b.userId) AS "userId",
-      COALESCE(c.name, b.name) AS name,
-      COALESCE(c.collected_gross,0) AS collected_gross,
-      COALESCE(c.collected_net,0) AS collected_net,
-      COALESCE(b.bonus_net,0) AS bonus,
-      (COALESCE(c.collected_net,0) + COALESCE(b.bonus_net,0)) AS personal
-    FROM cash c
-    FULL JOIN bonus b ON b.userId = c.userId
+      COALESCE(d.staff_id, ('__NAME__:' || d.staff_name)) AS "userId",
+      MAX(d.staff_name) AS name,
+      COALESCE(SUM(
+        CASE d.type
+          WHEN 'SALES' THEN COALESCE(d.net,0)
+          WHEN 'SALES_RETURN' THEN -COALESCE(d.net,0)
+          ELSE 0
+        END
+      ),0) AS personal
+    FROM ds d
+    WHERE 1=1
+      ${sqlIf(from, Prisma.sql`AND d.ds_date >= ${from}`)}
+      ${sqlIf(to, Prisma.sql`AND d.ds_date <= ${to}`)}
+    GROUP BY COALESCE(d.staff_id, ('__NAME__:' || d.staff_name))
     ORDER BY personal DESC
     LIMIT 50
   `;
 
-  const out: StaffRow[] = rows.map((r) => ({
+  return (rows || []).map((r) => ({
     userId: String(r.userId),
     name: String(r.name || "Unknown"),
-    role: "TECH",
-    personalRevenue: n(r.personal), // NET
-    collectedNormal: n(r.collected_net), // NET (NORMAL)
-    bonusWarranty: n(r.bonus), // NET
-    collectedGross: n(r.collected_gross), // GROSS (NORMAL + HOLD)
+    role: staffRole,
+    // ✅ rule: đủ need mới tính DS => ds_net
+    personalRevenue: n(r.personal),
+    collectedNormal: n(r.personal),
+    bonusWarranty: 0,
+    collectedGross: 0,
   }));
+}
+
+/** =========================================================
+ * getStaffInvoices (popup)
+ * ========================================================= */
+async function getStaffInvoices(params: {
+  from?: Date;
+  to?: Date;
+  staffRole: "SALE" | "TECH";
+  staffUserId: string;
+  receiveAccountId?: string;
+}) {
+  const { from, to, staffRole, staffUserId, receiveAccountId } = params;
+
+  const isNameKey = String(staffUserId || "").startsWith("__NAME__:");
+  const staffNameOnly = isNameKey ? String(staffUserId).slice("__NAME__:".length) : undefined;
+
+  const staffIdField = staffRole === "SALE" ? Prisma.sql`i."saleUserId"` : Prisma.sql`i."techUserId"`;
+  const staffNameField =
+    staffRole === "SALE"
+      ? Prisma.sql`COALESCE(NULLIF(i."saleUserName", ''), NULLIF(u."username", ''), 'Unknown')`
+      : Prisma.sql`COALESCE(NULLIF(i."techUserName", ''), NULLIF(u."username", ''), 'Unknown')`;
+  const staffJoinField = staffRole === "SALE" ? Prisma.sql`i."saleUserId"` : Prisma.sql`i."techUserId"`;
+
+  const rows: any[] = await prisma.$queryRaw`
+    WITH inv AS (
+      SELECT
+        i."id" AS invoice_id,
+        i."code" AS code,
+        i."issueDate" AS issue_date,
+        COALESCE(i."partnerName",'') AS partner_name,
+        i."type",
+        ${staffIdField} AS staff_id,
+        ${staffNameField} AS staff_name,
+        i."receiveAccountId",
+        COALESCE(i."subtotal",0) AS subtotal_raw,
+        COALESCE(i."tax",0)      AS vat,
+        COALESCE(i."total",0)    AS gross,
+        COALESCE(i."warrantyHoldAmount",0) AS hold,
+        (
+          CASE
+            WHEN COALESCE(i."total",0) > 0
+                 AND COALESCE(i."tax",0) > 0
+                 AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
+              THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
+            WHEN COALESCE(i."subtotal",0) > 0
+              THEN COALESCE(i."subtotal",0)
+            ELSE (
+              SELECT COALESCE(SUM(il."amount"),0)
+              FROM "InvoiceLine" il
+              WHERE il."invoiceId" = i."id"
+            )
+          END
+        ) AS net,
+        CASE
+          WHEN COALESCE(i."warrantyHoldAmount",0) > 0 THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."warrantyHoldAmount",0), 0)
+          ELSE COALESCE(i."total",0)
+        END AS need
+      FROM "Invoice" i
+      LEFT JOIN "User" u ON u."id" = ${staffJoinField}
+      WHERE
+        i."status" = ${INV_STATUS_APPROVED}
+        AND i."type" IN (${INV_TYPE_SALES}, ${INV_TYPE_SALES_RETURN})
+        AND i."approvedAt" IS NOT NULL
+        ${sqlIf(receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${receiveAccountId}`)}
+        ${
+          staffUserId
+            ? isNameKey
+              ? Prisma.sql`AND ${staffIdField} IS NULL AND ${staffNameField} = ${staffNameOnly}`
+              : Prisma.sql`AND ${staffIdField} = ${staffUserId}`
+            : sqlEmpty
+        }
+    ),
+    pay AS (
+      SELECT
+        pa."invoiceId" AS invoice_id,
+        p."date" AS pay_date,
+        p."id"   AS pay_id,
+        COALESCE(pa."amount",0) AS amt
+      FROM "PaymentAllocation" pa
+      JOIN "Payment" p ON p."id" = pa."paymentId"
+      WHERE pa."kind"::text = 'NORMAL'
+    ),
+    seq AS (
+      SELECT
+        inv.*,
+        pay.pay_date,
+        pay.pay_id,
+        pay.amt,
+        SUM(pay.amt) OVER (
+          PARTITION BY inv.invoice_id
+          ORDER BY pay.pay_date, pay.pay_id
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cum_amt
+      FROM inv
+      JOIN pay ON pay.invoice_id = inv.invoice_id
+    ),
+    ds AS (
+      SELECT
+        s.invoice_id,
+        MIN(s.pay_date) AS ds_date,
+        MAX(s.code) AS code,
+        MAX(s.issue_date) AS issue_date,
+        MAX(s.partner_name) AS partner_name,
+        MAX(s.type) AS type,
+        MAX(s.net) AS net,
+        MAX(s.vat) AS vat,
+        MAX(s.gross) AS gross,
+        MAX(s.need) AS need
+      FROM seq s
+      WHERE s.cum_amt >= s.need
+      GROUP BY s.invoice_id
+    ),
+    paid AS (
+      SELECT
+        invoice_id,
+        COALESCE(SUM(amt),0) AS paid_normal
+      FROM pay
+      GROUP BY invoice_id
+    )
+    SELECT
+      d.invoice_id,
+      d.code,
+      d.issue_date,
+      d.partner_name,
+      d.net,
+      d.vat,
+      d.gross,
+      d.need,
+      COALESCE(p.paid_normal,0) AS paid_normal,
+      d.ds_date,
+      CASE d.type
+        WHEN 'SALES' THEN d.net
+        WHEN 'SALES_RETURN' THEN -d.net
+        ELSE 0
+      END AS ds_net
+    FROM ds d
+    LEFT JOIN paid p ON p.invoice_id = d.invoice_id
+    WHERE 1=1
+      ${sqlIf(from, Prisma.sql`AND d.ds_date >= ${from}`)}
+      ${sqlIf(to, Prisma.sql`AND d.ds_date <= ${to}`)}
+    ORDER BY d.ds_date DESC, d.code DESC
+    LIMIT 300
+  `;
+
+  const out: StaffInvoiceRow[] = (rows || []).map((r: any) => {
+    const paidNormal = n(r.paid_normal);
+    return {
+      invoiceId: String(r.invoice_id),
+      code: String(r.code || ""),
+      issueDate: r.issue_date ? new Date(r.issue_date).toISOString().slice(0, 10) : "",
+      partnerName: String(r.partner_name || ""),
+      net: n(r.net),
+      vat: n(r.vat),
+      gross: n(r.gross),
+      need: n(r.need),
+      paidNormal,
+      paidNormalGross: paidNormal,
+      dsDate: r.ds_date ? new Date(r.ds_date).toISOString().slice(0, 10) : "",
+      dsNet: n(r.ds_net),
+    };
+  });
 
   return out;
 }
 
 export async function getRevenueDashboard(q: RevenueQuery) {
-  const from = toDate(q.from) ?? undefined;
-  const to = toDate(q.to) ?? undefined;
+  const from = toDateStart(q.from) ?? undefined;
+  const to = toDateEnd(q.to) ?? undefined;
 
   const groupBy = q.groupBy ?? "day";
   const trunc = groupBy === "month" ? "month" : groupBy === "week" ? "week" : "day";
 
-  /** =========================
-   * KPI: invoice-level (company revenue) (APPROVED + approvedAt)
-   * ========================= */
+  /** ========================= KPI company ========================= */
   const invWhere: Prisma.InvoiceWhereInput = {
     status: InvoiceStatus.APPROVED,
     type: { in: [InvoiceType.SALES, InvoiceType.SALES_RETURN] },
@@ -512,15 +460,13 @@ export async function getRevenueDashboard(q: RevenueQuery) {
       subtotal: true,
       tax: true,
       total: true,
-      paidAmount: true, // NORMAL collected (gross)
+      paidAmount: true,
     },
   });
 
-  let netRevenue = 0; // subtotalNet signed (không VAT)
+  let netRevenue = 0;
   let netVat = 0;
   let netTotal = 0;
-
-  // ✅ netCollected: quy về NET để cùng hệ quy chiếu với netRevenue
   let netCollected = 0;
 
   for (const r of invRows) {
@@ -530,7 +476,6 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     const total = n(r.total);
     const paidGross = n(r.paidAmount);
 
-    // ✅ Fix: nếu có VAT mà subtotalRaw bị “dính gross” -> dùng total - tax
     let subtotalNet = subtotalRaw;
     if (total > 0 && tax > 0 && Math.abs((subtotalRaw + tax) - total) > 0.01) {
       subtotalNet = Math.max(total - tax, 0);
@@ -546,9 +491,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
 
   const orderCount = invRows.length;
 
-  /** =========================
-   * KPI: Net COGS theo MovementLine (OUT +, IN -)
-   * ========================= */
+  /** ========================= COGS ========================= */
   const cogsAgg: Array<{ cogs: any }> = await prisma.$queryRaw`
     SELECT COALESCE(SUM(
       CASE m."type"
@@ -575,10 +518,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   const grossProfit = netRevenue - netCogs;
   const marginPct = netRevenue !== 0 ? (grossProfit / netRevenue) * 100 : 0;
 
-  /** =========================
-   * Trend: company revenue (approvedAt) + cogs
-   * - revenue dùng subtotalNet (fix VAT lệch)
-   * ========================= */
+  /** ========================= Trend (giữ nguyên nếu bạn còn dùng) ========================= */
   const trend: Array<{ t: any; revenue: any; cogs: any }> = await prisma.$queryRaw`
     WITH inv AS (
       SELECT
@@ -660,9 +600,9 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   });
 
   /** =========================
-   * By Product (company revenue) - giữ theo InvoiceLine.amount
+   * ✅ By Product (FIX: thêm qty)
    * ========================= */
-  const byProduct: Array<{ itemId: string; name: string; revenue: any; cogs: any }> = await prisma.$queryRaw`
+  const byProduct: Array<{ itemId: string; name: string; qty: any; revenue: any; cogs: any }> = await prisma.$queryRaw`
     WITH inv AS (
       SELECT
         i."id",
@@ -686,6 +626,17 @@ export async function getRevenueDashboard(q: RevenueQuery) {
       SELECT
         il."itemId" AS "itemId",
         COALESCE(MAX(il."itemName"), '') AS name,
+
+        -- ✅ qty signed: SALES +, RETURN -
+        COALESCE(SUM(
+          CASE inv."type"
+            WHEN 'SALES' THEN COALESCE(il."qty",0)
+            WHEN 'SALES_RETURN' THEN -COALESCE(il."qty",0)
+            ELSE 0
+          END
+        ),0) AS qty,
+
+        -- ✅ revenue NET theo InvoiceLine.amount signed
         COALESCE(SUM(
           CASE inv."type"
             WHEN 'SALES' THEN COALESCE(il."amount",0)
@@ -715,6 +666,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     SELECT
       rev."itemId",
       rev.name,
+      rev.qty,
       rev.revenue,
       COALESCE(cogs.cogs,0) AS cogs
     FROM rev
@@ -724,12 +676,14 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   `;
 
   const byProductOut = (byProduct || []).map((r: any) => {
+    const qty = n(r.qty);
     const revenue = n(r.revenue);
     const cogs = n(r.cogs);
     const profit = revenue - cogs;
     return {
       itemId: r.itemId,
       name: r.name || "Unknown",
+      qty, // ✅ NEW
       revenue,
       cogs,
       profit,
@@ -737,9 +691,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     };
   });
 
-  /** =========================
-   * By Staff: doanh thu cá nhân theo Payment.date + bonus hold khi đủ need (NET)
-   * ========================= */
+  /** ========================= By Staff ========================= */
   const staffSalePersonal = await getStaffPersonalRevenue({
     from,
     to,
@@ -758,19 +710,40 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     receiveAccountId: q.receiveAccountId,
   });
 
+  const filterRealStaff = (rows: StaffRow[]) =>
+    rows.filter((r) => {
+      const uid = String(r.userId || "");
+      const name = String(r.name || "");
+      if (!uid) return false;
+      if (uid.startsWith("__NAME__:")) return false;
+      if (name.trim().toLowerCase() === "unknown") return false;
+      return true;
+    });
+
   const mapToLegacyStaffShape = (rows: StaffRow[]) =>
     rows.map((r) => ({
       userId: r.userId,
       name: r.name,
       role: r.role,
-      revenue: r.personalRevenue, // ✅ NET (Doanh thu chưa VAT, đã cộng bonus BH nếu đủ need)
-      collectedNormal: r.collectedNormal, // NET (NORMAL)
-      collectedGross: r.collectedGross ?? 0, // ✅ GROSS thực thu (NORMAL + HOLD)
-      bonusWarranty: r.bonusWarranty, // NET
+      revenue: r.personalRevenue,
+      collectedNormal: r.collectedNormal,
+      collectedGross: r.collectedGross ?? 0,
+      bonusWarranty: r.bonusWarranty,
       cogs: 0,
       profit: 0,
       marginPct: 0,
     }));
+
+  let staffInvoices: StaffInvoiceRow[] | undefined = undefined;
+  if (q.includeStaffInvoices && q.staffRole && q.staffUserId) {
+    staffInvoices = await getStaffInvoices({
+      from,
+      to,
+      staffRole: q.staffRole,
+      staffUserId: q.staffUserId,
+      receiveAccountId: q.receiveAccountId,
+    });
+  }
 
   return {
     kpis: {
@@ -786,8 +759,9 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     trend: trendOut,
     byProduct: byProductOut,
     byStaff: {
-      sale: mapToLegacyStaffShape(staffSalePersonal),
-      tech: mapToLegacyStaffShape(staffTechPersonal),
+      sale: mapToLegacyStaffShape(filterRealStaff(staffSalePersonal)),
+      tech: mapToLegacyStaffShape(filterRealStaff(staffTechPersonal)),
     },
+    staffInvoices,
   };
 }

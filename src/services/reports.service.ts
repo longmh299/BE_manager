@@ -14,6 +14,25 @@ function round2(n: number) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
 }
 
+function pad2(n: number) {
+  return String(n).padStart(2, "0");
+}
+
+// ✅ tránh lệch ngày/tháng do timezone (không dùng toISOString)
+function toLocalYMD(d: Date) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function parseYMD(ymd: string): { year: number; month: number; day: number } {
+  const s = String(ymd || "").slice(0, 10);
+  const [y, m, d] = s.split("-").map((x) => Number(x));
+  return {
+    year: Number.isFinite(y) ? y : 1970,
+    month: Number.isFinite(m) ? m : 1,
+    day: Number.isFinite(d) ? d : 1,
+  };
+}
+
 export type LedgerRow = {
   at: string; // ISO
   movementId: string;
@@ -44,10 +63,11 @@ export async function getLedger(params: {
     posted: true,
   };
 
+  // ✅ CHUẨN: lọc theo occurredAt (ngày phát sinh)
   if (params.from || params.to) {
-    whereMv.createdAt = {};
-    if (params.from) (whereMv.createdAt as any).gte = params.from;
-    if (params.to) (whereMv.createdAt as any).lte = params.to;
+    whereMv.occurredAt = {};
+    if (params.from) (whereMv.occurredAt as any).gte = params.from;
+    if (params.to) (whereMv.occurredAt as any).lte = params.to;
   }
 
   if (params.type) whereMv.type = params.type;
@@ -55,10 +75,6 @@ export async function getLedger(params: {
   if (params.q && params.q.trim()) {
     const q = params.q.trim();
 
-    // ✅ Search theo:
-    // - refNo (movement)
-    // - invoice.code, invoice.partnerName
-    // - item.name / item.sku (movement lines)
     whereMv.OR = [
       { refNo: { contains: q, mode: "insensitive" } },
       { invoice: { is: { code: { contains: q, mode: "insensitive" } } } },
@@ -78,9 +94,8 @@ export async function getLedger(params: {
 
   const movements = await prisma.movement.findMany({
     where: whereMv,
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ occurredAt: "desc" }, { createdAt: "desc" }],
     include: {
-      // ✅ include note để dùng hiển thị
       invoice: { select: { id: true, code: true, type: true, note: true, partnerName: true } },
       lines: {
         where: params.itemId ? { itemId: params.itemId } : undefined,
@@ -90,24 +105,24 @@ export async function getLedger(params: {
   });
 
   const rows: LedgerRow[] = [];
-  for (const mv of movements) {
-    for (const ln of mv.lines) {
+  for (const mv of movements as any[]) {
+    for (const ln of mv.lines as any[]) {
       let qty = toNum(ln.qty);
 
-      // 1 kho: chuẩn hóa sign
       if (mv.type === "OUT") qty = -Math.abs(qty);
       if (mv.type === "IN") qty = Math.abs(qty);
-      // ADJUST: giữ nguyên qty theo line
 
-      // ✅ NOTE: ưu tiên invoice.note (đúng nghiệp vụ), rồi movement.note, rồi line.note
       const note =
         (mv.invoice?.note && String(mv.invoice.note).trim()) ||
         (mv.note && String(mv.note).trim()) ||
         (ln.note && String(ln.note).trim()) ||
         null;
 
+      // ✅ thời gian hiển thị: occurredAt
+      const at = (mv.occurredAt ?? mv.createdAt) as Date;
+
       rows.push({
-        at: mv.createdAt.toISOString(),
+        at: new Date(at).toISOString(),
         movementId: mv.id,
         movementType: mv.type,
         invoiceId: mv.invoice?.id ?? null,
@@ -157,14 +172,12 @@ export async function exportLedgerExcel(params: {
     views: [{ state: "frozen", ySplit: 2 }],
   });
 
-  // Title row
   ws.mergeCells("A1:I1");
   ws.getCell("A1").value = "LỊCH SỬ XUẤT NHẬP KHO";
   ws.getCell("A1").font = { size: 14, bold: true };
   ws.getCell("A1").alignment = { vertical: "middle", horizontal: "center" };
   ws.getRow(1).height = 22;
 
-  // Header row
   const header = [
     "Thời gian",
     "Chứng từ",
@@ -216,8 +229,8 @@ export async function exportLedgerExcel(params: {
 
   ws.getColumn(1).numFmt = "dd/mm/yyyy hh:mm";
   ws.getColumn(6).numFmt = "#,##0.###";
-  ws.getColumn(7).numFmt = "#,##0.00";
-  ws.getColumn(8).numFmt = "#,##0.00";
+  ws.getColumn(7).numFmt = "#,##0";
+  ws.getColumn(8).numFmt = "#,##0";
 
   ws.getColumn(1).alignment = { vertical: "middle", horizontal: "left" };
   ws.getColumn(2).alignment = { vertical: "middle", horizontal: "left" };
@@ -261,22 +274,29 @@ export async function exportLedgerExcel(params: {
 /** ========================= Sales Ledger (Bảng kê bán hàng) ========================= **/
 
 export type SalesLedgerRow = {
+  invoiceId: string;
+
   issueDate: string; // yyyy-mm-dd
   code: string;
   partnerName: string;
+
+  itemId: string;
 
   itemName: string;
   itemSku?: string | null;
 
   qty: number;
-  unitPrice: number;  // đơn giá
-  unitCost: number;   // đơn giá vốn
-  costTotal: number;  // tiền vốn (đã net theo trả hàng)
+  unitPrice: number;
+  unitCost: number;
+  costTotal: number;
 
-  lineAmount: number; // thành tiền (đã net theo trả hàng)
+  unitCostMonthAvg: number;
+  costTotalMonthAvg: number;
 
-  paid: number;       // đã thanh toán (phân bổ theo dòng - theo NET sau trả hàng)
-  debt: number;       // còn nợ (theo NET sau trả hàng)
+  lineAmount: number;
+
+  paid: number;
+  debt: number;
 
   saleUserName: string;
   techUserName: string;
@@ -294,7 +314,6 @@ async function loadSalesReturnAgg(params: { invoiceIds: string[]; asOf?: Date })
     refInvoiceId: { in: invoiceIds },
   };
 
-  // as-of: để report “tới ngày” thì trả hàng sau ngày đó không tính vào
   if (asOf) {
     where.issueDate = { lte: asOf };
   }
@@ -308,7 +327,6 @@ async function loadSalesReturnAgg(params: { invoiceIds: string[]; asOf?: Date })
     },
   });
 
-  // Map: salesInvoiceId -> (itemId -> {qty, amount})
   const retMap = new Map<string, Map<string, ReturnAggByItem>>();
 
   for (const r of returns as any[]) {
@@ -338,6 +356,113 @@ async function loadSalesReturnAgg(params: { invoiceIds: string[]; asOf?: Date })
   }
 
   return retMap;
+}
+
+async function attachMonthlyAvgCostToSalesRows(rows: SalesLedgerRow[], opts?: { asOf?: Date }) {
+  if (!rows.length) return;
+
+  const itemIds = Array.from(new Set(rows.map((r) => r.itemId).filter(Boolean)));
+
+  let locationId: string | null = null;
+  const stockLoc = await prisma.stock.findFirst({
+    where: { itemId: { in: itemIds } },
+    select: { locationId: true },
+  });
+  locationId = (stockLoc?.locationId as any) ?? null;
+
+  if (!locationId) {
+    const defaultLoc = await prisma.location.findFirst({ select: { id: true } });
+    locationId = defaultLoc?.id ?? null;
+  }
+
+  if (!locationId) {
+    for (const r of rows) {
+      r.unitCostMonthAvg = r.unitCost || 0;
+      r.costTotalMonthAvg = round2((r.qty || 0) * (r.unitCostMonthAvg || 0));
+    }
+    return;
+  }
+
+  const ymSet = new Set<string>();
+  const yms: Array<{ year: number; month: number }> = [];
+  for (const r of rows) {
+    const { year, month } = parseYMD(r.issueDate);
+    const k = `${year}-${month}`;
+    if (ymSet.has(k)) continue;
+    ymSet.add(k);
+    yms.push({ year, month });
+  }
+
+  let asOfYear: number | null = null;
+  let asOfMonth: number | null = null;
+  if (opts?.asOf instanceof Date && !Number.isNaN(opts.asOf.getTime())) {
+    asOfYear = opts.asOf.getFullYear();
+    asOfMonth = opts.asOf.getMonth() + 1;
+  }
+
+  const map = new Map<string, number>(); // key: year-month-itemId -> avg
+
+  for (const ym of yms) {
+    let found = await prisma.monthlyAvgCost.findMany({
+      where: {
+        year: ym.year,
+        month: ym.month,
+        locationId,
+        itemId: { in: itemIds },
+      },
+      select: { year: true, month: true, itemId: true, avgCost: true },
+    });
+
+    if (found.length === 0) {
+      found = await prisma.monthlyAvgCost.findMany({
+        where: {
+          year: ym.year,
+          month: ym.month,
+          itemId: { in: itemIds },
+        },
+        select: { year: true, month: true, itemId: true, avgCost: true },
+      });
+    }
+
+    for (const x of found) {
+      const kk = `${x.year}-${x.month}-${x.itemId}`;
+      if (!map.has(kk)) map.set(kk, toNum(x.avgCost));
+    }
+  }
+
+  if (asOfYear && asOfMonth) {
+    const missingItemIds = new Set<string>();
+    for (const r of rows) {
+      const { year, month } = parseYMD(r.issueDate);
+      if (year !== asOfYear || month !== asOfMonth) continue;
+      const kk = `${year}-${month}-${r.itemId}`;
+      if (!map.has(kk)) missingItemIds.add(r.itemId);
+    }
+
+    if (missingItemIds.size > 0) {
+      const stocks = await prisma.stock.findMany({
+        where: {
+          locationId,
+          itemId: { in: Array.from(missingItemIds) },
+        },
+        select: { itemId: true, avgCost: true },
+      });
+
+      for (const s of stocks) {
+        const kk = `${asOfYear}-${asOfMonth}-${s.itemId}`;
+        map.set(kk, toNum(s.avgCost));
+      }
+    }
+  }
+
+  for (const r of rows) {
+    const { year, month } = parseYMD(r.issueDate);
+    const kk = `${year}-${month}-${r.itemId}`;
+    const monthAvg = map.get(kk);
+
+    r.unitCostMonthAvg = monthAvg ?? r.unitCost ?? 0;
+    r.costTotalMonthAvg = round2((r.qty || 0) * (r.unitCostMonthAvg || 0));
+  }
 }
 
 export async function getSalesLedger(params: {
@@ -373,7 +498,6 @@ export async function getSalesLedger(params: {
     ];
   }
 
-  // include true để khỏi kẹt typing + chắc chắn có inv.lines
   const invoices = await prisma.invoice.findMany({
     where,
     orderBy: { issueDate: "desc" },
@@ -392,7 +516,6 @@ export async function getSalesLedger(params: {
 
   for (const inv of invoices as any[]) {
     const invId = String(inv.id);
-
     const invPaid = toNum(inv.paidAmount);
 
     const saleName =
@@ -411,15 +534,14 @@ export async function getSalesLedger(params: {
       inv.techUser?.id ||
       "";
 
-    const issueDateStr = new Date(inv.issueDate).toISOString().slice(0, 10);
+    const issueDateStr = toLocalYMD(new Date(inv.issueDate));
     const partnerName = String(inv.partnerName || "");
 
     const linesArr: any[] = Array.isArray(inv.lines) ? inv.lines : [];
     if (linesArr.length === 0) continue;
 
-    const retItemMap = returnAgg.get(invId); // may be undefined
+    const retItemMap = returnAgg.get(invId);
 
-    // 1) Tính NET line theo trả hàng
     const netLines = linesArr.map((l: any) => {
       const itemId = String(l.itemId || "");
       const qty = toNum(l.qty);
@@ -433,14 +555,9 @@ export async function getSalesLedger(params: {
       const retQty = ret ? toNum(ret.qty) : 0;
       const retAmt = ret ? toNum(ret.amount) : 0;
 
-      // qty net
       const netQty = Math.max(0, round2(qty - retQty));
-
-      // amount net: ưu tiên trừ theo amount trả hàng (qty*price trên phiếu return)
       const netAmount = Math.max(0, round2(lineAmount - retAmt));
 
-      // cost net: giảm theo qty net (unitCost * netQty)
-      // nếu thiếu unitCost thì fallback theo tỉ lệ lineCostTotal/qty
       let useUnitCost = unitCost;
       if (!useUnitCost && qty > 0 && lineCostTotal > 0) useUnitCost = round2(lineCostTotal / qty);
 
@@ -450,7 +567,7 @@ export async function getSalesLedger(params: {
         itemId,
         itemName: String(l.itemName || ""),
         itemSku: l.itemSku ?? null,
-        qty,
+        netQty,
         unitPrice,
         unitCost: useUnitCost,
         costTotal: netCostTotal,
@@ -459,22 +576,14 @@ export async function getSalesLedger(params: {
     });
 
     const netBase = round2(netLines.reduce((s: number, x: any) => s + toNum(x.lineAmount), 0));
+    if (netBase <= 0.0001) continue;
 
-    // ✅ FULL RETURN => bỏ khỏi bảng kê (không show “còn nợ” nữa)
-    if (netBase <= 0.0001) {
-      continue;
-    }
-
-    // 2) paidBase phân bổ theo NET base để không bị “paidLine > lineAmount”
     const paidBase = Math.min(invPaid, netBase > 0 ? netBase : invPaid);
 
-    // 3) phân bổ paid xuống line theo NET lineAmount
     let paidAllocatedSum = 0;
 
     for (let i = 0; i < netLines.length; i++) {
       const l = netLines[i];
-
-      // bỏ line đã trả hết (net = 0)
       if (toNum(l.lineAmount) <= 0.0001) continue;
 
       let paidLine = 0;
@@ -482,7 +591,6 @@ export async function getSalesLedger(params: {
         paidLine = round2((paidBase * toNum(l.lineAmount)) / netBase);
       }
 
-      // dòng cuối: chỉnh để tổng paidLine = paidBase (tránh lệch do làm tròn)
       if (i === netLines.length - 1) {
         const remain = round2(paidBase - paidAllocatedSum);
         paidLine = Math.max(0, Math.min(toNum(l.lineAmount), remain));
@@ -492,17 +600,22 @@ export async function getSalesLedger(params: {
       const debt = round2(Math.max(0, toNum(l.lineAmount) - paidLine));
 
       rows.push({
+        invoiceId: invId,
         issueDate: issueDateStr,
         code: String(inv.code),
         partnerName,
 
+        itemId: String(l.itemId),
         itemName: String(l.itemName || ""),
         itemSku: l.itemSku ?? null,
 
-        qty: toNum(l.qty), // qty gốc (đang hiển thị giống hệ thống hiện tại)
+        qty: toNum(l.netQty),
         unitPrice: toNum(l.unitPrice),
         unitCost: toNum(l.unitCost),
         costTotal: toNum(l.costTotal),
+
+        unitCostMonthAvg: 0,
+        costTotalMonthAvg: 0,
 
         lineAmount: toNum(l.lineAmount),
         paid: paidLine,
@@ -513,6 +626,8 @@ export async function getSalesLedger(params: {
       });
     }
   }
+
+  await attachMonthlyAvgCostToSalesRows(rows, { asOf });
 
   const totals = rows.reduce(
     (acc, r) => {
@@ -546,14 +661,12 @@ export async function exportSalesLedgerExcel(params: {
     views: [{ state: "frozen", ySplit: 2 }],
   });
 
-  // Title row
-  ws.mergeCells("A1:L1");
+  ws.mergeCells("A1:M1");
   ws.getCell("A1").value = "BẢNG KÊ BÁN HÀNG";
   ws.getCell("A1").font = { size: 14, bold: true };
   ws.getCell("A1").alignment = { vertical: "middle", horizontal: "center" };
   ws.getRow(1).height = 22;
 
-  // Header row (12 cột đúng yêu cầu)
   const header = [
     "Ngày",
     "Số chứng từ",
@@ -561,6 +674,7 @@ export async function exportSalesLedgerExcel(params: {
     "Tên sản phẩm",
     "Đơn giá",
     "Đơn giá vốn",
+    "Giá vốn TB (kỳ)",
     "Tiền vốn",
     "Thành tiền",
     "Đã thanh toán",
@@ -585,9 +699,7 @@ export async function exportSalesLedgerExcel(params: {
   });
 
   for (const r of rows) {
-    // Ngày: để Date object để Excel format đẹp
-    const d = new Date(r.issueDate + "T00:00:00.000Z");
-
+    const d = new Date(r.issueDate + "T00:00:00");
     ws.addRow([
       d,
       r.code,
@@ -595,6 +707,7 @@ export async function exportSalesLedgerExcel(params: {
       r.itemName,
       r.unitPrice,
       r.unitCost,
+      r.unitCostMonthAvg,
       r.costTotal,
       r.lineAmount,
       r.paid,
@@ -604,29 +717,19 @@ export async function exportSalesLedgerExcel(params: {
     ]);
   }
 
-  // Format / alignment
   ws.getColumn(1).numFmt = "dd/mm/yyyy";
-  ws.getColumn(5).numFmt = "#,##0.00";
-  ws.getColumn(6).numFmt = "#,##0.00";
-  ws.getColumn(7).numFmt = "#,##0.00";
-  ws.getColumn(8).numFmt = "#,##0.00";
-  ws.getColumn(9).numFmt = "#,##0.00";
-  ws.getColumn(10).numFmt = "#,##0.00";
+  [5, 6, 7, 8, 9, 10, 11].forEach((col) => (ws.getColumn(col).numFmt = "#,##0"));
 
   ws.getColumn(1).alignment = { vertical: "middle", horizontal: "left" };
   ws.getColumn(2).alignment = { vertical: "middle", horizontal: "left" };
   ws.getColumn(3).alignment = { vertical: "middle", horizontal: "left", wrapText: true };
   ws.getColumn(4).alignment = { vertical: "middle", horizontal: "left", wrapText: true };
-  ws.getColumn(5).alignment = { vertical: "middle", horizontal: "right" };
-  ws.getColumn(6).alignment = { vertical: "middle", horizontal: "right" };
-  ws.getColumn(7).alignment = { vertical: "middle", horizontal: "right" };
-  ws.getColumn(8).alignment = { vertical: "middle", horizontal: "right" };
-  ws.getColumn(9).alignment = { vertical: "middle", horizontal: "right" };
-  ws.getColumn(10).alignment = { vertical: "middle", horizontal: "right" };
-  ws.getColumn(11).alignment = { vertical: "middle", horizontal: "left" };
+  for (let c = 5; c <= 11; c++) {
+    ws.getColumn(c).alignment = { vertical: "middle", horizontal: "right" };
+  }
   ws.getColumn(12).alignment = { vertical: "middle", horizontal: "left" };
+  ws.getColumn(13).alignment = { vertical: "middle", horizontal: "left" };
 
-  // Borders data rows
   for (let i = 3; i <= ws.rowCount; i++) {
     ws.getRow(i).eachCell((c) => {
       c.border = {
@@ -638,7 +741,6 @@ export async function exportSalesLedgerExcel(params: {
     });
   }
 
-  // Summary
   const summaryRowIndex = ws.rowCount + 2;
   ws.getCell(`A${summaryRowIndex}`).value = "Tổng doanh thu:";
   ws.getCell(`B${summaryRowIndex}`).value = totals.totalRevenue;
@@ -653,9 +755,9 @@ export async function exportSalesLedgerExcel(params: {
   ws.getCell(`K${summaryRowIndex}`).value = totals.totalDebt;
 
   ["A", "D", "G", "J"].forEach((col) => (ws.getCell(`${col}${summaryRowIndex}`).font = { bold: true }));
-  ["B", "E", "H", "K"].forEach((col) => (ws.getCell(`${col}${summaryRowIndex}`).numFmt = "#,##0.00"));
+  ["B", "E", "H", "K"].forEach((col) => (ws.getCell(`${col}${summaryRowIndex}`).numFmt = "#,##0"));
 
-  const widths = [12, 18, 26, 28, 12, 12, 14, 14, 14, 14, 18, 18];
+  const widths = [12, 18, 26, 28, 12, 12, 14, 14, 14, 14, 14, 18, 18];
   widths.forEach((w, idx) => (ws.getColumn(idx + 1).width = w));
 
   const buffer = await wb.xlsx.writeBuffer();
