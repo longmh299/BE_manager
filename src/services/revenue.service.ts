@@ -456,14 +456,19 @@ export async function getRevenueDashboard(q: RevenueQuery) {
       subtotal: true,
       tax: true,
       total: true,
-      paidAmount: true,
+      paidAmount: true, // ✅ giả định đây là số tiền đã thu NORMAL (gross)
     },
   });
 
   let netRevenue = 0;
   let netVat = 0;
   let netTotal = 0;
+
+  // ✅ cũ: quy đổi về NET
   let netCollected = 0;
+
+  // ✅ NEW: tiền thực thu (GROSS) — không quy đổi
+  let grossCollected = 0;
 
   for (const r of invRows) {
     const s = revenueSign(r.type);
@@ -473,7 +478,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     const paidGross = n(r.paidAmount);
 
     let subtotalNet = subtotalRaw;
-    if (total > 0 && tax > 0 && Math.abs((subtotalRaw + tax) - total) > 0.01) {
+    if (total > 0 && tax > 0 && Math.abs(subtotalRaw + tax - total) > 0.01) {
       subtotalNet = Math.max(total - tax, 0);
     }
 
@@ -481,6 +486,10 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     netVat += s * tax;
     netTotal += s * total;
 
+    // ✅ NEW: grossCollected = tiền thu thực tế (không quy đổi)
+    grossCollected += s * paidGross;
+
+    // ✅ giữ lại netCollected để tương thích chỗ khác (nếu còn dùng)
     const paidNet = total > 0 ? paidGross * (subtotalNet / total) : 0;
     netCollected += s * paidNet;
   }
@@ -750,7 +759,13 @@ export async function getRevenueDashboard(q: RevenueQuery) {
       orderCount,
       netVat,
       netTotal,
+
+      // ✅ giữ lại để tương thích cũ
       netCollected,
+
+      // ✅ NEW: FE sẽ dùng cái này cho KPI "Đã thu"
+      grossCollected,
+
       netCogs,
     },
     trend: trendOut,

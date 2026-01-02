@@ -4,5 +4,5 @@ import { startPeriodAutoLockJob } from './jobs/periodAutoLock.job';
 
 app.listen(config.port, () => {
   console.log(`Warehouse API running on http://localhost:${config.port}`);
-    // startPeriodAutoLockJob();
+    startPeriodAutoLockJob();
 });
