@@ -114,9 +114,7 @@ export type StaffInvoiceRow = {
 
 /** =========================================================
  * getStaffPersonalRevenue
- * ✅ FIX: tính doanh số theo ds_date (ngày đủ need) giống popup
- *    personalRevenue = SUM(ds_net) trong range ds_date
- *    collectedNormal = personalRevenue (ẩn breakdown bonus/hold)
+ * ✅ tính doanh số theo ds_date (ngày đủ need) giống popup
  * ========================================================= */
 async function getStaffPersonalRevenue(params: {
   from?: Date;
@@ -138,11 +136,7 @@ async function getStaffPersonalRevenue(params: {
       : Prisma.sql`COALESCE(NULLIF(i."techUserName", ''), NULLIF(u."username", ''), 'Unknown')`;
   const staffJoinField = staffRole === "SALE" ? Prisma.sql`i."saleUserId"` : Prisma.sql`i."techUserId"`;
 
-  const rows: Array<{
-    userId: string;
-    name: string;
-    personal: any;
-  }> = await prisma.$queryRaw`
+  const rows: Array<{ userId: string; name: string; personal: any }> = await prisma.$queryRaw`
     WITH inv AS (
       SELECT
         i."id" AS invoice_id,
@@ -253,7 +247,6 @@ async function getStaffPersonalRevenue(params: {
     userId: String(r.userId),
     name: String(r.name || "Unknown"),
     role: staffRole,
-    // ✅ rule: đủ need mới tính DS => ds_net
     personalRevenue: n(r.personal),
     collectedNormal: n(r.personal),
     bonusWarranty: 0,
@@ -432,7 +425,10 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   const groupBy = q.groupBy ?? "day";
   const trunc = groupBy === "month" ? "month" : groupBy === "week" ? "week" : "day";
 
-  /** ========================= KPI company ========================= */
+  /** ========================= KPI company =========================
+   * ✅ FIX: lọc theo issueDate (ngày hoá đơn), không lọc theo approvedAt
+   * approvedAt chỉ để đảm bảo hoá đơn đã duyệt
+   * ============================================================ */
   const invWhere: Prisma.InvoiceWhereInput = {
     status: InvoiceStatus.APPROVED,
     type: { in: [InvoiceType.SALES, InvoiceType.SALES_RETURN] },
@@ -440,9 +436,9 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   };
 
   if (from || to) {
-    invWhere.approvedAt = { not: null };
-    if (from) (invWhere.approvedAt as any).gte = from;
-    if (to) (invWhere.approvedAt as any).lte = to;
+    invWhere.issueDate = {};
+    if (from) (invWhere.issueDate as any).gte = from;
+    if (to) (invWhere.issueDate as any).lte = to;
   }
 
   if (q.receiveAccountId) invWhere.receiveAccountId = q.receiveAccountId;
@@ -489,9 +485,12 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     netCollected += s * paidNet;
   }
 
-  const orderCount = invRows.length;
+  // ✅ FIX: Số hoá đơn = chỉ count SALES
+  const orderCount = invRows.filter((x) => x.type === InvoiceType.SALES).length;
 
-  /** ========================= COGS ========================= */
+  /** ========================= COGS =========================
+   * ✅ FIX: lọc theo issueDate
+   * ======================================================== */
   const cogsAgg: Array<{ cogs: any }> = await prisma.$queryRaw`
     SELECT COALESCE(SUM(
       CASE m."type"
@@ -507,8 +506,8 @@ export async function getRevenueDashboard(q: RevenueQuery) {
       i."status" = ${INV_STATUS_APPROVED}
       AND i."type" IN (${INV_TYPE_SALES}, ${INV_TYPE_SALES_RETURN})
       AND i."approvedAt" IS NOT NULL
-      ${sqlIf(from, Prisma.sql`AND i."approvedAt" >= ${from}`)}
-      ${sqlIf(to, Prisma.sql`AND i."approvedAt" <= ${to}`)}
+      ${sqlIf(from, Prisma.sql`AND i."issueDate" >= ${from}`)}
+      ${sqlIf(to, Prisma.sql`AND i."issueDate" <= ${to}`)}
       ${sqlIf(q.receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${q.receiveAccountId}`)}
       ${sqlIf(q.staffRole === "SALE" && q.staffUserId, Prisma.sql`AND i."saleUserId" = ${q.staffUserId}`)}
       ${sqlIf(q.staffRole === "TECH" && q.staffUserId, Prisma.sql`AND i."techUserId" = ${q.staffUserId}`)}
@@ -518,12 +517,14 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   const grossProfit = netRevenue - netCogs;
   const marginPct = netRevenue !== 0 ? (grossProfit / netRevenue) * 100 : 0;
 
-  /** ========================= Trend (giữ nguyên nếu bạn còn dùng) ========================= */
+  /** ========================= Trend =========================
+   * ✅ FIX: trục thời gian = issueDate
+   * ======================================================== */
   const trend: Array<{ t: any; revenue: any; cogs: any }> = await prisma.$queryRaw`
     WITH inv AS (
       SELECT
         i."id",
-        i."approvedAt",
+        i."issueDate" AS date_key,
         i."type",
         COALESCE(i."subtotal",0) AS subtotal_raw,
         COALESCE(i."tax",0)      AS tax_raw,
@@ -545,15 +546,15 @@ export async function getRevenueDashboard(q: RevenueQuery) {
         i."status" = ${INV_STATUS_APPROVED}
         AND i."type" IN (${INV_TYPE_SALES}, ${INV_TYPE_SALES_RETURN})
         AND i."approvedAt" IS NOT NULL
-        ${sqlIf(from, Prisma.sql`AND i."approvedAt" >= ${from}`)}
-        ${sqlIf(to, Prisma.sql`AND i."approvedAt" <= ${to}`)}
+        ${sqlIf(from, Prisma.sql`AND i."issueDate" >= ${from}`)}
+        ${sqlIf(to, Prisma.sql`AND i."issueDate" <= ${to}`)}
         ${sqlIf(q.receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${q.receiveAccountId}`)}
         ${sqlIf(q.staffRole === "SALE" && q.staffUserId, Prisma.sql`AND i."saleUserId" = ${q.staffUserId}`)}
         ${sqlIf(q.staffRole === "TECH" && q.staffUserId, Prisma.sql`AND i."techUserId" = ${q.staffUserId}`)}
     ),
     rev AS (
       SELECT
-        date_trunc(${trunc}, inv."approvedAt") AS t,
+        date_trunc(${trunc}, inv.date_key) AS t,
         COALESCE(SUM(
           CASE inv."type"
             WHEN 'SALES' THEN COALESCE(inv.subtotal_net,0)
@@ -566,7 +567,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     ),
     cogs AS (
       SELECT
-        date_trunc(${trunc}, inv."approvedAt") AS t,
+        date_trunc(${trunc}, inv.date_key) AS t,
         COALESCE(SUM(
           CASE m."type"
             WHEN 'OUT' THEN COALESCE(ml."costTotal",0)
@@ -599,14 +600,14 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     };
   });
 
-  /** =========================
-   * ✅ By Product (FIX: thêm qty)
-   * ========================= */
+  /** ========================= By Product =========================
+   * ✅ FIX: lọc theo issueDate + có qty signed
+   * ============================================================= */
   const byProduct: Array<{ itemId: string; name: string; qty: any; revenue: any; cogs: any }> = await prisma.$queryRaw`
     WITH inv AS (
       SELECT
         i."id",
-        i."approvedAt",
+        i."issueDate" AS date_key,
         i."type",
         i."saleUserId",
         i."techUserId",
@@ -616,8 +617,8 @@ export async function getRevenueDashboard(q: RevenueQuery) {
         i."status" = ${INV_STATUS_APPROVED}
         AND i."type" IN (${INV_TYPE_SALES}, ${INV_TYPE_SALES_RETURN})
         AND i."approvedAt" IS NOT NULL
-        ${sqlIf(from, Prisma.sql`AND i."approvedAt" >= ${from}`)}
-        ${sqlIf(to, Prisma.sql`AND i."approvedAt" <= ${to}`)}
+        ${sqlIf(from, Prisma.sql`AND i."issueDate" >= ${from}`)}
+        ${sqlIf(to, Prisma.sql`AND i."issueDate" <= ${to}`)}
         ${sqlIf(q.receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${q.receiveAccountId}`)}
         ${sqlIf(q.staffRole === "SALE" && q.staffUserId, Prisma.sql`AND i."saleUserId" = ${q.staffUserId}`)}
         ${sqlIf(q.staffRole === "TECH" && q.staffUserId, Prisma.sql`AND i."techUserId" = ${q.staffUserId}`)}
@@ -626,8 +627,6 @@ export async function getRevenueDashboard(q: RevenueQuery) {
       SELECT
         il."itemId" AS "itemId",
         COALESCE(MAX(il."itemName"), '') AS name,
-
-        -- ✅ qty signed: SALES +, RETURN -
         COALESCE(SUM(
           CASE inv."type"
             WHEN 'SALES' THEN COALESCE(il."qty",0)
@@ -635,8 +634,6 @@ export async function getRevenueDashboard(q: RevenueQuery) {
             ELSE 0
           END
         ),0) AS qty,
-
-        -- ✅ revenue NET theo InvoiceLine.amount signed
         COALESCE(SUM(
           CASE inv."type"
             WHEN 'SALES' THEN COALESCE(il."amount",0)
@@ -683,7 +680,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
     return {
       itemId: r.itemId,
       name: r.name || "Unknown",
-      qty, // ✅ NEW
+      qty,
       revenue,
       cogs,
       profit,
