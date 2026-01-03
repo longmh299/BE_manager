@@ -2,7 +2,7 @@ name: neon-db-backup
 
 on:
   schedule:
-    # 02:00 giờ VN (UTC+7) = 19:00 UTC (ngày hôm trước)
+    # 02:00 VN (UTC+7) = 19:00 UTC (ngày hôm trước)
     - cron: "0 19 * * *"
   workflow_dispatch:
 
@@ -22,12 +22,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ -z "${NEON_DATABASE_URL:-}" ]; then
+            echo "❌ NEON_DATABASE_URL is empty"
+            exit 1
+          fi
+
           TS=$(date -u +"%Y-%m-%dT%H%M%SZ")
           FILE="neon_${TS}.dump"
 
-          # dùng pg_dump 17 để match server PG 17.x
+          # Force SSL bằng env (tránh lỗi sslmode dính dấu quote trong URL)
           docker run --rm \
             -e NEON_DATABASE_URL="$NEON_DATABASE_URL" \
+            -e PGSSLMODE="require" \
             -v "$PWD:/work" -w /work \
             postgres:17 \
             bash -lc 'pg_dump -Fc -v -d "$NEON_DATABASE_URL" -f "'"$FILE"'"'
