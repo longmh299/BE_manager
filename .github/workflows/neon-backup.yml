@@ -2,7 +2,8 @@ name: neon-db-backup
 
 on:
   schedule:
-    # 02:00 VN (UTC+7) = 19:00 UTC (ngày hôm trước)
+    # GitHub Actions schedule chạy theo UTC
+    # 02:00 giờ VN (UTC+7) = 19:00 UTC (ngày hôm trước)
     - cron: "0 19 * * *"
   workflow_dispatch:
 
@@ -23,16 +24,18 @@ jobs:
           set -euo pipefail
 
           if [ -z "${NEON_DATABASE_URL:-}" ]; then
-            echo "❌ NEON_DATABASE_URL is empty"
+            echo "❌ NEON_DATABASE_URL is empty. Check repo secret name/value."
             exit 1
           fi
+
+          # ✅ trim newline/CR trong secret để tránh lỗi kiểu "neondb\n"
+          NEON_DATABASE_URL_CLEAN="$(printf %s "$NEON_DATABASE_URL" | tr -d '\r\n')"
 
           TS=$(date -u +"%Y-%m-%dT%H%M%SZ")
           FILE="neon_${TS}.dump"
 
-          # Force SSL bằng env (tránh lỗi sslmode dính dấu quote trong URL)
           docker run --rm \
-            -e NEON_DATABASE_URL="$NEON_DATABASE_URL" \
+            -e NEON_DATABASE_URL="$NEON_DATABASE_URL_CLEAN" \
             -e PGSSLMODE="require" \
             -v "$PWD:/work" -w /work \
             postgres:17 \
