@@ -1,3 +1,4 @@
+/** src/services/revenue.service.ts **/
 import { PrismaClient, Prisma, InvoiceStatus, InvoiceType } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -57,7 +58,7 @@ function n(x: any): number {
   return Number.isFinite(v) ? v : 0;
 }
 
-function revenueSign(t: InvoiceType) {
+function revenueSign(t: InvoiceType | string) {
   if (t === "SALES") return 1;
   if (t === "SALES_RETURN") return -1;
   return 0;
@@ -112,6 +113,28 @@ export type StaffInvoiceRow = {
   dsNet: number;
 };
 
+/** =========================
+ * calcNetSafe
+ * Fix case: subtotal=0, tax=0, sum(lines)=0 nhưng total>0 => NET = total
+ * ========================= */
+function calcNetSafe(params: { subtotalRaw: number; tax: number; total: number; lineNetSum: number }): number {
+  const { subtotalRaw, tax, total, lineNetSum } = params;
+
+  // trường hợp lệch: subtotal+tax != total => ưu tiên total-tax
+  if (total > 0 && tax > 0 && Math.abs(subtotalRaw + tax - total) > 0.01) {
+    return Math.max(total - tax, 0);
+  }
+
+  if (subtotalRaw > 0) return subtotalRaw;
+
+  if (lineNetSum > 0) return lineNetSum;
+
+  // ✅ fallback cuối: nếu có total thì lấy total-tax (tax có thể =0 => net=total)
+  if (total > 0) return Math.max(total - tax, 0);
+
+  return 0;
+}
+
 /** =========================================================
  * getStaffPersonalRevenue
  * ✅ tính doanh số theo ds_date (ngày đủ need) giống popup
@@ -157,7 +180,7 @@ async function getStaffPersonalRevenue(params: {
             WHEN COALESCE(i."subtotal",0) > 0
               THEN COALESCE(i."subtotal",0)
             ELSE (
-              SELECT COALESCE(SUM(il."amount"),0)
+              SELECT COALESCE(NULLIF(SUM(il."amount"),0), COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
               FROM "InvoiceLine" il
               WHERE il."invoiceId" = i."id"
             )
@@ -300,7 +323,7 @@ async function getStaffInvoices(params: {
             WHEN COALESCE(i."subtotal",0) > 0
               THEN COALESCE(i."subtotal",0)
             ELSE (
-              SELECT COALESCE(SUM(il."amount"),0)
+              SELECT COALESCE(NULLIF(SUM(il."amount"),0), COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
               FROM "InvoiceLine" il
               WHERE il."invoiceId" = i."id"
             )
@@ -426,79 +449,113 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   const trunc = groupBy === "month" ? "month" : groupBy === "week" ? "week" : "day";
 
   /** ========================= KPI company =========================
-   * ✅ FIX: lọc theo issueDate (ngày hoá đơn), không lọc theo approvedAt
-   * approvedAt chỉ để đảm bảo hoá đơn đã duyệt
+   * ✅ Lọc theo issueDate (ngày hoá đơn)
+   * ✅ Trả thêm breakdown SALES vs SALES_RETURN
+   * ✅ Trả grossCollected + alias để FE pick chắc chắn
    * ============================================================ */
-  const invWhere: Prisma.InvoiceWhereInput = {
-    status: InvoiceStatus.APPROVED,
-    type: { in: [InvoiceType.SALES, InvoiceType.SALES_RETURN] },
-    approvedAt: { not: null },
+
+  // Dùng SQL để lấy line sum luôn (tránh NET=0 khi subtotal=0, lines=0 nhưng total>0)
+  type KpiInvRow = {
+    id: string;
+    type: any;
+    subtotal_raw: any;
+    tax: any;
+    total: any;
+    paid_gross: any;
+    line_net_sum: any;
   };
 
-  if (from || to) {
-    invWhere.issueDate = {};
-    if (from) (invWhere.issueDate as any).gte = from;
-    if (to) (invWhere.issueDate as any).lte = to;
-  }
+  const invRows: KpiInvRow[] = await prisma.$queryRaw`
+    SELECT
+      i."id" AS id,
+      i."type" AS type,
+      COALESCE(i."subtotal",0) AS subtotal_raw,
+      COALESCE(i."tax",0)      AS tax,
+      COALESCE(i."total",0)    AS total,
+      COALESCE(i."paidAmount",0) AS paid_gross,
+      (
+        SELECT COALESCE(SUM(il."amount"),0)
+        FROM "InvoiceLine" il
+        WHERE il."invoiceId" = i."id"
+      ) AS line_net_sum
+    FROM "Invoice" i
+    WHERE
+      i."status" = ${INV_STATUS_APPROVED}
+      AND i."type" IN (${INV_TYPE_SALES}, ${INV_TYPE_SALES_RETURN})
+      AND i."approvedAt" IS NOT NULL
+      ${sqlIf(from, Prisma.sql`AND i."issueDate" >= ${from}`)}
+      ${sqlIf(to, Prisma.sql`AND i."issueDate" <= ${to}`)}
+      ${sqlIf(q.receiveAccountId, Prisma.sql`AND i."receiveAccountId" = ${q.receiveAccountId}`)}
+      ${sqlIf(q.staffRole === "SALE" && q.staffUserId, Prisma.sql`AND i."saleUserId" = ${q.staffUserId}`)}
+      ${sqlIf(q.staffRole === "TECH" && q.staffUserId, Prisma.sql`AND i."techUserId" = ${q.staffUserId}`)}
+  `;
 
-  if (q.receiveAccountId) invWhere.receiveAccountId = q.receiveAccountId;
+  // breakdown
+  let salesNet = 0,
+    salesVat = 0,
+    salesGross = 0,
+    salesCollectedNet = 0,
+    salesCollectedGross = 0;
 
-  if (q.staffRole && q.staffUserId) {
-    if (q.staffRole === "SALE") invWhere.saleUserId = q.staffUserId;
-    if (q.staffRole === "TECH") invWhere.techUserId = q.staffUserId;
-  }
+  let returnNet = 0,
+    returnVat = 0,
+    returnGross = 0,
+    returnCollectedNet = 0,
+    returnCollectedGross = 0;
 
-  const invRows = await prisma.invoice.findMany({
-    where: invWhere,
-    select: {
-      id: true,
-      type: true,
-      subtotal: true,
-      tax: true,
-      total: true,
-      paidAmount: true, // ✅ giả định đây là số tiền đã thu NORMAL (gross)
-    },
-  });
-
+  // tổng signed (để tương thích FE cũ)
   let netRevenue = 0;
   let netVat = 0;
   let netTotal = 0;
-
-  // ✅ cũ: quy đổi về NET
   let netCollected = 0;
-
-  // ✅ NEW: tiền thực thu (GROSS) — không quy đổi
   let grossCollected = 0;
 
-  for (const r of invRows) {
-    const s = revenueSign(r.type);
-    const subtotalRaw = n(r.subtotal);
+  for (const r of invRows || []) {
+    const type = String(r.type);
+    const s = revenueSign(type);
+
+    const subtotalRaw = n(r.subtotal_raw);
     const tax = n(r.tax);
     const total = n(r.total);
-    const paidGross = n(r.paidAmount);
+    const paidGross = n(r.paid_gross);
+    const lineNetSum = n(r.line_net_sum);
 
-    let subtotalNet = subtotalRaw;
-    if (total > 0 && tax > 0 && Math.abs(subtotalRaw + tax - total) > 0.01) {
-      subtotalNet = Math.max(total - tax, 0);
-    }
+    const subtotalNet = calcNetSafe({ subtotalRaw, tax, total, lineNetSum });
 
+    // signed totals (cũ)
     netRevenue += s * subtotalNet;
     netVat += s * tax;
     netTotal += s * total;
 
-    // ✅ NEW: grossCollected = tiền thu thực tế (không quy đổi)
+    // collected gross signed
     grossCollected += s * paidGross;
 
-    // ✅ giữ lại netCollected để tương thích chỗ khác (nếu còn dùng)
+    // collected net (quy đổi theo tỷ lệ net/total)
     const paidNet = total > 0 ? paidGross * (subtotalNet / total) : 0;
     netCollected += s * paidNet;
+
+    // breakdown (luôn trả dương cho RETURN để FE show "Tổng tiền trả" dễ)
+    if (type === "SALES") {
+      salesNet += subtotalNet;
+      salesVat += tax;
+      salesGross += total;
+
+      salesCollectedGross += paidGross;
+      salesCollectedNet += paidNet;
+    } else if (type === "SALES_RETURN") {
+      returnNet += subtotalNet;
+      returnVat += tax;
+      returnGross += total;
+
+      returnCollectedGross += paidGross;
+      returnCollectedNet += paidNet;
+    }
   }
 
-  // ✅ FIX: Số hoá đơn = chỉ count SALES
-  const orderCount = invRows.filter((x) => x.type === InvoiceType.SALES).length;
+  const orderCount = (invRows || []).length;
 
   /** ========================= COGS =========================
-   * ✅ FIX: lọc theo issueDate
+   * ✅ lọc theo issueDate
    * ======================================================== */
   const cogsAgg: Array<{ cogs: any }> = await prisma.$queryRaw`
     SELECT COALESCE(SUM(
@@ -527,7 +584,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   const marginPct = netRevenue !== 0 ? (grossProfit / netRevenue) * 100 : 0;
 
   /** ========================= Trend =========================
-   * ✅ FIX: trục thời gian = issueDate
+   * ✅ trục thời gian = issueDate
    * ======================================================== */
   const trend: Array<{ t: any; revenue: any; cogs: any }> = await prisma.$queryRaw`
     WITH inv AS (
@@ -538,16 +595,19 @@ export async function getRevenueDashboard(q: RevenueQuery) {
         COALESCE(i."subtotal",0) AS subtotal_raw,
         COALESCE(i."tax",0)      AS tax_raw,
         COALESCE(i."total",0)    AS total,
-        i."saleUserId",
-        i."techUserId",
-        i."receiveAccountId",
         (
           CASE
             WHEN COALESCE(i."total",0) > 0
                  AND COALESCE(i."tax",0) > 0
                  AND ABS((COALESCE(i."subtotal",0) + COALESCE(i."tax",0)) - COALESCE(i."total",0)) > 0.01
               THEN GREATEST(COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
-            ELSE COALESCE(i."subtotal",0)
+            WHEN COALESCE(i."subtotal",0) > 0
+              THEN COALESCE(i."subtotal",0)
+            ELSE (
+              SELECT COALESCE(NULLIF(SUM(il."amount"),0), COALESCE(i."total",0) - COALESCE(i."tax",0), 0)
+              FROM "InvoiceLine" il
+              WHERE il."invoiceId" = i."id"
+            )
           END
         ) AS subtotal_net
       FROM "Invoice" i
@@ -610,7 +670,7 @@ export async function getRevenueDashboard(q: RevenueQuery) {
   });
 
   /** ========================= By Product =========================
-   * ✅ FIX: lọc theo issueDate + có qty signed
+   * ✅ lọc theo issueDate + có qty signed
    * ============================================================= */
   const byProduct: Array<{ itemId: string; name: string; qty: any; revenue: any; cogs: any }> = await prisma.$queryRaw`
     WITH inv AS (
@@ -753,20 +813,35 @@ export async function getRevenueDashboard(q: RevenueQuery) {
 
   return {
     kpis: {
+      // tổng signed (FE đang dùng)
       netRevenue,
       grossProfit,
       marginPct,
       orderCount,
       netVat,
       netTotal,
-
-      // ✅ giữ lại để tương thích cũ
       netCollected,
-
-      // ✅ NEW: FE sẽ dùng cái này cho KPI "Đã thu"
-      grossCollected,
-
       netCogs,
+
+      // ✅ grossCollected + alias keys để FE pick chắc chắn
+      grossCollected,
+      collectedGross: grossCollected,
+      paidGross: grossCollected,
+      paidTotal: grossCollected,
+      totalCollected: grossCollected,
+
+      // ✅ breakdown để FE show “Tổng tiền trả”
+      salesNet,
+      salesVat,
+      salesGross,
+      salesCollectedNet,
+      salesCollectedGross,
+
+      returnNet,
+      returnVat,
+      returnGross,
+      returnCollectedNet,
+      returnCollectedGross,
     },
     trend: trendOut,
     byProduct: byProductOut,

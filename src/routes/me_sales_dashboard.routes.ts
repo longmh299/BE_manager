@@ -110,7 +110,10 @@ type CustomerAgg = {
 type InvoiceListRow = {
   invoiceId: string;
   invoiceCode: string;
-  issueDate: string; // dd/MM/yyyy
+
+  // ✅ giữ issueDate để hiển thị (dd/MM/yyyy)
+  issueDate: string;
+
   partnerId: string | null;
   customerName: string;
 
@@ -167,17 +170,24 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
 
   const { start, endExclusive } = monthRangeUTC(year, month);
 
-  // 1) Load invoices (APPROVED SALES) for this SALE user in selected month
+  /**
+   * ✅ IMPORTANT FIX
+   * Dashboard theo "tháng chốt doanh thu" => lọc theo approvedAt
+   * (tránh lệch TZ issueDate + đúng logic doanh thu)
+   */
   const invoices = await prisma.invoice.findMany({
     where: {
       status: InvoiceStatus.APPROVED,
       type: InvoiceType.SALES,
       saleUserId: me.id,
-      issueDate: { gte: start, lt: endExclusive },
+
+      approvedAt: { not: null, gte: start, lt: endExclusive },
     },
     select: {
       id: true,
       code: true,
+
+      approvedAt: true,
       issueDate: true,
 
       partnerId: true,
@@ -211,7 +221,7 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
         select: { status: true }, // OPEN | PAID | VOID
       },
     },
-    orderBy: { issueDate: "asc" },
+    orderBy: { approvedAt: "desc" },
   });
 
   if (!invoices.length) {
@@ -326,7 +336,9 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
     return {
       invoiceId: String(inv.id),
       invoiceCode: String(inv.code),
-      issueDate: formatDateVN(new Date(inv.issueDate)),
+
+      // ✅ hiển thị theo issueDate (nếu null thì fallback approvedAt)
+      issueDate: formatDateVN(new Date(inv.issueDate || inv.approvedAt)),
 
       partnerId: inv.partnerId ? String(inv.partnerId) : null,
       customerName,
@@ -367,10 +379,10 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
       return pa < pb ? 1 : -1;
     });
 
-  // 4) Trend by issueDate (sum subtotal per day) ✅ NET
+  // 4) Trend by approvedAt (sum subtotal per day) ✅ NET (giữ nhất quán với filter)
   const trendMap = new Map<string, number>();
   for (const inv of invoices as any[]) {
-    const k = ymd(new Date(inv.issueDate));
+    const k = ymd(new Date(inv.approvedAt));
     trendMap.set(k, (trendMap.get(k) || 0) + num(inv.subtotal));
   }
 
