@@ -1,0 +1,51 @@
+name: neon-db-backup
+
+on:
+  schedule:
+    # GitHub Actions schedule chạy theo UTC
+    # 02:00 giờ VN (UTC+7) = 19:00 UTC (ngày hôm trước)
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: neon-db-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Dump database (pg_dump v17 via Docker)
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${NEON_DATABASE_URL:-}" ]; then
+            echo "❌ NEON_DATABASE_URL is empty. Check repo secret name/value."
+            exit 1
+          fi
+
+          # ✅ trim newline/CR trong secret để tránh lỗi kiểu "neondb\n"
+          NEON_DATABASE_URL_CLEAN="$(printf %s "$NEON_DATABASE_URL" | tr -d '\r\n')"
+
+          TS=$(date -u +"%Y-%m-%dT%H%M%SZ")
+          FILE="neon_${TS}.dump"
+
+          docker run --rm \
+            -e NEON_DATABASE_URL="$NEON_DATABASE_URL_CLEAN" \
+            -e PGSSLMODE="require" \
+            -v "$PWD:/work" -w /work \
+            postgres:17 \
+            bash -lc 'pg_dump -Fc -v -d "$NEON_DATABASE_URL" -f "'"$FILE"'"'
+
+          ls -lh "$FILE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-backup
+          path: neon_*.dump
+          retention-days: 14
