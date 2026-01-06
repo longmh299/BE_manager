@@ -24,11 +24,26 @@ function friendlyPrismaError(e: any) {
   if (e instanceof Prisma.PrismaClientKnownRequestError) {
     if (e.code === "P2002") {
       const target = (e.meta as any)?.target;
-      if (Array.isArray(target) && target.includes("name")) {
+
+      // target có thể là string[] hoặc string tuỳ Prisma version
+      const targets: string[] = Array.isArray(target)
+        ? target
+        : typeof target === "string"
+          ? [target]
+          : [];
+
+      if (targets.includes("sku")) {
+        const err: any = new Error("Mã máy (SKU) đã tồn tại");
+        err.statusCode = 409;
+        return err;
+      }
+
+      if (targets.includes("name")) {
         const err: any = new Error("Tên sản phẩm đã tồn tại");
         err.statusCode = 409;
         return err;
       }
+
       const err: any = new Error("Dữ liệu bị trùng (unique constraint)");
       err.statusCode = 409;
       return err;
@@ -93,7 +108,7 @@ r.post("/", requireRole("accountant", "admin"), async (req, res, next) => {
 
 /**
  * PATCH /api/items/:id/master (admin-only)
- * - dành riêng cho UI admin sửa nhanh name + unit
+ * - dành riêng cho UI admin sửa nhanh sku + name + unit
  */
 r.patch("/:id/master", requireRole("admin"), async (req, res, next) => {
   try {

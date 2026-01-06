@@ -235,12 +235,19 @@ export async function updateItem(id: string, body: any, actor?: Actor) {
 /**
  * ===========================================
  * UPDATE ITEM MASTER (admin UI)
- * - chỉ cho update name + unitId/unitCode
- * - KHÔNG đụng price/sellPrice/kind/isSerialized/sku để ít ảnh hưởng
+ * - cho phép admin sửa nhanh: sku + name + unitId/unitCode
+ * - KHÔNG đụng price/sellPrice/kind/isSerialized để ít ảnh hưởng
  * ===========================================
  */
 export async function updateItemMaster(id: string, body: any) {
   const data: any = {};
+
+  // ✅ NEW: cho phép sửa SKU
+  if (body?.sku !== undefined) {
+    const sku = String(body?.sku ?? "").trim();
+    if (!sku) throw httpError(400, "Mã sản phẩm (SKU) không được rỗng");
+    data.sku = sku;
+  }
 
   if (body?.name !== undefined) {
     const name = String(body?.name ?? "").trim();
