@@ -582,6 +582,74 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
     },
   });
 }
+async function applyPaymentFromBodyOnDraftUpdate(
+  tx: Prisma.TransactionClient,
+  invoiceId: string,
+  body: any,
+  auditCtx?: AuditCtx
+) {
+  // chỉ nhận cho SALES / PURCHASE
+  const inv = await tx.invoice.findUnique({
+    where: { id: invoiceId },
+    select: {
+      id: true,
+      type: true,
+      status: true,
+      issueDate: true,
+      partnerId: true,
+      receiveAccountId: true,
+      code: true,
+    },
+  });
+  if (!inv) throw httpError(404, "Invoice not found");
+
+  // chỉ DRAFT mới xử lý
+  if (inv.status !== "DRAFT") return;
+
+  // return types: không tạo payment
+  if (inv.type === "SALES_RETURN" || inv.type === "PURCHASE_RETURN") return;
+
+  // UI fields
+  const paymentStatus = body?.paymentStatus as PaymentStatus | undefined;
+  const paidRaw = parseOptionalNumber(body?.paidAmount);
+  const paid = roundMoney(paidRaw ?? 0);
+
+  // nếu user set UNPAID hoặc không nhập gì -> bỏ qua
+  if (!paymentStatus || paymentStatus === "UNPAID") return;
+  if (paid <= 0) return;
+
+  // bắt buộc có partnerId
+  if (!inv.partnerId) {
+    throw httpError(400, "Muốn ghi nhận thanh toán cần chọn khách hàng (partner).");
+  }
+
+  // 🔥 Chặn tạo payment trùng liên tục khi user bấm Save nhiều lần:
+  // Nếu đã có allocations NORMAL > 0 thì thôi (đã ghi nhận rồi)
+  const agg = await tx.paymentAllocation.aggregate({
+    where: { invoiceId, kind: "NORMAL" },
+    _sum: { amount: true },
+  });
+  const sumSigned = toNum(agg._sum.amount);
+
+  const alreadyPaid =
+    inv.type === "PURCHASE" ? Math.max(0, -sumSigned) : Math.max(0, sumSigned);
+
+  // nếu đã có ghi nhận >= paid user nhập -> không tạo nữa
+  if (alreadyPaid + 0.0001 >= paid) return;
+
+  // còn thiếu => tạo thêm payment phần thiếu
+  const delta = roundMoney(paid - alreadyPaid);
+  if (delta <= 0) return;
+
+  await createInitialPaymentIfNeeded(tx, invoiceId, {
+    paidAmount: delta,
+    issueDate: inv.issueDate ?? new Date(),
+    partnerId: inv.partnerId,
+    receiveAccountId: inv.receiveAccountId,
+    createdById: body.updatedById ?? auditCtx?.userId ?? null,
+    note: body.initialPaymentNote ?? `Thu/chi khi cập nhật HĐ ${inv.code}`,
+  });
+}
 
 /**
  * Nếu lúc tạo invoice có paidAmount > 0 => tạo Payment + Allocation
@@ -1800,15 +1868,21 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
           });
         }
 
-        if (
-          Array.isArray(body.lines) ||
-          body.hasWarrantyHold !== undefined ||
-          body.warrantyHoldPct !== undefined ||
-          body.warrantyHoldAmount !== undefined ||
-          changedTotals
-        ) {
-          await syncInvoicePaidFromAllocations(tx, id);
-        }
+        // ✅ Nếu user chỉnh thanh toán trên UI (paymentStatus/paidAmount) thì auto tạo Payment+Allocation
+await applyPaymentFromBodyOnDraftUpdate(tx, id, body, auditCtx);
+
+if (
+  Array.isArray(body.lines) ||
+  body.hasWarrantyHold !== undefined ||
+  body.warrantyHoldPct !== undefined ||
+  body.warrantyHoldAmount !== undefined ||
+  changedTotals ||
+  body.paymentStatus !== undefined ||
+  body.paidAmount !== undefined
+) {
+  await syncInvoicePaidFromAllocations(tx, id);
+}
+
 
         const after = await getInvoiceAuditSnapshot(tx, id);
         await auditLog(tx, {
