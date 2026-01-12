@@ -62,6 +62,25 @@ async function allocateInvoiceCode(
   if (INVOICE_CODE_PAD > 0) return String(usedNo).padStart(INVOICE_CODE_PAD, "0");
   return String(usedNo);
 }
+async function allocateInvoiceCodeMaxPlusOne(
+  tx: Prisma.TransactionClient,
+  year: number,
+  type: InvoiceType
+): Promise<string> {
+  const rows = await tx.$queryRaw<Array<{ max: number | null }>>`
+    SELECT MAX(CAST(code AS INT)) as max
+    FROM "Invoice"
+    WHERE "codeYear" = ${year}
+      AND "type" = ${type}::"InvoiceType"
+      AND code ~ '^[0-9]+$'
+  `;
+
+  const maxNo = rows?.[0]?.max ?? 0;
+  const nextNo = maxNo + 1;
+
+  if (INVOICE_CODE_PAD > 0) return String(nextNo).padStart(INVOICE_CODE_PAD, "0");
+  return String(nextNo);
+}
 
 async function ensureWarehouse(warehouseId?: string) {
   if (warehouseId) {
@@ -1364,6 +1383,9 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
               })()
             : null;
 
+        // ============================================================
+        // ✅ INVOICE CODE: input or auto MAX(code)+1 (Postgres/Neon)
+        // ============================================================
         const codeYear = issueDate.getFullYear();
         let invoiceCode: string;
 
@@ -1373,65 +1395,102 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
           }
           invoiceCode = inputCode;
         } else {
-          invoiceCode = await allocateInvoiceCode(tx, codeYear, type);
+          invoiceCode = "";
         }
 
-        const inv = await tx.invoice.create({
-          data: {
-            code: invoiceCode,
-            codeYear,
-            type,
-            issueDate,
+        // ✅ create invoice with retry (race condition)
+        let inv: any = null;
 
-            partnerId: body.partnerId ?? null,
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const codeToUse = inputCode
+            ? invoiceCode
+            : await allocateInvoiceCodeMaxPlusOne(tx, codeYear, type);
 
-            saleUserId: body.saleUserId ?? null,
-            techUserId: body.techUserId ?? null,
+          try {
+            inv = await tx.invoice.create({
+              data: {
+                code: codeToUse,
+                codeYear,
+                type,
+                issueDate,
 
-            refInvoiceId:
-              type === "SALES_RETURN"
-                ? String(body.refInvoiceId).trim()
-                : body.refInvoiceId ?? null,
+                partnerId: body.partnerId ?? null,
 
-            receiveAccountId,
-            note: body.note ?? "",
+                saleUserId: body.saleUserId ?? null,
+                techUserId: body.techUserId ?? null,
 
-            partnerName: body.partnerName ?? null,
-            partnerPhone: body.partnerPhone ?? null,
-            partnerTax: body.partnerTax ?? null,
-            partnerAddr: body.partnerAddr ?? null,
+                refInvoiceId:
+                  type === "SALES_RETURN"
+                    ? String(body.refInvoiceId).trim()
+                    : body.refInvoiceId ?? null,
 
-            currency: body.currency ?? "VND",
+                receiveAccountId,
+                note: body.note ?? "",
 
-            subtotal: new Prisma.Decimal(subtotal),
-            tax: new Prisma.Decimal(effectiveTax),
-            total: new Prisma.Decimal(effectiveTotal),
+                partnerName: body.partnerName ?? null,
+                partnerPhone: body.partnerPhone ?? null,
+                partnerTax: body.partnerTax ?? null,
+                partnerAddr: body.partnerAddr ?? null,
 
-            returnedSubtotal: new Prisma.Decimal(0),
-            returnedTax: new Prisma.Decimal(0),
-            returnedTotal: new Prisma.Decimal(0),
+                currency: body.currency ?? "VND",
 
-            netSubtotal: new Prisma.Decimal(subtotal),
-            netTax: new Prisma.Decimal(effectiveTax),
-            netTotal: new Prisma.Decimal(effectiveTotal),
+                subtotal: new Prisma.Decimal(subtotal),
+                tax: new Prisma.Decimal(effectiveTax),
+                total: new Prisma.Decimal(effectiveTotal),
 
-            // ✅ return types always start unpaid/0 (refund goes via /payments to origin)
-            paymentStatus: "UNPAID",
-            paidAmount: new Prisma.Decimal(0),
+                returnedSubtotal: new Prisma.Decimal(0),
+                returnedTax: new Prisma.Decimal(0),
+                returnedTotal: new Prisma.Decimal(0),
 
-            hasWarrantyHold: type === "SALES" ? hasWarrantyHold : false,
-            warrantyHoldPct: new Prisma.Decimal(type === "SALES" ? holdCalc.pct : 0),
-            warrantyHoldAmount: new Prisma.Decimal(type === "SALES" ? holdCalc.holdAmount : 0),
-            warrantyDueDate: type === "SALES" ? due : null,
+                netSubtotal: new Prisma.Decimal(subtotal),
+                netTax: new Prisma.Decimal(effectiveTax),
+                netTotal: new Prisma.Decimal(effectiveTotal),
 
-            status: "DRAFT",
+                // ✅ return types always start unpaid/0 (refund goes via /payments to origin)
+                paymentStatus: "UNPAID",
+                paidAmount: new Prisma.Decimal(0),
 
-            cancelledAt: null,
-            cancelledById: null,
-            cancelReason: null,
-          } as any,
-        });
+                hasWarrantyHold: type === "SALES" ? hasWarrantyHold : false,
+                warrantyHoldPct: new Prisma.Decimal(type === "SALES" ? holdCalc.pct : 0),
+                warrantyHoldAmount: new Prisma.Decimal(type === "SALES" ? holdCalc.holdAmount : 0),
+                warrantyDueDate: type === "SALES" ? due : null,
 
+                status: "DRAFT",
+
+                cancelledAt: null,
+                cancelledById: null,
+                cancelReason: null,
+              } as any,
+            });
+
+            invoiceCode = codeToUse;
+            break;
+          } catch (e: any) {
+            // inputCode mà trùng -> fail
+            if (inputCode) handleUniqueInvoiceError(e);
+
+            // auto gen mà trùng do concurrency -> retry
+            if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+              const target = (e.meta as any)?.target;
+              const targetStr = Array.isArray(target) ? target.join(",") : String(target || "");
+              if (targetStr.includes("code")) {
+                if (attempt < 3) continue;
+                throw httpError(
+                  409,
+                  "Không thể cấp mã hoá đơn tự động do xung đột đồng thời. Vui lòng thử lại."
+                );
+              }
+            }
+
+            throw e;
+          }
+        }
+
+        if (!inv) throw httpError(500, "Không tạo được hoá đơn.");
+
+        // ============================================================
+        // Lines
+        // ============================================================
         await tx.invoiceLine.createMany({
           data: validLines.map((l) => {
             const amount = l.qty * l.price;
@@ -1503,6 +1562,7 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
     handleUniqueInvoiceError(e);
   }
 }
+
 
 /**
  * Update invoice + replace lines
