@@ -25,8 +25,11 @@ import paymentAccountsRoutes from './routes/paymentAccounts.routes';
 import revenueRoutes from './routes/revenue.routes';
 import receivablesReportRoute from'./routes/receivables_report.route';
 import { errorHandler } from './middlewares/errorHandler';
-import meSalesDashboardRoutes from'./routes/me_sales_dashboard.routes'
-import auditLogsRouter from'./routes/auditLogs.routes'
+import meSalesDashboardRoutes from'./routes/me_sales_dashboard.routes';
+import auditLogsRouter from'./routes/auditLogs.routes';
+import invoiceStatusRoutes from'./routes/Invoice.Status'
+import assistantAlertsRoute from "./routes/assistant.alerts.routes";
+
 const app = express();
 
 // ================== CORS CONFIG (đơn giản) ==================
@@ -86,10 +89,14 @@ api.use('/assets', assetRoutes);
 api.use('/invoices', invoiceRoutes);
 api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
+app.use("/api/assistant/alerts", assistantAlertsRoute);
+api.use("/invoices", invoiceStatusRoutes);
 
 // ✅ Reports: mount chung prefix /reports
 api.use('/reports', reportsRouter);
 api.use('/reports', stockInOutReportRoutes); // ✅ ADD (endpoint /api/reports/stock-inout)
+// api.use("/assistant", assistantRoute); // ✅ nằm trong Router /api
+// hoặc: app.use("/api/assistant", assistantRoute);
 
 api.use('/locks', locksRoutes);
 api.use("/payment-accounts", paymentAccountsRoutes);
@@ -103,6 +110,7 @@ app.use("/api/revenue", revenueRoutes);
 app.use("/api/receivables_report", receivablesReportRoute);
 app.use("/api/me", meSalesDashboardRoutes);
 app.use("/api/audit-logs", auditLogsRouter);
+// app.use("/assistant", assistantRoute);
 
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
