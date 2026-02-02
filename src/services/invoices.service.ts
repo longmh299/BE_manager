@@ -9,7 +9,7 @@ import {
 } from "@prisma/client";
 import { auditLog, type AuditCtx } from "./audit.service";
 import { ensureWarrantyHoldOnApprove } from "./warrantyHold.service";
-import { ensureDateNotLocked } from "./periodLock.service"; // ✅ NEW: period lock
+import { ensureDateNotLocked } from "./periodLock.service"; // ✅ period lock
 
 const prisma = new PrismaClient();
 
@@ -62,6 +62,7 @@ async function allocateInvoiceCode(
   if (INVOICE_CODE_PAD > 0) return String(usedNo).padStart(INVOICE_CODE_PAD, "0");
   return String(usedNo);
 }
+
 async function allocateInvoiceCodeMaxPlusOne(
   tx: Prisma.TransactionClient,
   year: number,
@@ -89,6 +90,19 @@ async function ensureWarehouse(warehouseId?: string) {
     return w;
   }
   const warehouses = await prisma.location.findMany({ where: { kind: "warehouse" } });
+  if (warehouses.length === 0) throw new Error("No warehouse found");
+  if (warehouses.length > 1)
+    throw new Error("Multiple warehouses detected. Please specify warehouseId.");
+  return warehouses[0];
+}
+
+async function ensureWarehouseTx(tx: Prisma.TransactionClient, warehouseId?: string) {
+  if (warehouseId) {
+    const w = await tx.location.findUnique({ where: { id: warehouseId } });
+    if (!w) throw new Error("Warehouse not found");
+    return w;
+  }
+  const warehouses = await tx.location.findMany({ where: { kind: "warehouse" } });
   if (warehouses.length === 0) throw new Error("No warehouse found");
   if (warehouses.length > 1)
     throw new Error("Multiple warehouses detected. Please specify warehouseId.");
@@ -506,9 +520,6 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
   const sumNormalSigned = toNum(agg._sum.amount); // signed sum
 
   // ✅ FIX BUG PURCHASE:
-  // - SALES: allocation dương = đã thu
-  // - PURCHASE: allocation âm = đã chi
-  // => paidAmount trên invoice phải là số dương biểu thị "đã thu/đã chi"
   const paidNormalNet =
     inv.type === "PURCHASE" ? Math.max(0, -sumNormalSigned) : Math.max(0, sumNormalSigned);
 
@@ -520,7 +531,7 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
   const netSubtotal = toNum((inv as any).netSubtotal);
   const netTotal = toNum((inv as any).netTotal);
 
-  // ✅ FIX: FULL RETURN => netTotal = 0 => phải là PAID (đã tất toán), không phải UNPAID
+  // ✅ FIX: FULL RETURN => netTotal = 0 => phải là PAID
   if (inv.type === "SALES" && netTotal <= 0.0001) {
     await tx.invoice.update({
       where: { id: invoiceId },
@@ -552,7 +563,6 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
     holdPct = calc.pct;
     holdAmount = calc.holdAmount;
   } else {
-    // PURCHASE: collectible = total
     collectible = total;
   }
 
@@ -582,6 +592,7 @@ async function syncInvoicePaidFromAllocations(tx: Prisma.TransactionClient, invo
     },
   });
 }
+
 async function applyPaymentFromBodyOnDraftUpdate(
   tx: Prisma.TransactionClient,
   invoiceId: string,
@@ -623,21 +634,17 @@ async function applyPaymentFromBodyOnDraftUpdate(
     throw httpError(400, "Muốn ghi nhận thanh toán cần chọn khách hàng (partner).");
   }
 
-  // 🔥 Chặn tạo payment trùng liên tục khi user bấm Save nhiều lần:
-  // Nếu đã có allocations NORMAL > 0 thì thôi (đã ghi nhận rồi)
+  // 🔥 Chặn tạo payment trùng liên tục khi user bấm Save nhiều lần
   const agg = await tx.paymentAllocation.aggregate({
     where: { invoiceId, kind: "NORMAL" },
     _sum: { amount: true },
   });
   const sumSigned = toNum(agg._sum.amount);
 
-  const alreadyPaid =
-    inv.type === "PURCHASE" ? Math.max(0, -sumSigned) : Math.max(0, sumSigned);
+  const alreadyPaid = inv.type === "PURCHASE" ? Math.max(0, -sumSigned) : Math.max(0, sumSigned);
 
-  // nếu đã có ghi nhận >= paid user nhập -> không tạo nữa
   if (alreadyPaid + 0.0001 >= paid) return;
 
-  // còn thiếu => tạo thêm payment phần thiếu
   const delta = roundMoney(paid - alreadyPaid);
   if (delta <= 0) return;
 
@@ -656,7 +663,6 @@ async function applyPaymentFromBodyOnDraftUpdate(
  *
  * ✅ FIX (Option A):
  * - KHÔNG tạo payment lúc tạo SALES_RETURN/PURCHASE_RETURN.
- * - Refund phải đi qua /payments và allocate âm vào SALES gốc.
  */
 async function createInitialPaymentIfNeeded(
   tx: Prisma.TransactionClient,
@@ -932,6 +938,62 @@ function sumQtyByItem(rows: Array<{ itemId: string; qty: number }>) {
   for (const r of rows) map.set(r.itemId, (map.get(r.itemId) || 0) + r.qty);
   return map;
 }
+/** OUT types cần check tồn trước khi lưu/submit/approve */
+function isOutType(t: InvoiceType) {
+  return t === "SALES" || t === "PURCHASE_RETURN";
+}
+
+/**
+ * ✅ NEW: Check tồn kho cho invoice OUT (SALES / PURCHASE_RETURN)
+ * - dùng cho Save (update/create draft), Submit, Admin-save-and-post
+ * - nếu nhiều kho mà không truyền warehouseId => throw 400
+ */
+async function assertEnoughStockForOutInvoiceTx(
+  tx: Prisma.TransactionClient,
+  params: {
+    invoiceType: InvoiceType;
+    lines: Array<{ itemId: string; qty: Prisma.Decimal | number | string }>;
+    warehouseId?: string;
+  }
+) {
+  if (!isOutType(params.invoiceType)) return; // chỉ OUT mới check
+
+  const warehouse = await ensureWarehouseTx(tx, params.warehouseId);
+
+  const qtyByItem = sumQtyByItem(
+    (params.lines || []).map((l) => ({ itemId: String(l.itemId), qty: toNum(l.qty as any) }))
+  );
+  const itemIds = Array.from(qtyByItem.keys());
+  if (!itemIds.length) return;
+
+  const [items, stocks] = await Promise.all([
+    tx.item.findMany({
+      where: { id: { in: itemIds } },
+      select: { id: true, name: true, sku: true },
+    }),
+    tx.stock.findMany({
+      where: { locationId: warehouse.id, itemId: { in: itemIds } },
+      select: { itemId: true, qty: true },
+    }),
+  ]);
+
+  const nameMap = new Map(items.map((it) => [it.id, it.name || it.sku || it.id]));
+  const stockMap = new Map(stocks.map((s) => [s.itemId, toNum(s.qty)]));
+
+  const errors: string[] = [];
+  for (const [itemId, needQty] of qtyByItem.entries()) {
+    const curQty = stockMap.get(itemId);
+    const name = nameMap.get(itemId) ?? itemId;
+
+    if (curQty == null) errors.push(`"${name}" chưa có tồn trong kho để xuất.`);
+    else if (curQty <= 0) errors.push(`"${name}" đã hết hàng.`);
+    else if (curQty < needQty) errors.push(`"${name}" không đủ tồn (còn ${curQty}, cần ${needQty}).`);
+  }
+
+  if (errors.length) {
+    throw httpError(400, `Không thể lưu/gửi duyệt vì thiếu tồn kho: ${errors.join(" ")}`);
+  }
+}
 
 /** helper: fetch invoice full (dùng tx) */
 async function getInvoiceByIdTx(tx: Prisma.TransactionClient | PrismaClient, id: string) {
@@ -1055,12 +1117,10 @@ async function getInvoiceAuditSnapshot(
 /**
  * Apply SALES_RETURN vào hóa đơn SALES gốc
  *
- * ✅ FIX theo rule bạn chốt:
- * - Trả hàng FULL phải trả cả VAT.
- * - Không tin tuyệt đối ret.tax (UI/BE có thể lưu 0), nếu (ret.total != ret.subtotal + ret.tax)
- *   => lấy VAT của phiếu trả = ret.total - ret.subtotal.
- * - Nếu phiếu trả bị lưu thiếu VAT (tax=0, total=subtotal) => tự tính VAT theo VAT của hóa đơn gốc.
- * - Không auto set CANCELLED nữa. "Tag đã trả" sẽ thể hiện bằng returnedTotal/netTotal ở FE.
+ * ✅ Rule chốt:
+ * - FULL return phải trả cả VAT
+ * - Không tin tuyệt đối ret.tax (có thể 0) => normalize
+ * - Nếu thiếu VAT => suy theo VAT của origin
  */
 async function applySalesReturnToOrigin(
   tx: Prisma.TransactionClient,
@@ -1128,17 +1188,16 @@ async function applySalesReturnToOrigin(
   const oTax = roundMoney(toNum(origin.tax));
   const oTotal = roundMoney(toNum(origin.total));
 
-  // --- ✅ normalize return amounts ---
+  // --- normalize return amounts ---
   let rSubtotal = roundMoney(toNum(ret.subtotal));
   let rTax = roundMoney(toNum(ret.tax));
   let rTotal = roundMoney(toNum(ret.total));
 
-  // fallback: nếu total bị 0 nhưng subtotal/tax có => tính lại
   if (rTotal <= 0 && (rSubtotal > 0 || rTax > 0)) {
     rTotal = roundMoney(rSubtotal + rTax);
   }
 
-  // ✅ CORE FIX #1: nếu mismatch thì tin total+subtotal => derive tax = total - subtotal
+  // mismatch => derive tax
   if (rTotal > 0) {
     const diff = roundMoney(rTotal - (rSubtotal + rTax));
     if (Math.abs(diff) > 0.01) {
@@ -1147,7 +1206,7 @@ async function applySalesReturnToOrigin(
     }
   }
 
-  // ✅ CORE FIX #2: nếu phiếu trả bị lưu thiếu VAT (tax ~ 0, total ~ subtotal) nhưng hóa đơn gốc có VAT
+  // thiếu VAT => suy theo origin
   if (rSubtotal > 0.0001 && rTax <= 0.0001 && oTax > 0.0001 && oSubtotal > 0.0001) {
     rTax = computeReturnTaxFromOrigin({
       originSubtotal: oSubtotal,
@@ -1157,12 +1216,10 @@ async function applySalesReturnToOrigin(
     rTotal = roundMoney(rSubtotal + rTax);
   }
 
-  // ensure non-negative
   rSubtotal = Math.max(0, rSubtotal);
   rTax = Math.max(0, rTax);
   rTotal = Math.max(0, roundMoney(rSubtotal + rTax));
 
-  // Basic caps: không cho trả vượt tổng gốc
   const oldReturnedSubtotal = roundMoney(toNum((origin as any).returnedSubtotal));
   const oldReturnedTax = roundMoney(toNum((origin as any).returnedTax));
   const oldReturnedTotal = roundMoney(toNum((origin as any).returnedTotal));
@@ -1175,7 +1232,6 @@ async function applySalesReturnToOrigin(
   const nextNetTax = Math.max(0, roundMoney(oTax - nextReturnedTax));
   const nextNetTotal = Math.max(0, roundMoney(oTotal - nextReturnedTotal));
 
-  // recompute hold theo netSubtotal
   let nextHoldPct = roundPct(toNum(origin.warrantyHoldPct));
   let nextHoldAmount = roundMoney(toNum(origin.warrantyHoldAmount));
 
@@ -1211,7 +1267,6 @@ async function applySalesReturnToOrigin(
     },
   });
 
-  // ✅ sync paid/status theo allocations NORMAL (chỉ trên SALES gốc)
   await syncInvoicePaidFromAllocations(tx, origin.id);
 
   const originAfter = await getInvoiceAuditSnapshot(tx, origin.id);
@@ -1238,12 +1293,150 @@ async function applySalesReturnToOrigin(
         netTax: nextNetTax,
         netTotal: nextNetTotal,
       },
-      normalize: {
-        retSubtotal: toNum(ret.subtotal),
-        retTax: toNum(ret.tax),
-        retTotal: toNum(ret.total),
-        used: { rSubtotal, rTax, rTotal },
-        originRate: oSubtotal > 0 ? oTax / oSubtotal : null,
+    }),
+  });
+}
+
+/**
+ * ✅ NEW: Un-apply SALES_RETURN khỏi hóa đơn SALES gốc (dùng khi reopen return invoice / rollback)
+ */
+async function unapplySalesReturnFromOrigin(
+  tx: Prisma.TransactionClient,
+  params: {
+    returnInvoiceId: string;
+    originInvoiceId: string;
+    actorId: string;
+    auditCtx?: AuditCtx;
+  }
+) {
+  const ret = await tx.invoice.findUnique({
+    where: { id: params.returnInvoiceId },
+    select: { id: true, code: true, type: true, subtotal: true, tax: true, total: true },
+  });
+  if (!ret) throw httpError(404, "Không tìm thấy phiếu trả hàng");
+  if (ret.type !== "SALES_RETURN") throw httpError(400, "Không phải SALES_RETURN");
+
+  const origin = await tx.invoice.findUnique({
+    where: { id: params.originInvoiceId },
+    select: {
+      id: true,
+      code: true,
+      type: true,
+      subtotal: true,
+      tax: true,
+      total: true,
+      returnedSubtotal: true,
+      returnedTax: true,
+      returnedTotal: true,
+      hasWarrantyHold: true,
+      warrantyHoldPct: true,
+      warrantyHoldAmount: true,
+    },
+  });
+  if (!origin) throw httpError(404, "Không tìm thấy hóa đơn gốc");
+  if (origin.type !== "SALES") throw httpError(400, "Hóa đơn gốc không phải SALES");
+
+  const originBefore = await getInvoiceAuditSnapshot(tx, origin.id);
+
+  const oSubtotal = roundMoney(toNum(origin.subtotal));
+  const oTax = roundMoney(toNum(origin.tax));
+  const oTotal = roundMoney(toNum(origin.total));
+
+  // normalize return
+  let rSubtotal = roundMoney(toNum(ret.subtotal));
+  let rTax = roundMoney(toNum(ret.tax));
+  let rTotal = roundMoney(toNum(ret.total));
+
+  if (rTotal <= 0 && (rSubtotal > 0 || rTax > 0)) rTotal = roundMoney(rSubtotal + rTax);
+
+  if (rTotal > 0) {
+    const diff = roundMoney(rTotal - (rSubtotal + rTax));
+    if (Math.abs(diff) > 0.01) rTax = Math.max(0, roundMoney(rTotal - rSubtotal));
+  }
+
+  if (rSubtotal > 0.0001 && rTax <= 0.0001 && oTax > 0.0001 && oSubtotal > 0.0001) {
+    rTax = computeReturnTaxFromOrigin({
+      originSubtotal: oSubtotal,
+      originTax: oTax,
+      returnSubtotal: rSubtotal,
+    });
+    rTotal = roundMoney(rSubtotal + rTax);
+  }
+
+  rSubtotal = Math.max(0, rSubtotal);
+  rTax = Math.max(0, rTax);
+  rTotal = Math.max(0, roundMoney(rSubtotal + rTax));
+
+  const oldReturnedSubtotal = roundMoney(toNum((origin as any).returnedSubtotal));
+  const oldReturnedTax = roundMoney(toNum((origin as any).returnedTax));
+  const oldReturnedTotal = roundMoney(toNum((origin as any).returnedTotal));
+
+  const nextReturnedSubtotal = Math.max(0, roundMoney(oldReturnedSubtotal - rSubtotal));
+  const nextReturnedTax = Math.max(0, roundMoney(oldReturnedTax - rTax));
+  const nextReturnedTotal = Math.max(0, roundMoney(oldReturnedTotal - rTotal));
+
+  const nextNetSubtotal = Math.max(0, roundMoney(oSubtotal - nextReturnedSubtotal));
+  const nextNetTax = Math.max(0, roundMoney(oTax - nextReturnedTax));
+  const nextNetTotal = Math.max(0, roundMoney(oTotal - nextReturnedTotal));
+
+  let nextHoldPct = roundPct(toNum(origin.warrantyHoldPct));
+  let nextHoldAmount = roundMoney(toNum(origin.warrantyHoldAmount));
+
+  if (origin.hasWarrantyHold === true) {
+    if (!(nextHoldPct > 0)) nextHoldPct = 5;
+    nextHoldAmount = roundMoney((nextNetSubtotal * nextHoldPct) / 100);
+    if (nextHoldAmount > nextNetSubtotal) nextHoldAmount = nextNetSubtotal;
+  } else {
+    nextHoldPct = 0;
+    nextHoldAmount = 0;
+  }
+
+  await tx.invoice.update({
+    where: { id: origin.id },
+    data: {
+      returnedSubtotal: new Prisma.Decimal(nextReturnedSubtotal),
+      returnedTax: new Prisma.Decimal(nextReturnedTax),
+      returnedTotal: new Prisma.Decimal(nextReturnedTotal),
+      netSubtotal: new Prisma.Decimal(nextNetSubtotal),
+      netTax: new Prisma.Decimal(nextNetTax),
+      netTotal: new Prisma.Decimal(nextNetTotal),
+      ...(origin.hasWarrantyHold
+        ? {
+            warrantyHoldPct: new Prisma.Decimal(nextHoldPct),
+            warrantyHoldAmount: new Prisma.Decimal(nextHoldAmount),
+          }
+        : {
+            warrantyHoldPct: new Prisma.Decimal(0),
+            warrantyHoldAmount: new Prisma.Decimal(0),
+          }),
+    } as any,
+  });
+
+  await syncInvoicePaidFromAllocations(tx, origin.id);
+
+  const originAfter = await getInvoiceAuditSnapshot(tx, origin.id);
+
+  await auditLog(tx, {
+    userId: params.auditCtx?.userId ?? params.actorId,
+    userRole: params.auditCtx?.userRole,
+    action: "INVOICE_ORIGIN_UNAPPLY_RETURN",
+    entity: "Invoice",
+    entityId: origin.id,
+    before: originBefore,
+    after: originAfter,
+    meta: mergeMeta(params.auditCtx?.meta, {
+      originInvoiceId: origin.id,
+      originCode: origin.code,
+      returnInvoiceId: ret.id,
+      returnCode: ret.code,
+      delta: { returnedSubtotal: -rSubtotal, returnedTax: -rTax, returnedTotal: -rTotal },
+      next: {
+        returnedSubtotal: nextReturnedSubtotal,
+        returnedTax: nextReturnedTax,
+        returnedTotal: nextReturnedTotal,
+        netSubtotal: nextNetSubtotal,
+        netTax: nextNetTax,
+        netTotal: nextNetTotal,
       },
     }),
   });
@@ -1354,13 +1547,9 @@ export async function updateInvoiceNote(id: string, note: string, auditCtx?: Aud
 /**
  * Create invoice
  *
- * ✅ FIX (Option A):
- * - SALES_RETURN/PURCHASE_RETURN: ignore paidAmount/paymentStatus on invoice create
- *   (refund không gắn vào return invoice)
- *
- * ✅ FIX VAT RETURN:
- * - SALES_RETURN: tax/total sẽ được suy ra từ VAT của hóa đơn gốc (tỷ lệ originTax/originSubtotal)
- *   để tránh trường hợp phiếu trả bị lưu thiếu VAT => origin còn thiếu VAT như bug bạn gặp.
+ * ✅ Option A:
+ * - SALES_RETURN/PURCHASE_RETURN: ignore paidAmount/paymentStatus on create
+ * - SALES_RETURN: VAT suy theo origin
  */
 export async function createInvoice(body: any, auditCtx?: AuditCtx) {
   const issueDate = body.issueDate ? new Date(body.issueDate) : new Date();
@@ -1383,7 +1572,6 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
   const taxFromBody = calcTaxFromBody(subtotal, body);
   const totalFromBody = subtotal + taxFromBody;
 
-  // ✅ Only SALES/PURCHASE allow legacy paidAmount-on-create
   const isReturnType = type === "SALES_RETURN" || type === "PURCHASE_RETURN";
   const normalized = !isReturnType
     ? normalizePayment(subtotal, taxFromBody, body)
@@ -1398,11 +1586,13 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
   try {
     const created = await prisma.$transaction(
       async (tx) => {
+        // ✅ period lock: chặn tạo “ngày phát sinh” vào kỳ đã khóa (tuỳ policy của bạn)
+        await ensureDateNotLocked(issueDate, "tạo hóa đơn");
+
         const receiveAccountId = await validateReceiveAccountId(tx, body.receiveAccountId);
 
         let origin: Awaited<ReturnType<typeof requireValidRefInvoiceForSalesReturn>> | null = null;
 
-        // ✅ totals effective (đặc biệt cho SALES_RETURN cần suy VAT theo origin)
         let effectiveTax = taxFromBody;
         let effectiveTotal = totalFromBody;
 
@@ -1417,7 +1607,7 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
           if (body.partnerTax == null) body.partnerTax = origin.partnerTax ?? null;
           if (body.partnerAddr == null) body.partnerAddr = origin.partnerAddr ?? null;
 
-          // ✅ VAT return = theo tỷ lệ VAT hóa đơn gốc
+          // VAT return theo origin ratio
           effectiveTax = computeReturnTaxFromOrigin({
             originSubtotal: toNum(origin.subtotal),
             originTax: toNum(origin.tax),
@@ -1451,9 +1641,7 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
               })()
             : null;
 
-        // ============================================================
-        // ✅ INVOICE CODE: input or auto MAX(code)+1 (Postgres/Neon)
-        // ============================================================
+        // invoice code
         const codeYear = issueDate.getFullYear();
         let invoiceCode: string;
 
@@ -1466,7 +1654,6 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
           invoiceCode = "";
         }
 
-        // ✅ create invoice with retry (race condition)
         let inv: any = null;
 
         for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1514,7 +1701,7 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
                 netTax: new Prisma.Decimal(effectiveTax),
                 netTotal: new Prisma.Decimal(effectiveTotal),
 
-                // ✅ return types always start unpaid/0 (refund goes via /payments to origin)
+                // return types always start unpaid/0
                 paymentStatus: "UNPAID",
                 paidAmount: new Prisma.Decimal(0),
 
@@ -1534,10 +1721,8 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
             invoiceCode = codeToUse;
             break;
           } catch (e: any) {
-            // inputCode mà trùng -> fail
             if (inputCode) handleUniqueInvoiceError(e);
 
-            // auto gen mà trùng do concurrency -> retry
             if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
               const target = (e.meta as any)?.target;
               const targetStr = Array.isArray(target) ? target.join(",") : String(target || "");
@@ -1549,16 +1734,12 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
                 );
               }
             }
-
             throw e;
           }
         }
 
         if (!inv) throw httpError(500, "Không tạo được hoá đơn.");
 
-        // ============================================================
-        // Lines
-        // ============================================================
         await tx.invoiceLine.createMany({
           data: validLines.map((l) => {
             const amount = l.qty * l.price;
@@ -1572,6 +1753,13 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
               itemSku: l.itemSku || undefined,
             };
           }),
+        });
+        // ✅ NEW: check tồn ngay khi tạo (SAVE) cho OUT types
+// FE có thể gửi body.warehouseId; nếu không gửi mà chỉ có 1 kho => auto pick
+        await assertEnoughStockForOutInvoiceTx(tx, {
+          invoiceType: type,
+          lines: validLines.map((l) => ({ itemId: l.itemId, qty: l.qty })),
+          warehouseId: body.warehouseId,
         });
 
         // ✅ Only non-return types can create initial payment
@@ -1614,9 +1802,6 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
             originInvoiceId: origin?.id ?? null,
             lineCount: validLines.length,
             isReturnType,
-            note: isReturnType
-              ? "Return invoice does not create payments; refund must go via /payments to origin."
-              : undefined,
           }),
         });
 
@@ -1631,12 +1816,8 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
   }
 }
 
-
 /**
  * Update invoice + replace lines
- *
- * ✅ FIX: Nếu invoice không phải SALES => ép warrantyHold fields = 0 (tránh return bị set hold)
- * ✅ FIX VAT RETURN: nếu SALES_RETURN, tax/total được suy theo VAT hóa đơn gốc
  */
 export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) {
   const before = await getInvoiceAuditSnapshot(prisma, id);
@@ -1662,6 +1843,10 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
           },
         });
         if (!current) throw httpError(404, "Invoice not found");
+
+        // ✅ period lock: chặn sửa nếu issueDate thuộc kỳ khóa
+        // (vì update có thể dẫn tới approve/post ở kỳ đó)
+        await ensureDateNotLocked(current.issueDate ?? new Date(), "cập nhật hóa đơn");
 
         const nextType: InvoiceType = (body.type ?? current.type) as InvoiceType;
 
@@ -1786,7 +1971,7 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
 
           await tx.invoiceLine.createMany({ data: linesData });
 
-          // ✅ VAT return
+          // VAT return
           let tax = calcTaxFromBody(subtotal, body);
           if (nextType === "SALES_RETURN" && originForReturn) {
             tax = computeReturnTaxFromOrigin({
@@ -1869,20 +2054,36 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
         }
 
         // ✅ Nếu user chỉnh thanh toán trên UI (paymentStatus/paidAmount) thì auto tạo Payment+Allocation
-await applyPaymentFromBodyOnDraftUpdate(tx, id, body, auditCtx);
+        await applyPaymentFromBodyOnDraftUpdate(tx, id, body, auditCtx);
 
-if (
-  Array.isArray(body.lines) ||
-  body.hasWarrantyHold !== undefined ||
-  body.warrantyHoldPct !== undefined ||
-  body.warrantyHoldAmount !== undefined ||
-  changedTotals ||
-  body.paymentStatus !== undefined ||
-  body.paidAmount !== undefined
-) {
-  await syncInvoicePaidFromAllocations(tx, id);
-}
+        if (
+          Array.isArray(body.lines) ||
+          body.hasWarrantyHold !== undefined ||
+          body.warrantyHoldPct !== undefined ||
+          body.warrantyHoldAmount !== undefined ||
+          changedTotals ||
+          body.paymentStatus !== undefined ||
+          body.paidAmount !== undefined
+        ) {
+          await syncInvoicePaidFromAllocations(tx, id);
+        }
+        // ✅ NEW: check tồn ngay khi SAVE draft (OUT types)
+        const invForStockCheck = await tx.invoice.findUnique({
+          where: { id },
+          select: { type: true },
+        });
+        if (!invForStockCheck) throw httpError(404, "Invoice not found");
 
+        const linesForStockCheck = await tx.invoiceLine.findMany({
+          where: { invoiceId: id },
+          select: { itemId: true, qty: true },
+        });
+
+        await assertEnoughStockForOutInvoiceTx(tx, {
+          invoiceType: invForStockCheck.type as InvoiceType,
+          lines: linesForStockCheck,
+          warehouseId: body.warehouseId, // FE gửi lên nếu nhiều kho
+        });
 
         const after = await getInvoiceAuditSnapshot(tx, id);
         await auditLog(tx, {
@@ -1913,9 +2114,13 @@ export async function deleteInvoice(id: string, auditCtx?: AuditCtx) {
 
   const inv = await prisma.invoice.findUnique({
     where: { id },
-    select: { status: true },
+    select: { status: true, issueDate: true },
   });
   if (!inv) throw httpError(404, "Invoice not found");
+
+  // ✅ period lock: chặn xóa hóa đơn ở kỳ đã khóa
+  await ensureDateNotLocked(inv.issueDate ?? new Date(), "xóa hóa đơn");
+
   if (inv.status === "APPROVED") {
     throw httpError(409, "Hóa đơn đã duyệt, không được xóa. Hãy dùng chứng từ điều chỉnh/hoàn trả.");
   }
@@ -1925,7 +2130,6 @@ export async function deleteInvoice(id: string, auditCtx?: AuditCtx) {
     throw httpError(409, "Không thể xoá hoá đơn đã post tồn (đã có movement liên kết).");
   }
 
-  // ✅ nếu có phiếu trả hàng/tham chiếu (refInvoiceId), cần xoá các phiếu đó trước
   const refCount = await prisma.invoice.count({ where: { refInvoiceId: id } });
   if (refCount > 0) {
     throw httpError(
@@ -1935,7 +2139,6 @@ export async function deleteInvoice(id: string, auditCtx?: AuditCtx) {
   }
 
   await prisma.warrantyHold.deleteMany({ where: { invoiceId: id } });
-  // ✅ remove payment allocations that reference this invoice (draft/submitted) so FK doesn't block delete
   await prisma.paymentAllocation.deleteMany({
     where: { OR: [{ invoiceId: id }, { returnInvoiceId: id }] },
   });
@@ -2050,11 +2253,11 @@ export async function submitInvoice(
 
       const inv = await tx.invoice.findUnique({
         where: { id: params.invoiceId },
-        select: { id: true, status: true, issueDate: true }, // ✅ add issueDate
+        select: { id: true, status: true, issueDate: true },
       });
       if (!inv) throw httpError(404, "Invoice not found");
 
-      // ✅ NEW: block submit into locked period (không ảnh hưởng logic cũ)
+      // ✅ period lock
       await ensureDateNotLocked(inv.issueDate ?? new Date(), "gửi duyệt hóa đơn");
 
       if (inv.status === "APPROVED") throw httpError(409, "Hóa đơn đã duyệt rồi.");
@@ -2089,13 +2292,13 @@ export async function approveInvoice(
   params: { invoiceId: string; approvedById: string; warehouseId?: string },
   auditCtx?: AuditCtx
 ) {
-  const warehouse = await ensureWarehouse(params.warehouseId);
-
   const isOutType = (t: InvoiceType) => t === "SALES" || t === "PURCHASE_RETURN";
   const isInType = (t: InvoiceType) => t === "PURCHASE" || t === "SALES_RETURN";
 
   return prisma.$transaction(
     async (tx) => {
+      const warehouse = await ensureWarehouseTx(tx, params.warehouseId);
+
       const before = await getInvoiceAuditSnapshot(tx, params.invoiceId);
 
       const invoice = await tx.invoice.findUnique({
@@ -2104,7 +2307,7 @@ export async function approveInvoice(
       });
       if (!invoice) throw httpError(404, "Invoice not found");
 
-      // ✅ NEW: block approve (post stock/cost) if issueDate in locked period
+      // ✅ period lock
       await ensureDateNotLocked((invoice as any).issueDate ?? new Date(), "duyệt hóa đơn");
 
       if (invoice.status === "APPROVED") throw httpError(409, "Hóa đơn đã duyệt rồi.");
@@ -2127,7 +2330,6 @@ export async function approveInvoice(
           (invoice as any).refInvoiceId
         );
 
-        // ✅ FIX VAT RETURN: ép tax/total của phiếu trả theo VAT hóa đơn gốc
         const retSubtotal = roundMoney(toNum((invoice as any).subtotal));
         const retTax = computeReturnTaxFromOrigin({
           originSubtotal: toNum(originForReturn.subtotal),
@@ -2154,13 +2356,11 @@ export async function approveInvoice(
 
             receiveAccountId: invoice.receiveAccountId ?? originForReturn.receiveAccountId ?? null,
 
-            // ✅ return invoice never has hold
             hasWarrantyHold: false,
             warrantyHoldPct: new Prisma.Decimal(0),
             warrantyHoldAmount: new Prisma.Decimal(0),
             warrantyDueDate: null,
 
-            // ✅ totals corrected
             tax: new Prisma.Decimal(retTax),
             total: new Prisma.Decimal(retTotal),
             netSubtotal: new Prisma.Decimal(retSubtotal),
@@ -2170,9 +2370,7 @@ export async function approveInvoice(
         });
       }
 
-      /**
-       * SALES: tính lại warrantyHold fields ngay trước khi approve
-       */
+      // SALES: reset net/returned + hold fields
       if (invoice.type === "SALES") {
         const hasHold = invoice.hasWarrantyHold === true;
 
@@ -2266,6 +2464,7 @@ export async function approveInvoice(
         if (errors.length) throw httpError(400, errors.join(" "));
       }
 
+      // OUT types: assign unitCost from avgCost & totalCost
       if (isOutType(invoice.type as InvoiceType)) {
         await Promise.all(
           invoice.lines.map((l) => {
@@ -2293,6 +2492,7 @@ export async function approveInvoice(
         });
       }
 
+      // PURCHASE: update avgCost
       if (invoice.type === "PURCHASE") {
         const moneyByItem = new Map<string, number>();
         for (const l of invoice.lines) {
@@ -2337,6 +2537,7 @@ export async function approveInvoice(
         }
       }
 
+      // OUT types: decrement stock
       if (invoice.type === "SALES" || invoice.type === "PURCHASE_RETURN") {
         const updatePromises: Array<Promise<any>> = [];
         for (const [itemId, outQty] of qtyByItem.entries()) {
@@ -2350,6 +2551,7 @@ export async function approveInvoice(
         if (updatePromises.length) await Promise.all(updatePromises);
       }
 
+      // SALES_RETURN: increment stock (create missing rows)
       if (invoice.type === "SALES_RETURN") {
         const existingStockItemIds = new Set(stocks.map((s) => s.itemId));
         const createData: Array<any> = [];
@@ -2380,15 +2582,14 @@ export async function approveInvoice(
 
       const mvType: MovementType = isInType(invoice.type as InvoiceType) ? "IN" : "OUT";
 
-      // ✅ NEW: đồng bộ timestamp approve/post
       const now = new Date();
 
       await tx.movement.create({
         data: {
           type: mvType,
           posted: true,
-          postedAt: now, // ✅ NEW
-          occurredAt: invoice.issueDate, // ✅ NEW: khóa kỳ theo ngày phát sinh
+          postedAt: now,
+          occurredAt: invoice.issueDate,
 
           invoiceId: invoice.id,
           lines: {
@@ -2429,7 +2630,7 @@ export async function approveInvoice(
         data: {
           status: "APPROVED",
           approvedById: params.approvedById,
-          approvedAt: now, // ✅ same timestamp
+          approvedAt: now,
         },
       });
 
@@ -2439,16 +2640,7 @@ export async function approveInvoice(
         meta: auditCtx?.meta,
       });
 
-      // ✅ FIX BUG #1: nếu invoice có paid legacy nhưng chưa có allocations => tạo allocations trước khi sync
-      await ensureLegacyPaymentAllocationOnApprove(
-        tx,
-        invoice.id,
-        auditCtx?.userId ?? params.approvedById
-      );
-
-      // ✅ Sync allocations:
-      // - for SALES/PURCHASE only
-      // - return types are forced to 0/unpaid by syncInvoicePaidFromAllocations()
+      await ensureLegacyPaymentAllocationOnApprove(tx, invoice.id, auditCtx?.userId ?? params.approvedById);
       await syncInvoicePaidFromAllocations(tx, invoice.id);
 
       if (invoice.type === "SALES_RETURN") {
@@ -2495,9 +2687,13 @@ export async function rejectInvoice(
 
       const inv = await tx.invoice.findUnique({
         where: { id: params.invoiceId },
-        select: { status: true },
+        select: { status: true, issueDate: true },
       });
       if (!inv) throw httpError(404, "Invoice not found");
+
+      // ✅ period lock: chặn reject nếu kỳ khóa (tuỳ policy, mình set chặt để khớp chốt sổ)
+      await ensureDateNotLocked(inv.issueDate ?? new Date(), "từ chối hóa đơn");
+
       if (inv.status === "APPROVED") throw httpError(409, "Hóa đơn đã duyệt, không thể từ chối.");
       if (inv.status === "REJECTED") throw httpError(409, "Hóa đơn đã bị từ chối rồi.");
       if (inv.status !== "SUBMITTED") {
@@ -2525,6 +2721,227 @@ export async function rejectInvoice(
         before,
         after,
         meta: mergeMeta(auditCtx?.meta, { reason: params.reason ?? null }),
+      });
+    },
+    { timeout: 20000, maxWait: 5000 }
+  );
+
+  return getInvoiceById(params.invoiceId);
+}
+
+/**
+ * ✅ NEW: Reopen APPROVED -> DRAFT (rollback stock + delete movement)
+ * - chặn nếu có movement phát sinh sau đó đụng cùng item+warehouse
+ * - nếu invoice là SALES_RETURN: unapply khỏi hóa đơn gốc
+ */
+export async function reopenApprovedInvoice(
+  params: { invoiceId: string; actorId: string; warehouseId?: string },
+  auditCtx?: AuditCtx
+) {
+  return prisma.$transaction(
+    async (tx) => {
+      const before = await getInvoiceAuditSnapshot(tx, params.invoiceId);
+
+      const invoice = await tx.invoice.findUnique({
+        where: { id: params.invoiceId },
+        include: { lines: true, movements: { include: { lines: true } } as any },
+      });
+      if (!invoice) throw httpError(404, "Invoice not found");
+
+      if (invoice.status !== "APPROVED") {
+        throw httpError(409, "Chỉ hóa đơn đã DUYỆT (APPROVED) mới được mở lại.");
+      }
+
+      // ✅ period lock
+      await ensureDateNotLocked(invoice.issueDate ?? new Date(), "mở lại hóa đơn đã duyệt");
+
+      const warehouse = await ensureWarehouseTx(tx, params.warehouseId);
+
+      // movements linked
+      const mvs = await tx.movement.findMany({
+        where: { invoiceId: invoice.id, posted: true },
+        include: { lines: true },
+        orderBy: { postedAt: "desc" },
+      });
+      if (!mvs.length) {
+        // vẫn cho reopen (trường hợp data cũ)
+      }
+
+      // if invoice is SALES_RETURN, remember origin id
+      const originId = invoice.type === "SALES_RETURN" ? String((invoice as any).refInvoiceId || "") : "";
+
+      // rollback each movement
+      for (const mv of mvs) {
+        const postedAt = (mv as any).postedAt ?? (mv as any).occurredAt ?? (mv as any).createdAt ?? new Date();
+
+        const itemIds = Array.from(new Set((mv.lines || []).map((l: any) => String(l.itemId))));
+        if (!itemIds.length) continue;
+
+        // SAFETY: disallow reopen if later movements touch same items + warehouse
+        const laterTouchCount = await tx.movementLine.count({
+          where: {
+            itemId: { in: itemIds } as any,
+            OR: [{ toLocationId: warehouse.id }, { fromLocationId: warehouse.id }] as any,
+            movement: { posted: true, postedAt: { gt: postedAt } } as any,
+          } as any,
+        });
+
+        if (laterTouchCount > 0) {
+          throw httpError(
+            409,
+            "Không thể mở lại vì có chứng từ phát sinh SAU đó ảnh hưởng cùng mặt hàng trong kho. Hãy xử lý chứng từ sau trước hoặc dùng chứng từ điều chỉnh."
+          );
+        }
+
+        const mvType = mv.type as MovementType; // IN/OUT
+
+        for (const l of (mv.lines || []) as any[]) {
+          const itemId = String(l.itemId);
+          const qtyAbs = Math.abs(toNum(l.qty));
+          if (qtyAbs <= 0) continue;
+
+          const stock = await tx.stock.findUnique({
+            where: { itemId_locationId: { itemId, locationId: warehouse.id } },
+            select: { qty: true, avgCost: true },
+          });
+
+          const curQty = stock ? toNum(stock.qty) : 0;
+          const curAvg = stock ? toNum(stock.avgCost) : 0;
+
+          // OUT rollback => +qty ; IN rollback => -qty
+          const nextQty = mvType === "OUT" ? curQty + qtyAbs : curQty - qtyAbs;
+
+          if (nextQty < -0.0001) {
+            throw httpError(409, `Rollback tồn kho bị âm (itemId=${itemId}).`);
+          }
+
+          let nextAvg = curAvg;
+
+          // rollback avgCost only for PURCHASE IN
+          if (invoice.type === "PURCHASE" && mvType === "IN") {
+            const unitCost = toNum(l.unitCost);
+            const denom = nextQty;
+
+            if (denom <= 0.0001) nextAvg = 0;
+            else {
+              const prevTotalCost = curQty * curAvg - qtyAbs * unitCost;
+              nextAvg = prevTotalCost / denom;
+              if (!Number.isFinite(nextAvg) || nextAvg < 0) nextAvg = 0;
+              nextAvg = round4(nextAvg);
+            }
+          }
+
+          if (!stock) {
+            await tx.stock.create({
+              data: {
+                itemId,
+                locationId: warehouse.id,
+                qty: new Prisma.Decimal(nextQty),
+                avgCost: new Prisma.Decimal(nextAvg),
+              },
+            });
+          } else {
+            await tx.stock.update({
+              where: { itemId_locationId: { itemId, locationId: warehouse.id } },
+              data: { qty: new Prisma.Decimal(nextQty), avgCost: new Prisma.Decimal(nextAvg) },
+            });
+          }
+        }
+
+        // delete movement lines + movement
+        await tx.movementLine.deleteMany({ where: { movementId: mv.id } });
+        await tx.movement.delete({ where: { id: mv.id } });
+      }
+
+      // if SALES_RETURN => unapply from origin
+      if (invoice.type === "SALES_RETURN" && originId) {
+        await unapplySalesReturnFromOrigin(tx, {
+          returnInvoiceId: invoice.id,
+          originInvoiceId: originId,
+          actorId: auditCtx?.userId ?? params.actorId,
+          auditCtx,
+        });
+      }
+
+      // reset costs on invoice lines
+      await tx.invoiceLine.updateMany({
+        where: { invoiceId: invoice.id },
+        data: { unitCost: null as any, costTotal: null as any },
+      });
+
+      await tx.invoice.update({
+        where: { id: invoice.id },
+        data: {
+          status: "DRAFT",
+          approvedById: null,
+          approvedAt: null,
+          totalCost: new Prisma.Decimal(0),
+        } as any,
+      });
+
+      // after reopen: sync paid (return types forced 0/unpaid)
+      await syncInvoicePaidFromAllocations(tx, invoice.id);
+
+      const after = await getInvoiceAuditSnapshot(tx, params.invoiceId);
+
+      await auditLog(tx, {
+        userId: auditCtx?.userId ?? params.actorId,
+        userRole: auditCtx?.userRole,
+        action: "INVOICE_REOPEN",
+        entity: "Invoice",
+        entityId: params.invoiceId,
+        before,
+        after,
+        meta: mergeMeta(auditCtx?.meta, { warehouseId: warehouse.id }),
+      });
+
+      return getInvoiceByIdTx(tx, invoice.id);
+    },
+    { timeout: 20000, maxWait: 5000 }
+  );
+}
+
+export async function recallInvoice(
+  params: { invoiceId: string; actorId: string },
+  auditCtx?: AuditCtx
+) {
+  await prisma.$transaction(
+    async (tx) => {
+      const before = await getInvoiceAuditSnapshot(tx, params.invoiceId);
+
+      const inv = await tx.invoice.findUnique({
+        where: { id: params.invoiceId },
+        select: { status: true, issueDate: true },
+      });
+
+      if (!inv) throw httpError(404, "Invoice not found");
+      if (inv.status !== "SUBMITTED") {
+        throw httpError(409, "Chỉ hóa đơn CHỜ DUYỆT mới được thu hồi.");
+      }
+
+      // ✅ period lock: chặn recall nếu kỳ khóa
+      await ensureDateNotLocked(inv.issueDate ?? new Date(), "thu hồi hóa đơn");
+
+      await tx.invoice.update({
+        where: { id: params.invoiceId },
+        data: {
+          status: "DRAFT",
+          approvedById: null,
+          approvedAt: null,
+        },
+      });
+
+      const after = await getInvoiceAuditSnapshot(tx, params.invoiceId);
+
+      await auditLog(tx, {
+        userId: auditCtx?.userId ?? params.actorId,
+        userRole: auditCtx?.userRole,
+        action: "INVOICE_RECALL",
+        entity: "Invoice",
+        entityId: params.invoiceId,
+        before,
+        after,
+        meta: mergeMeta(auditCtx?.meta, {}),
       });
     },
     { timeout: 20000, maxWait: 5000 }
@@ -2568,9 +2985,13 @@ export async function unpostInvoiceStock(invoiceId: string, _auditCtx?: AuditCtx
 export async function hardDeleteInvoice(id: string) {
   const inv = await prisma.invoice.findUnique({
     where: { id },
-    select: { status: true },
+    select: { status: true, issueDate: true },
   });
   if (!inv) throw httpError(404, "Invoice not found");
+
+  // ✅ period lock
+  await ensureDateNotLocked(inv.issueDate ?? new Date(), "hard delete hóa đơn");
+
   if (inv.status === "APPROVED") {
     throw httpError(409, "Hóa đơn đã duyệt (chốt sổ). Không hỗ trợ hard delete.");
   }
@@ -2584,7 +3005,6 @@ export async function hardDeleteInvoice(id: string) {
   await prisma.$transaction(async (tx) => {
     await tx.movement.deleteMany({ where: { invoiceId: id } });
     await tx.warrantyHold.deleteMany({ where: { invoiceId: id } });
-    // ✅ remove payment allocations that reference this invoice so FK doesn't block delete
     await tx.paymentAllocation.deleteMany({
       where: { OR: [{ invoiceId: id }, { returnInvoiceId: id }] },
     });
@@ -2754,51 +3174,681 @@ export async function aggregateRevenue(params: {
     byTech: Array.from(byTech.values()).sort((a, b) => b.revenue - a.revenue),
   };
 }
-
-export async function recallInvoice(
-  params: { invoiceId: string; actorId: string },
+export async function adminEditApprovedInvoiceInPlace(
+  params: { invoiceId: string; actorId: string; warehouseId?: string; body: any },
   auditCtx?: AuditCtx
 ) {
-  await prisma.$transaction(
+  const isOutType = (t: InvoiceType) => t === "SALES" || t === "PURCHASE_RETURN";
+  const isInType = (t: InvoiceType) => t === "PURCHASE" || t === "SALES_RETURN";
+
+  return prisma.$transaction(
     async (tx) => {
       const before = await getInvoiceAuditSnapshot(tx, params.invoiceId);
 
-      const inv = await tx.invoice.findUnique({
+      const invoice = await tx.invoice.findUnique({
         where: { id: params.invoiceId },
-        select: { status: true },
+        include: { lines: true, movements: { include: { lines: true } } as any },
       });
+      if (!invoice) throw httpError(404, "Invoice not found");
 
-      if (!inv) throw httpError(404, "Invoice not found");
-      if (inv.status !== "SUBMITTED") {
-        throw httpError(409, "Chỉ hóa đơn CHỜ DUYỆT mới được thu hồi.");
+      if (invoice.status !== "APPROVED") {
+        throw httpError(409, "Chỉ hóa đơn đã DUYỆT (APPROVED) mới dùng admin-edit-approved.");
       }
 
+      const body = params.body || {};
+      const warehouse = await ensureWarehouseTx(tx, params.warehouseId);
+
+      // ✅ period lock: check theo issueDate MỚI nếu admin gửi lên
+      const nextIssueDate =
+        body.issueDate !== undefined ? new Date(body.issueDate) : (invoice.issueDate ?? new Date());
+      await ensureDateNotLocked(nextIssueDate, "admin sửa hóa đơn đã duyệt");
+
+      const currentType: InvoiceType = invoice.type as InvoiceType;
+      const nextType: InvoiceType = (body.type ?? currentType) as InvoiceType;
+
+      if (nextType !== currentType) {
+        throw httpError(409, "Admin-edit-approved hiện không cho đổi type của hóa đơn đã duyệt.");
+      }
+
+      // ✅ TRIỆT ĐỂ (an toàn): nếu SALES đã có trả hàng apply (returnedTotal>0) thì cấm sửa in-place
+      // (vì sửa lines/subtotal sẽ làm origin net/returned không còn đúng với return chain)
+      if (currentType === "SALES") {
+        const originCheck = await tx.invoice.findUnique({
+          where: { id: invoice.id },
+          select: { returnedTotal: true },
+        });
+        const returnedTotal = roundMoney(toNum((originCheck as any)?.returnedTotal));
+        if (returnedTotal > 0.0001) {
+          throw httpError(
+            409,
+            "Hóa đơn SALES đã có phiếu trả hàng liên quan (returnedTotal > 0). Không hỗ trợ admin sửa in-place để tránh lệch NET. Hãy dùng reopen + sửa + duyệt lại, hoặc chứng từ điều chỉnh."
+          );
+        }
+      }
+
+      // ====== SALES_RETURN: cần originId để unapply/apply ======
+      let originForReturn: Awaited<ReturnType<typeof requireValidRefInvoiceForSalesReturn>> | null = null;
+      const originId =
+        currentType === "SALES_RETURN" ? String((invoice as any).refInvoiceId || "") : "";
+
+      if (currentType === "SALES_RETURN") {
+        originForReturn = await requireValidRefInvoiceForSalesReturn(tx, originId);
+        if (!originForReturn?.id) throw httpError(400, "Thiếu/không hợp lệ refInvoiceId của SALES_RETURN.");
+      }
+
+      // =========================
+      // 0) Nếu SALES_RETURN: UNAPPLY khỏi origin trước khi rollback/repost (đảm bảo origin NET đúng)
+      // =========================
+      if (currentType === "SALES_RETURN" && originForReturn) {
+        await unapplySalesReturnFromOrigin(tx, {
+          returnInvoiceId: invoice.id,
+          originInvoiceId: originForReturn.id,
+          actorId: auditCtx?.userId ?? params.actorId,
+          auditCtx,
+        });
+      }
+
+      // =========================
+      // 1) ROLLBACK movements + delete movements (giống reopenApprovedInvoice)
+      // =========================
+      const mvs = await tx.movement.findMany({
+        where: { invoiceId: invoice.id, posted: true },
+        include: { lines: true },
+        orderBy: { postedAt: "desc" },
+      });
+
+      for (const mv of mvs) {
+        const postedAt =
+          (mv as any).postedAt ?? (mv as any).occurredAt ?? (mv as any).createdAt ?? new Date();
+
+        const itemIds = Array.from(new Set((mv.lines || []).map((l: any) => String(l.itemId))));
+        if (!itemIds.length) continue;
+
+        const laterTouchCount = await tx.movementLine.count({
+          where: {
+            itemId: { in: itemIds } as any,
+            OR: [{ toLocationId: warehouse.id }, { fromLocationId: warehouse.id }] as any,
+            movement: { posted: true, postedAt: { gt: postedAt } } as any,
+          } as any,
+        });
+
+        if (laterTouchCount > 0) {
+          throw httpError(
+            409,
+            "Không thể sửa vì có chứng từ phát sinh SAU đó ảnh hưởng cùng mặt hàng trong kho. Hãy xử lý chứng từ sau trước hoặc dùng chứng từ điều chỉnh."
+          );
+        }
+
+        const mvType = mv.type as MovementType; // IN/OUT
+
+        for (const l of (mv.lines || []) as any[]) {
+          const itemId = String(l.itemId);
+          const qtyAbs = Math.abs(toNum(l.qty));
+          if (qtyAbs <= 0) continue;
+
+          const stock = await tx.stock.findUnique({
+            where: { itemId_locationId: { itemId, locationId: warehouse.id } },
+            select: { qty: true, avgCost: true },
+          });
+
+          const curQty = stock ? toNum(stock.qty) : 0;
+          const curAvg = stock ? toNum(stock.avgCost) : 0;
+
+          const nextQty = mvType === "OUT" ? curQty + qtyAbs : curQty - qtyAbs;
+          if (nextQty < -0.0001) throw httpError(409, `Rollback tồn kho bị âm (itemId=${itemId}).`);
+
+          let nextAvg = curAvg;
+
+          // rollback avgCost only for PURCHASE IN
+          if (invoice.type === "PURCHASE" && mvType === "IN") {
+            let unitCost = toNum(l.unitCost);
+            if (!Number.isFinite(unitCost) || unitCost < 0) unitCost = 0;
+
+            const denom = nextQty;
+            if (denom <= 0.0001) nextAvg = 0;
+            else {
+              const prevTotalCost = curQty * curAvg - qtyAbs * unitCost;
+              nextAvg = prevTotalCost / denom;
+              if (!Number.isFinite(nextAvg) || nextAvg < 0) nextAvg = 0;
+              nextAvg = round4(nextAvg);
+            }
+          }
+
+          if (!stock) {
+            await tx.stock.create({
+              data: {
+                itemId,
+                locationId: warehouse.id,
+                qty: new Prisma.Decimal(nextQty),
+                avgCost: new Prisma.Decimal(nextAvg),
+              },
+            });
+          } else {
+            await tx.stock.update({
+              where: { itemId_locationId: { itemId, locationId: warehouse.id } },
+              data: { qty: new Prisma.Decimal(nextQty), avgCost: new Prisma.Decimal(nextAvg) },
+            });
+          }
+        }
+
+        await tx.movementLine.deleteMany({ where: { movementId: mv.id } });
+        await tx.movement.delete({ where: { id: mv.id } });
+      }
+
+      // reset costs on invoice lines (để repost set lại đúng)
+      await tx.invoiceLine.updateMany({
+        where: { invoiceId: invoice.id },
+        data: { unitCost: null as any, costTotal: null as any },
+      });
+
+      // =========================
+      // 2) UPDATE header + REPLACE lines + recompute totals
+      // =========================
+      const data: any = {};
+
+      if (body.note !== undefined) data.note = body.note;
+      if (body.partnerId !== undefined) data.partnerId = body.partnerId || null;
+      if (body.partnerName !== undefined) data.partnerName = body.partnerName;
+      if (body.partnerPhone !== undefined) data.partnerPhone = body.partnerPhone;
+      if (body.partnerTax !== undefined) data.partnerTax = body.partnerTax;
+      if (body.partnerAddr !== undefined) data.partnerAddr = body.partnerAddr;
+
+      if (body.saleUserId !== undefined) data.saleUserId = body.saleUserId || null;
+      if (body.techUserId !== undefined) data.techUserId = body.techUserId || null;
+
+      if (body.receiveAccountId !== undefined) {
+        data.receiveAccountId = await validateReceiveAccountId(tx, body.receiveAccountId);
+      }
+
+      if (body.issueDate !== undefined) {
+        data.issueDate = new Date(body.issueDate);
+      }
+
+      // SALES_RETURN: ép đồng bộ partner/receiveAccount theo origin nếu thiếu
+      if (currentType === "SALES_RETURN" && originForReturn) {
+        if (data.partnerId == null) data.partnerId = originForReturn.partnerId ?? null;
+        if (data.partnerName == null) data.partnerName = originForReturn.partnerName ?? null;
+        if (data.partnerPhone == null) data.partnerPhone = originForReturn.partnerPhone ?? null;
+        if (data.partnerTax == null) data.partnerTax = originForReturn.partnerTax ?? null;
+        if (data.partnerAddr == null) data.partnerAddr = originForReturn.partnerAddr ?? null;
+
+        data.refInvoiceId = originForReturn.id;
+        data.receiveAccountId =
+          (body.receiveAccountId !== undefined ? data.receiveAccountId : null) ??
+          invoice.receiveAccountId ??
+          originForReturn.receiveAccountId ??
+          null;
+
+        // warrantyHold không áp dụng cho return
+        data.hasWarrantyHold = false;
+        data.warrantyHoldPct = new Prisma.Decimal(0);
+        data.warrantyHoldAmount = new Prisma.Decimal(0);
+        data.warrantyDueDate = null;
+      }
+
+      // warrantyHold chỉ hợp lệ cho SALES
+      if (currentType !== "SALES") {
+        data.hasWarrantyHold = false;
+        data.warrantyHoldPct = new Prisma.Decimal(0);
+        data.warrantyHoldAmount = new Prisma.Decimal(0);
+        data.warrantyDueDate = null;
+      } else {
+        if (body.hasWarrantyHold !== undefined) {
+          data.hasWarrantyHold = body.hasWarrantyHold === true;
+          if (data.hasWarrantyHold !== true) {
+            data.warrantyHoldPct = new Prisma.Decimal(0);
+            data.warrantyHoldAmount = new Prisma.Decimal(0);
+            data.warrantyDueDate = null;
+          }
+        }
+        if (body.warrantyHoldPct !== undefined) {
+          const pct = Number(body.warrantyHoldPct);
+          if (!Number.isFinite(pct) || pct < 0 || pct > 100) throw httpError(400, "warrantyHoldPct không hợp lệ (0..100).");
+          data.warrantyHoldPct = new Prisma.Decimal(pct);
+        }
+        if (body.warrantyHoldAmount !== undefined) {
+          const amt = parseOptionalNumber(body.warrantyHoldAmount);
+          if (amt === undefined) data.warrantyHoldAmount = new Prisma.Decimal(0);
+          else {
+            if (amt < 0) throw httpError(400, "warrantyHoldAmount không hợp lệ (>=0).");
+            data.warrantyHoldAmount = new Prisma.Decimal(roundMoney(amt));
+          }
+        }
+      }
+
+      await tx.invoice.update({ where: { id: invoice.id }, data });
+
+      if (!Array.isArray(body.lines)) {
+        throw httpError(400, "admin-edit-approved yêu cầu gửi đầy đủ lines.");
+      }
+
+      await tx.invoiceLine.deleteMany({ where: { invoiceId: invoice.id } });
+
+      const validLines = body.lines
+        .map((l: any) => ({
+          ...l,
+          itemId: l.itemId,
+          qty: Number(l.qty || 0),
+          price: Number(l.price || l.unitPrice || 0),
+        }))
+        .filter((l: any) => !!l.itemId && l.qty > 0);
+
+      if (!validLines.length) throw httpError(400, "Hoá đơn phải có ít nhất 1 sản phẩm.");
+
+      let subtotal = 0;
+      const linesData = validLines.map((l: any) => {
+        const amount = l.qty * l.price;
+        subtotal += amount;
+        return {
+          invoiceId: invoice.id,
+          itemId: l.itemId,
+          qty: new Prisma.Decimal(l.qty),
+          price: new Prisma.Decimal(l.price),
+          amount: new Prisma.Decimal(amount),
+          itemName: l.itemName || undefined,
+          itemSku: l.itemSku || undefined,
+        };
+      });
+      await tx.invoiceLine.createMany({ data: linesData });
+
+      // ✅ tax/total
+      let tax = calcTaxFromBody(subtotal, body);
+
+      // SALES_RETURN: VAT theo origin ratio (triệt để)
+      if (currentType === "SALES_RETURN" && originForReturn) {
+        tax = computeReturnTaxFromOrigin({
+          originSubtotal: toNum(originForReturn.subtotal),
+          originTax: toNum(originForReturn.tax),
+          returnSubtotal: subtotal,
+        });
+      }
+
+      const total = roundMoney(subtotal + tax);
+
       await tx.invoice.update({
-        where: { id: params.invoiceId },
+        where: { id: invoice.id },
         data: {
-          status: "DRAFT",
-          approvedById: null,
-          approvedAt: null,
+          subtotal: new Prisma.Decimal(subtotal),
+          tax: new Prisma.Decimal(tax),
+          total: new Prisma.Decimal(total),
+
+          // SALES_RETURN: net = total return (để audit/hiển thị), origin net xử lý qua apply
+          netSubtotal: new Prisma.Decimal(subtotal),
+          netTax: new Prisma.Decimal(tax),
+          netTotal: new Prisma.Decimal(total),
+        } as any,
+      });
+
+      // recompute hold for SALES (triệt để)
+      const fresh2 = await tx.invoice.findUnique({
+        where: { id: invoice.id },
+        select: {
+          type: true, subtotal: true, tax: true, total: true, issueDate: true,
+          hasWarrantyHold: true, warrantyHoldPct: true, warrantyHoldAmount: true,
         },
       });
 
-      const after = await getInvoiceAuditSnapshot(tx, params.invoiceId);
+      if (fresh2 && fresh2.type === "SALES") {
+        const t = toNum(fresh2.total);
+        const xTax = toNum(fresh2.tax);
+        const xSub = toNum(fresh2.subtotal) > 0 ? toNum(fresh2.subtotal) : Math.max(0, roundMoney(t - xTax));
+
+        const calc = computeWarrantyHoldAndCollectible({
+          subtotal: xSub,
+          total: t,
+          hasWarrantyHold: fresh2.hasWarrantyHold === true,
+          warrantyHoldPct: toNum(fresh2.warrantyHoldPct),
+          warrantyHoldAmount: toNum(fresh2.warrantyHoldAmount) > 0 ? toNum(fresh2.warrantyHoldAmount) : undefined,
+          legacyPct: 5,
+        });
+
+        const due =
+          fresh2.hasWarrantyHold === true
+            ? (() => {
+                const d = new Date(fresh2.issueDate);
+                d.setFullYear(d.getFullYear() + 1);
+                return d;
+              })()
+            : null;
+
+        await tx.invoice.update({
+          where: { id: invoice.id },
+          data: {
+            warrantyHoldPct: new Prisma.Decimal(calc.pct),
+            warrantyHoldAmount: new Prisma.Decimal(calc.holdAmount),
+            warrantyDueDate: due,
+          },
+        });
+      }
+
+      // ✅ ensure payment migration + warranty hold rows then sync
+      await ensureWarrantyHoldOnApprove(tx, invoice.id, {
+        userId: auditCtx?.userId ?? params.actorId,
+        userRole: auditCtx?.userRole,
+        meta: auditCtx?.meta,
+      });
+
+      await ensureLegacyPaymentAllocationOnApprove(tx, invoice.id, auditCtx?.userId ?? params.actorId);
+      await syncInvoicePaidFromAllocations(tx, invoice.id);
+
+      // =========================
+      // 3) REPOST (stock + movement create) — full như approveInvoice
+      // =========================
+      const inv3 = await tx.invoice.findUnique({
+        where: { id: invoice.id },
+        include: { lines: true, warrantyHold: true },
+      });
+      if (!inv3) throw httpError(404, "Invoice not found (after update)");
+
+      const qtyByItem = sumQtyByItem(inv3.lines.map((l) => ({ itemId: l.itemId, qty: toNum(l.qty) })));
+      const itemIds = Array.from(qtyByItem.keys());
+
+      let stocks = await tx.stock.findMany({
+        where: { locationId: warehouse.id, itemId: { in: itemIds } },
+        select: { itemId: true, qty: true, avgCost: true },
+      });
+
+      const stockMap = new Map<string, { qty: number; avgCost: number }>();
+      for (const s of stocks) stockMap.set(s.itemId, { qty: toNum(s.qty), avgCost: toNum(s.avgCost) });
+
+      // OUT: ensure enough stock
+      if (isOutType(inv3.type as InvoiceType)) {
+        const items = await tx.item.findMany({
+          where: { id: { in: itemIds } },
+          select: { id: true, name: true, sku: true },
+        });
+        const nameMap = new Map(items.map((it) => [it.id, it.name || it.sku || it.id]));
+
+        const errors: string[] = [];
+        for (const [itemId, needQty] of qtyByItem.entries()) {
+          const curQty = stockMap.get(itemId)?.qty;
+          const name = nameMap.get(itemId) ?? itemId;
+
+          if (curQty == null) errors.push(`Sản phẩm "${name}" chưa có tồn trong kho để xuất.`);
+          else if (curQty <= 0) errors.push(`Sản phẩm "${name}" đã hết hàng trong kho.`);
+          else if (curQty < needQty) errors.push(`Sản phẩm "${name}" không đủ tồn (còn ${curQty}, cần ${needQty}).`);
+        }
+        if (errors.length) throw httpError(400, errors.join(" "));
+      }
+
+      // OUT: assign unitCost from avgCost & totalCost
+      if (isOutType(inv3.type as InvoiceType)) {
+        await Promise.all(
+          inv3.lines.map((l) => {
+            const avg = stockMap.get(l.itemId)?.avgCost ?? 0;
+            const qty = toNum(l.qty);
+            const costTotal = avg * qty;
+            return tx.invoiceLine.update({
+              where: { id: l.id },
+              data: { unitCost: new Prisma.Decimal(avg), costTotal: new Prisma.Decimal(costTotal) },
+            });
+          })
+        );
+
+        const totalCost = inv3.lines.reduce((s, l) => {
+          const avg = stockMap.get(l.itemId)?.avgCost ?? 0;
+          return s + avg * toNum(l.qty);
+        }, 0);
+
+        await tx.invoice.update({
+          where: { id: inv3.id },
+          data: { totalCost: new Prisma.Decimal(totalCost) },
+        });
+      }
+
+      // PURCHASE: update avgCost
+      if (inv3.type === "PURCHASE") {
+        const moneyByItem = new Map<string, number>();
+        for (const l of inv3.lines) {
+          const qty = toNum(l.qty);
+          const unit = toNum(l.price);
+          moneyByItem.set(l.itemId, (moneyByItem.get(l.itemId) || 0) + qty * unit);
+        }
+
+        for (const [itemId, inQty] of qtyByItem.entries()) {
+          const inMoney = moneyByItem.get(itemId) || 0;
+          const inUnitCost = inQty > 0 ? inMoney / inQty : 0;
+
+          const existing = await tx.stock.findUnique({
+            where: { itemId_locationId: { itemId, locationId: warehouse.id } },
+            select: { qty: true, avgCost: true },
+          });
+
+          const curQty = existing ? toNum(existing.qty) : 0;
+          const curAvg = existing ? toNum(existing.avgCost) : 0;
+
+          const newAvg = computeNewAvgCost({ curQty, curAvg, inQty, inUnitCost });
+          const newQty = curQty + inQty;
+
+          if (!existing) {
+            await tx.stock.create({
+              data: { itemId, locationId: warehouse.id, qty: new Prisma.Decimal(newQty), avgCost: new Prisma.Decimal(newAvg) },
+            });
+          } else {
+            await tx.stock.update({
+              where: { itemId_locationId: { itemId, locationId: warehouse.id } },
+              data: { qty: new Prisma.Decimal(newQty), avgCost: new Prisma.Decimal(newAvg) },
+            });
+          }
+        }
+
+        // ✅ reload stockMap after avgCost updates (TRIỆT ĐỂ)
+        stocks = await tx.stock.findMany({
+          where: { locationId: warehouse.id, itemId: { in: itemIds } },
+          select: { itemId: true, qty: true, avgCost: true },
+        });
+        stockMap.clear();
+        for (const s of stocks) stockMap.set(s.itemId, { qty: toNum(s.qty), avgCost: toNum(s.avgCost) });
+      }
+
+      // OUT types: decrement stock
+      if (inv3.type === "SALES" || inv3.type === "PURCHASE_RETURN") {
+        const updatePromises: Array<Promise<any>> = [];
+        for (const [itemId, outQty] of qtyByItem.entries()) {
+          updatePromises.push(
+            tx.stock.update({
+              where: { itemId_locationId: { itemId, locationId: warehouse.id } },
+              data: { qty: { increment: new Prisma.Decimal(-outQty) } },
+            })
+          );
+        }
+        if (updatePromises.length) await Promise.all(updatePromises);
+      }
+
+      // ✅ SALES_RETURN: increment stock (create missing rows) — TRIỆT ĐỂ
+      if (inv3.type === "SALES_RETURN") {
+        const existingStockItemIds = new Set(stocks.map((s) => s.itemId));
+        const createData: Array<any> = [];
+        const updatePromises: Array<Promise<any>> = [];
+
+        for (const [itemId, inQty] of qtyByItem.entries()) {
+          const keepAvg = stockMap.get(itemId)?.avgCost ?? 0;
+          if (!existingStockItemIds.has(itemId)) {
+            createData.push({
+              itemId,
+              locationId: warehouse.id,
+              qty: new Prisma.Decimal(inQty),
+              avgCost: new Prisma.Decimal(keepAvg),
+            });
+          } else {
+            updatePromises.push(
+              tx.stock.update({
+                where: { itemId_locationId: { itemId, locationId: warehouse.id } },
+                data: { qty: { increment: new Prisma.Decimal(inQty) } },
+              })
+            );
+          }
+        }
+
+        if (createData.length) await tx.stock.createMany({ data: createData });
+        if (updatePromises.length) await Promise.all(updatePromises);
+      }
+
+      const mvType: MovementType = isInType(inv3.type as InvoiceType) ? "IN" : "OUT";
+      const now = new Date();
+
+      await tx.movement.create({
+        data: {
+          type: mvType,
+          posted: true,
+          postedAt: now,
+          occurredAt: inv3.issueDate,
+          invoiceId: inv3.id,
+          lines: {
+            createMany: {
+              data: Array.from(qtyByItem.entries()).map(([itemId, qty]) => {
+                const absQty = Math.abs(qty);
+                const avg = stockMap.get(itemId)?.avgCost ?? 0;
+
+                let unitCost: number | null = null;
+
+                if (inv3.type === "PURCHASE") {
+                  const totalMoney = inv3.lines
+                    .filter((l) => l.itemId === itemId)
+                    .reduce((s, l) => s + toNum(l.qty) * toNum(l.price), 0);
+                  unitCost = absQty > 0 ? totalMoney / absQty : 0;
+                } else {
+                  unitCost = avg;
+                }
+
+                const costTotalLine = unitCost == null ? null : unitCost * absQty;
+
+                return {
+                  itemId,
+                  qty: new Prisma.Decimal(qty),
+                  toLocationId: mvType === "IN" ? warehouse.id : null,
+                  fromLocationId: mvType === "OUT" ? warehouse.id : null,
+                  unitCost: unitCost == null ? null : new Prisma.Decimal(unitCost),
+                  costTotal: costTotalLine == null ? null : new Prisma.Decimal(costTotalLine),
+                };
+              }),
+            },
+          },
+        },
+      });
+
+      // giữ APPROVED, cập nhật approvedAt phản ánh lần sửa
+      await tx.invoice.update({
+        where: { id: inv3.id },
+        data: {
+          status: "APPROVED",
+          approvedById: params.actorId,
+          approvedAt: now,
+        } as any,
+      });
+
+      // ✅ SALES_RETURN: apply lại vào origin sau khi repost + totals chuẩn
+      if (inv3.type === "SALES_RETURN") {
+        const originId2 = originForReturn?.id || String((inv3 as any).refInvoiceId || "");
+        if (!originId2) throw httpError(400, "Thiếu refInvoiceId để cập nhật hóa đơn gốc (apply).");
+
+        await applySalesReturnToOrigin(tx, {
+          returnInvoiceId: inv3.id,
+          originInvoiceId: originId2,
+          actorId: auditCtx?.userId ?? params.actorId,
+          auditCtx,
+        });
+      }
+
+      // final sync paid (return types forced 0/unpaid)
+      await ensureLegacyPaymentAllocationOnApprove(tx, inv3.id, auditCtx?.userId ?? params.actorId);
+      await syncInvoicePaidFromAllocations(tx, inv3.id);
+
+      const after = await getInvoiceAuditSnapshot(tx, invoice.id);
 
       await auditLog(tx, {
         userId: auditCtx?.userId ?? params.actorId,
         userRole: auditCtx?.userRole,
-        action: "INVOICE_RECALL",
+        action: "INVOICE_ADMIN_EDIT_APPROVED",
         entity: "Invoice",
-        entityId: params.invoiceId,
+        entityId: invoice.id,
         before,
         after,
-        meta: mergeMeta(auditCtx?.meta, {}),
+        meta: mergeMeta(auditCtx?.meta, {
+          warehouseId: warehouse.id,
+          type: inv3.type,
+          originInvoiceId: originForReturn?.id ?? null,
+        }),
       });
+
+      return getInvoiceByIdTx(tx, invoice.id);
     },
     { timeout: 20000, maxWait: 5000 }
   );
+}
 
-  return getInvoiceById(params.invoiceId);
+/**
+ * ✅ ADMIN: Save + Post luôn (không cần về DRAFT duyệt lại)
+ *
+ * Behavior:
+ * - Nếu invoice đang APPROVED: dùng Option B "edit in-place" => rollback movement + update + repost, giữ status APPROVED
+ * - Nếu invoice đang DRAFT: updateInvoice -> submit -> approve (post)
+ * - Nếu invoice đang SUBMITTED: recall -> updateInvoice -> submit -> approve
+ *
+ * Note:
+ * - Không hỗ trợ REJECTED/CANCELLED ở đây (muốn thì làm flow riêng)
+ */
+/**
+ * ✅ ADMIN: Save + Post luôn
+ *
+ * params.updateBody: payload giống PUT /invoices/:id
+ */
+export async function adminSaveAndPostInvoice(
+  params: { invoiceId: string; actorId: string; warehouseId?: string; updateBody: any },
+  auditCtx?: AuditCtx
+) {
+  const inv = await prisma.invoice.findUnique({
+    where: { id: params.invoiceId },
+    select: { id: true, status: true, type: true },
+  });
+  if (!inv) throw httpError(404, "Invoice not found");
+
+  const body = params.updateBody || {};
+
+  // 1) APPROVED => Option B: edit in-place + repost (giữ APPROVED)
+  if (inv.status === "APPROVED") {
+    return adminEditApprovedInvoiceInPlace(
+      {
+        invoiceId: params.invoiceId,
+        actorId: params.actorId,
+        warehouseId: params.warehouseId,
+        body,
+      },
+      auditCtx
+    );
+  }
+
+  // 2) SUBMITTED => recall -> update -> submit -> approve
+  if (inv.status === "SUBMITTED") {
+    await recallInvoice({ invoiceId: params.invoiceId, actorId: params.actorId }, auditCtx);
+
+    await updateInvoice(params.invoiceId, body, auditCtx);
+
+    await submitInvoice({ invoiceId: params.invoiceId, submittedById: params.actorId }, auditCtx);
+
+    return approveInvoice(
+      { invoiceId: params.invoiceId, approvedById: params.actorId, warehouseId: params.warehouseId },
+      auditCtx
+    );
+  }
+
+  // 3) DRAFT => update -> submit -> approve
+  if (inv.status === "DRAFT") {
+    await updateInvoice(params.invoiceId, body, auditCtx);
+
+    await submitInvoice({ invoiceId: params.invoiceId, submittedById: params.actorId }, auditCtx);
+
+    return approveInvoice(
+      { invoiceId: params.invoiceId, approvedById: params.actorId, warehouseId: params.warehouseId },
+      auditCtx
+    );
+  }
+
+  if (inv.status === "REJECTED") {
+    throw httpError(409, "Hóa đơn REJECTED: không hỗ trợ Save&Post. Hãy recall/mở lại theo flow riêng.");
+  }
+
+  throw httpError(409, `Trạng thái ${inv.status}: không hỗ trợ adminSaveAndPostInvoice.`);
 }
 
 /**

@@ -90,7 +90,7 @@ api.use('/invoices', invoiceRoutes);
 api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
 app.use("/api/assistant/alerts", assistantAlertsRoute);
-api.use("/invoices", invoiceStatusRoutes);
+api.use("/invoices-status", invoiceStatusRoutes);
 
 // ✅ Reports: mount chung prefix /reports
 api.use('/reports', reportsRouter);

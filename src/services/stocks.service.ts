@@ -169,6 +169,7 @@ export async function getStockSummaryByItem(params: GetStockSummaryParams = {}) 
     return {
       itemId: item.id,
       sku: item.sku,
+      note: item.note ?? "",
       name: item.name,
       unit: item.unit?.code ?? "pcs",
       unitName: item.unit?.name ?? "Cái",

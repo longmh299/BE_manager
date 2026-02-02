@@ -3,11 +3,39 @@ import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
-const VN_TZ = "Asia/Ho_Chi_Minh";
+export const VN_TZ = "Asia/Ho_Chi_Minh";
 
 function fmtDateVN(d: Date) {
   // en-CA -> YYYY-MM-DD
   return new Intl.DateTimeFormat("en-CA", { timeZone: VN_TZ }).format(d);
+}
+
+/** ✅ Format YYYY-MM theo giờ VN */
+function fmtMonthVN(d: Date) {
+  const y = new Intl.DateTimeFormat("en-CA", { timeZone: VN_TZ, year: "numeric" }).format(d);
+  const m = new Intl.DateTimeFormat("en-CA", { timeZone: VN_TZ, month: "2-digit" }).format(d);
+  return `${y}-${m}`;
+}
+
+/**
+ * ✅ NEW: Ensure date thuộc THÁNG HIỆN TẠI theo giờ VN
+ * - Dùng cho rule: chỉ được sửa chứng từ trong tháng hiện tại
+ */
+export async function ensureDateInCurrentMonthVN(date: Date, actionLabel: string) {
+  const now = new Date();
+  const mNow = fmtMonthVN(now);
+  const mDate = fmtMonthVN(date);
+
+  if (mNow !== mDate) {
+    throw Object.assign(
+      new Error(
+        `Chỉ được phép ${actionLabel} trong tháng hiện tại (VN). Ngày chứng từ: ${fmtDateVN(
+          date
+        )} (tháng ${mDate}), tháng hiện tại: ${mNow}.`
+      ),
+      { status: 400, statusCode: 400 }
+    );
+  }
 }
 
 /**
