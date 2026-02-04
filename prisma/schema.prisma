@@ -54,6 +54,7 @@ model Location {
   stocks           Stock[]
   stockCounts      StockCount[]
   stockSnapshots   StockSnapshot[]
+  
 }
 
 model Unit {
@@ -150,23 +151,35 @@ model AssetAssignment {
 }
 
 model Movement {
-  id        String         @id @default(cuid())
-  type      MovementType
-  refNo     String?        @unique
-  note      String?
-  posted    Boolean        @default(false)
-  postedAt  DateTime?    // ✅ thêm dòng này
-  occurredAt DateTime     @default(now()) // ✅ ngày phát sinh (có thể sửa)
-  createdAt DateTime       @default(now())
-  updatedAt DateTime       @updatedAt
-  invoiceId String?
-  invoice   Invoice?       @relation(fields: [invoiceId], references: [id])
-  lines     MovementLine[]
-  @@index([posted, postedAt]) // ✅ nên thêm index này
-  @@index([type, createdAt])
+  id          String         @id @default(cuid())
+  type        MovementType
+
+  refNo       String?        @unique
+  note        String?
+
+  posted      Boolean        @default(false)
+  postedAt    DateTime?      // ✅ ok
+
+  occurredAt  DateTime       @default(now()) // ✅ ngày phát sinh
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  invoiceId   String?
+  invoice     Invoice?       @relation(fields: [invoiceId], references: [id])
+
+  // ✅ NEW: kho “ngữ cảnh” của movement (không thay thế from/to ở lines)
+    warehouseId String?     // ✅ chỉ lưu ID Location (kho default)
+
+
+
+  lines       MovementLine[]
+
+  @@index([posted, postedAt])
   @@index([type, occurredAt])
   @@index([invoiceId])
+ 
 }
+
 
 model MovementLine {
   id             String    @id @default(cuid())
@@ -178,16 +191,20 @@ model MovementLine {
   unitCost       Decimal?  @db.Decimal(18, 4)
   costTotal      Decimal?  @db.Decimal(18, 4)
   note           String?
+
   fromLoc        Location? @relation("FromLocation", fields: [fromLocationId], references: [id])
   item           Item      @relation(fields: [itemId], references: [id])
   movement       Movement  @relation(fields: [movementId], references: [id])
   toLoc          Location? @relation("ToLocation", fields: [toLocationId], references: [id])
 
+  // ✅ Dùng khi load lines theo movement
   @@index([movementId])
-  @@index([itemId])
-  @@index([fromLocationId])
-  @@index([toLocationId])
+
+  // ✅ Dùng cho recompute/unpost: filter theo item + kho
+  @@index([itemId, fromLocationId])
+  @@index([itemId, toLocationId])
 }
+
 
 model StockCount {
   id         String           @id @default(cuid())
@@ -231,13 +248,8 @@ model Partner {
 
 model Invoice {
   id                 String               @id @default(cuid())
-
-  // ✅ code không unique toàn bảng nữa (để reset theo năm)
   code               String
-
-  // ✅ năm dương lịch để unique + reset (vd 2026)
   codeYear           Int                  @default(0)
-
   type               InvoiceType
   issueDate          DateTime
   partnerId          String?
@@ -258,7 +270,20 @@ model Invoice {
   totalCost          Decimal?             @db.Decimal(18, 2)
   note               String?
   attachment         String?
+
+  // ====== RETURN (GIỮ NGUYÊN - KHÔNG ĐỘNG) ======
   refInvoiceId       String?
+  refInvoice         Invoice?             @relation("InvoiceReturnRef", fields: [refInvoiceId], references: [id])
+  returns            Invoice[]            @relation("InvoiceReturnRef")
+
+  // ====== ADJUSTMENT (MỚI - TÁCH RIÊNG) ======
+  adjustsInvoiceId   String?
+  adjustmentKind     AdjustmentKind?
+  adjustmentReason   String?
+
+  adjustsInvoice     Invoice?             @relation("InvoiceAdjustRef", fields: [adjustsInvoiceId], references: [id])
+  adjustments        Invoice[]            @relation("InvoiceAdjustRef")
+
   hasWarrantyHold    Boolean              @default(false)
   warrantyHoldPct    Decimal              @default(0) @db.Decimal(5, 2)
   warrantyHoldAmount Decimal              @default(0) @db.Decimal(18, 2)
@@ -279,14 +304,14 @@ model Invoice {
   returnedSubtotal   Decimal              @default(0) @db.Decimal(18, 2)
   returnedTax        Decimal              @default(0) @db.Decimal(18, 2)
   returnedTotal      Decimal              @default(0) @db.Decimal(18, 2)
+
   approvedBy         User?                @relation("InvoiceApprovedBy", fields: [approvedById], references: [id])
   cancelledBy        User?                @relation("InvoiceCancelledBy", fields: [cancelledById], references: [id])
   partner            Partner?             @relation(fields: [partnerId], references: [id])
   receiveAccount     PaymentAccount?      @relation("InvoiceReceiveAccount", fields: [receiveAccountId], references: [id])
-  refInvoice         Invoice?             @relation("InvoiceReturnRef", fields: [refInvoiceId], references: [id])
-  returns            Invoice[]            @relation("InvoiceReturnRef")
   saleUser           User?                @relation("InvoiceSaleUser", fields: [saleUserId], references: [id])
   techUser           User?                @relation("InvoiceTechUser", fields: [techUserId], references: [id])
+
   lines              InvoiceLine[]
   movements          Movement[]
   allocations        PaymentAllocation[]
@@ -298,15 +323,22 @@ model Invoice {
   @@index([saleUserId])
   @@index([techUserId])
   @@index([receiveAccountId])
+
+  // RETURN index (GIỮ NGUYÊN)
   @@index([refInvoiceId])
+
+  // ADJUSTMENT index (MỚI)
+  @@index([adjustsInvoiceId])
+  @@index([adjustmentKind])
+
   @@index([type, status, issueDate])
   @@index([cancelledById])
   @@index([cancelledAt])
 
-  // ✅ unique theo năm + loại chứng từ + code
   @@unique([codeYear, type, code])
   @@index([codeYear, type, code])
 }
+
 
 model InvoiceCounter {
   // ✅ counter theo năm + loại hoá đơn (SALES/PURCHASE/RETURN...)
@@ -578,6 +610,7 @@ enum MovementType {
   OUT
   TRANSFER
   ADJUST
+  REVALUE
 }
 
 enum InvoiceType {
@@ -608,4 +641,8 @@ enum AllocationKind {
   NORMAL
   WARRANTY_HOLD
   TAX
+}
+enum AdjustmentKind {
+  DEBIT
+  CREDIT
 }

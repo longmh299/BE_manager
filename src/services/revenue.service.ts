@@ -138,6 +138,9 @@ function calcNetSafe(params: { subtotalRaw: number; tax: number; total: number; 
 /** =========================================================
  * getStaffPersonalRevenue
  * ✅ tính doanh số theo ds_date (ngày đủ need) giống popup
+ * ✅ FIX: SALES_RETURN phải trừ kể cả khi không có payment NORMAL
+ *      - SALES: giữ logic ds_date = ngày đủ tiền
+ *      - SALES_RETURN: ds_date = issueDate (không phụ thuộc payment)
  * ========================================================= */
 async function getStaffPersonalRevenue(params: {
   from?: Date;
@@ -164,6 +167,7 @@ async function getStaffPersonalRevenue(params: {
       SELECT
         i."id" AS invoice_id,
         i."type",
+        i."issueDate" AS issue_date,
         ${staffIdField} AS staff_id,
         ${staffNameField} AS staff_name,
         i."receiveAccountId",
@@ -224,6 +228,7 @@ async function getStaffPersonalRevenue(params: {
         inv.staff_name,
         inv.net,
         inv.need,
+        inv.issue_date,
         pay.pay_date,
         pay.pay_id,
         pay.amt,
@@ -236,6 +241,7 @@ async function getStaffPersonalRevenue(params: {
       JOIN pay ON pay.invoice_id = inv.invoice_id
     ),
     ds AS (
+      -- SALES: giữ logic cũ (ds_date = ngày đủ need theo NORMAL)
       SELECT
         s.invoice_id,
         MIN(s.pay_date) AS ds_date,
@@ -245,7 +251,21 @@ async function getStaffPersonalRevenue(params: {
         MAX(s.net) AS net
       FROM seq s
       WHERE s.cum_amt >= s.need
+        AND s."type" = 'SALES'
       GROUP BY s.invoice_id
+
+      UNION ALL
+
+      -- SALES_RETURN: trừ ngay theo issueDate (không phụ thuộc payment)
+      SELECT
+        inv.invoice_id,
+        inv.issue_date AS ds_date,
+        inv."type" AS type,
+        inv.staff_id,
+        inv.staff_name,
+        inv.net
+      FROM inv
+      WHERE inv."type" = 'SALES_RETURN'
     )
     SELECT
       COALESCE(d.staff_id, ('__NAME__:' || d.staff_name)) AS "userId",
@@ -279,6 +299,7 @@ async function getStaffPersonalRevenue(params: {
 
 /** =========================================================
  * getStaffInvoices (popup)
+ * ✅ FIX: include SALES_RETURN (ds_date = issueDate)
  * ========================================================= */
 async function getStaffInvoices(params: {
   from?: Date;
@@ -373,6 +394,7 @@ async function getStaffInvoices(params: {
       JOIN pay ON pay.invoice_id = inv.invoice_id
     ),
     ds AS (
+      -- SALES: đủ need theo NORMAL
       SELECT
         s.invoice_id,
         MIN(s.pay_date) AS ds_date,
@@ -386,7 +408,25 @@ async function getStaffInvoices(params: {
         MAX(s.need) AS need
       FROM seq s
       WHERE s.cum_amt >= s.need
+        AND s.type = 'SALES'
       GROUP BY s.invoice_id
+
+      UNION ALL
+
+      -- SALES_RETURN: show ngay theo issueDate
+      SELECT
+        inv.invoice_id,
+        inv.issue_date AS ds_date,
+        inv.code,
+        inv.issue_date,
+        inv.partner_name,
+        inv.type,
+        inv.net,
+        inv.vat,
+        inv.gross,
+        inv.need
+      FROM inv
+      WHERE inv.type = 'SALES_RETURN'
     ),
     paid AS (
       SELECT

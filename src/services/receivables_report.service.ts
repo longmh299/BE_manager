@@ -82,6 +82,8 @@ function buildExcludeFullyReturnedWhere(): Prisma.InvoiceWhereInput {
 
 /**
  * ✅ basis theo NET sau trả hàng + trừ BH treo
+ * - HOLD chỉ tính khi hasWarrantyHold = true
+ * - HOLD ưu tiên amount, fallback pct (%)
  */
 function computeBasis(inv: any) {
   const netSubtotal =
@@ -97,8 +99,24 @@ function computeBasis(inv: any) {
 
   const hasHold = inv.hasWarrantyHold === true;
 
-  let holdAmount = hasHold ? roundMoney(Math.max(0, toNum(inv.warrantyHoldAmount))) : 0;
-  if (holdAmount > netSubtotal) holdAmount = netSubtotal;
+  let holdAmount = 0;
+
+  if (hasHold) {
+    const amt = roundMoney(Math.max(0, toNum(inv.warrantyHoldAmount)));
+    if (amt > 0.0001) {
+      holdAmount = amt;
+    } else {
+      const pct = roundMoney(Math.max(0, toNum(inv.warrantyHoldPct)));
+      if (pct > 0.0001) {
+        // ✅ theo NET (netTotal) vì basis là NET sau trả hàng
+        holdAmount = roundMoney((netTotal * pct) / 100);
+      }
+    }
+  }
+
+  // cap hold không vượt quá netTotal (an toàn hơn netSubtotal)
+  if (holdAmount > netTotal) holdAmount = netTotal;
+  if (holdAmount < 0) holdAmount = 0;
 
   const collectible = Math.max(0, roundMoney(netTotal - holdAmount));
 
@@ -120,7 +138,7 @@ export type PaymentHistoryRow = {
   paymentType: string; // PaymentType
   refNo: string | null;
   allocationKind: AllocationKind;
-  amount: number;
+  amount: number; // signed
   note: string | null;
   accountName?: string | null;
   accountCode?: string | null;
@@ -144,9 +162,9 @@ export type ReceivableInvoiceRow = {
   warrantyHoldAmount: number;
   warrantyDueDate: string | null;
 
-  paidTotal: number; // invoice.paidAmount (NET NORMAL)
-  paidNormal: number;
-  paidWarranty: number;
+  paidTotal: number; // invoice.paidAmount (fallback)
+  paidNormal: number; // signed sum allocations NORMAL
+  paidWarranty: number; // signed sum allocations WARRANTY_HOLD
 
   normalOutstanding: number;
   warrantyOutstanding: number;
@@ -175,9 +193,8 @@ export async function getReceivablesReport(params: { asOf?: string; includeRows?
   const asOf = parseAsOf(params.asOf);
   const includeRows = params.includeRows !== false;
 
-  const asOfDateOnly = params.asOf && /^\d{4}-\d{2}-\d{2}$/.test(params.asOf)
-    ? params.asOf
-    : toDateOnlyLocal(asOf);
+  const asOfDateOnly =
+    params.asOf && /^\d{4}-\d{2}-\d{2}$/.test(params.asOf) ? params.asOf : toDateOnlyLocal(asOf);
 
   // ✅ Rule: hóa đơn qua tháng mới lên công nợ
   const periodStart = startOfMonthLocal(asOf);
@@ -212,6 +229,7 @@ export async function getReceivablesReport(params: { asOf?: string; includeRows?
       paidAmount: true,
 
       hasWarrantyHold: true,
+      warrantyHoldPct: true,        // ✅ NEW
       warrantyHoldAmount: true,
       warrantyDueDate: true,
     },
@@ -239,36 +257,50 @@ export async function getReceivablesReport(params: { asOf?: string; includeRows?
   const invoiceIds = invoices.map((x) => x.id);
 
   /**
-   * ✅ allocations theo invoiceId + kind, nhưng phải cắt theo asOf:
-   * chỉ lấy Payment.date <= asOf (chốt công nợ)
+   * ✅ allocations theo invoiceId + kind, cắt theo asOf
+   * ✅ FIX: signed theo Payment.type:
+   *  - RECEIPT => +ABS(amount)
+   *  - PAYMENT => -ABS(amount)
+   * (tránh case data lúc dương lúc âm)
    */
-  const allocGroups = await prisma.paymentAllocation.groupBy({
-    by: ["invoiceId", "kind"],
-    where: {
-      invoiceId: { in: invoiceIds },
-      kind: { in: ["NORMAL" as AllocationKind, "WARRANTY_HOLD" as AllocationKind] },
-      payment: { date: { lte: asOf } },
-    },
-    _sum: { amount: true },
-  });
+  const allocGroups: Array<{ invoice_id: string; kind: AllocationKind; sum_amt: any }> =
+    await prisma.$queryRaw`
+      SELECT
+        pa."invoiceId" AS invoice_id,
+        pa."kind"      AS kind,
+        COALESCE(SUM(
+          CASE
+            WHEN p."type"::text = 'PAYMENT' THEN -ABS(COALESCE(pa."amount",0))
+            WHEN p."type"::text = 'RECEIPT' THEN  ABS(COALESCE(pa."amount",0))
+            ELSE COALESCE(pa."amount",0)
+          END
+        ),0) AS sum_amt
+      FROM "PaymentAllocation" pa
+      JOIN "Payment" p ON p."id" = pa."paymentId"
+      WHERE
+        pa."invoiceId" IN (${Prisma.join(invoiceIds)})
+        AND pa."kind" IN ('NORMAL','WARRANTY_HOLD')
+        AND p."date" <= ${asOf}
+      GROUP BY 1,2
+    `;
 
   const allocMap = new Map<string, { normal: Money; warranty: Money }>();
   for (const g of allocGroups) {
     const cur =
-      allocMap.get(g.invoiceId) ?? {
+      allocMap.get(g.invoice_id) ?? {
         normal: new Prisma.Decimal(0),
         warranty: new Prisma.Decimal(0),
       };
 
-    const sumAmt = D(g._sum.amount);
+    const sumAmt = D(g.sum_amt);
 
     if (g.kind === ("NORMAL" as AllocationKind)) cur.normal = cur.normal.plus(sumAmt);
     if (g.kind === ("WARRANTY_HOLD" as AllocationKind)) cur.warranty = cur.warranty.plus(sumAmt);
 
-    allocMap.set(g.invoiceId, cur);
+    allocMap.set(g.invoice_id, cur);
   }
 
-  // ✅ payment history (chi tiết allocations) để hiển thị trong dialog thu tiền (cũng cắt theo asOf)
+  // ✅ payment history (cắt theo asOf) + signed amount
   const historyMap = new Map<string, PaymentHistoryRow[]>();
   if (includeRows && invoiceIds.length) {
     const allocs = await prisma.paymentAllocation.findMany({
@@ -298,17 +330,26 @@ export async function getReceivablesReport(params: { asOf?: string; includeRows?
     for (const a of allocs as any[]) {
       const invId = a.invoiceId as string;
       const list = historyMap.get(invId) ?? [];
+
+      const rawAmt = roundMoney(toNum(a.amount));
+      const pt = String(a.payment.type || "");
+
+      // ✅ signed theo type + ABS chống data bẩn
+      const signed =
+        pt === "PAYMENT" ? -Math.abs(rawAmt) : pt === "RECEIPT" ? Math.abs(rawAmt) : rawAmt;
+
       list.push({
         paymentId: a.payment.id,
         paymentDate: (a.payment.date as Date).toISOString().slice(0, 10),
-        paymentType: String(a.payment.type),
+        paymentType: pt,
         refNo: a.payment.refNo ?? null,
         allocationKind: a.kind as AllocationKind,
-        amount: roundMoney(toNum(a.amount)),
+        amount: signed,
         note: a.payment.note ?? null,
         accountName: a.payment.account?.name ?? null,
         accountCode: a.payment.account?.code ?? null,
       });
+
       historyMap.set(invId, list);
     }
   }
@@ -342,6 +383,7 @@ export async function getReceivablesReport(params: { asOf?: string; includeRows?
     let paidWarranty = new Prisma.Decimal(0);
 
     if (hasAnyAllocation) {
+      // ✅ paid có thể âm nếu hoàn > thu, nên clamp0 để không làm "nợ tăng ảo"
       paidNormal = max0(D(alloc!.normal));
       paidWarranty = max0(D(alloc!.warranty));
     } else {
@@ -384,23 +426,23 @@ export async function getReceivablesReport(params: { asOf?: string; includeRows?
         invoiceCount: 0,
       } as ReceivablesByPartnerRow);
 
-    const n = Number(normalOutstanding);
-    const h = Number(warrantyHoldNotDue);
-    const d = Number(warrantyHoldDue);
-    const t = Number(totalOutstanding);
+    const nOut = Number(normalOutstanding);
+    const hNot = Number(warrantyHoldNotDue);
+    const hDue = Number(warrantyHoldDue);
+    const tOut = Number(totalOutstanding);
 
-    cur.normalOutstanding += n;
-    cur.warrantyHoldNotDue += h;
-    cur.warrantyHoldDue += d;
-    cur.totalOutstanding += t;
+    cur.normalOutstanding += nOut;
+    cur.warrantyHoldNotDue += hNot;
+    cur.warrantyHoldDue += hDue;
+    cur.totalOutstanding += tOut;
     cur.invoiceCount += 1;
 
     byPartnerMap.set(partnerKey, cur);
 
-    sumNormal += n;
-    sumHoldNotDue += h;
-    sumHoldDue += d;
-    sumTotal += t;
+    sumNormal += nOut;
+    sumHoldNotDue += hNot;
+    sumHoldDue += hDue;
+    sumTotal += tOut;
 
     if (includeRows) {
       const saleName = (inv.saleUserName || inv.saleUser?.username || null) as string | null;
@@ -427,13 +469,13 @@ export async function getReceivablesReport(params: { asOf?: string; includeRows?
         paidNormal: Number(paidNormal),
         paidWarranty: Number(paidWarranty),
 
-        normalOutstanding: n,
+        normalOutstanding: nOut,
         warrantyOutstanding: Number(warrantyOutstanding),
 
-        warrantyHoldNotDue: h,
-        warrantyHoldDue: d,
+        warrantyHoldNotDue: hNot,
+        warrantyHoldDue: hDue,
 
-        totalOutstanding: t,
+        totalOutstanding: tOut,
         paymentHistory: historyMap.get(inv.id) || [],
       });
     }

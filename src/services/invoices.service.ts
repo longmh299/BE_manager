@@ -911,6 +911,39 @@ async function assertInvoiceEditable(tx: Prisma.TransactionClient | PrismaClient
     throw httpError(409, "Chỉ hoá đơn NHÁP (DRAFT) mới được chỉnh sửa.");
   }
 }
+/**
+ * ✅ Rule: chỉnh sửa hoá đơn đã duyệt theo "tuổi hoá đơn" (tính theo createdAt)
+ * - admin: 90 ngày
+ * - accountant: 7 ngày
+ * - role khác: cấm
+ *
+ * NOTE:
+ * - KHÔNG thay period lock, period lock vẫn check riêng (ensureDateNotLocked)
+ */
+function assertEditApprovedWindowOrThrow(params: {
+  invoice: { createdAt?: Date | string | null };
+  userRole?: string | null;
+}) {
+  const createdAtRaw = params.invoice?.createdAt;
+  if (!createdAtRaw) return; // fallback an toàn nếu thiếu field
+
+  const role = params.userRole || "";
+
+  let days = 0;
+  if (role === "admin") days = 90;
+  else if (role === "accountant") days = 7;
+  else throw httpError(403, "Bạn không có quyền chỉnh sửa hóa đơn đã duyệt.");
+
+  const createdAt = new Date(createdAtRaw as any);
+  if (isNaN(createdAt.getTime())) return; // fallback nếu date lỗi
+
+  const now = new Date();
+  const diffDays = (now.getTime() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+
+  if (diffDays > days) {
+    throw httpError(409, `Hóa đơn đã quá ${days} ngày kể từ ngày tạo, không được chỉnh sửa.`);
+  }
+}
 
 /** rounding helper cho avgCost (4 decimals) */
 function round4(n: number) {
@@ -1587,7 +1620,7 @@ export async function createInvoice(body: any, auditCtx?: AuditCtx) {
     const created = await prisma.$transaction(
       async (tx) => {
         // ✅ period lock: chặn tạo “ngày phát sinh” vào kỳ đã khóa (tuỳ policy của bạn)
-        await ensureDateNotLocked(issueDate, "tạo hóa đơn");
+        await ensureDateNotLocked(issueDate, "tạo hóa đơn", auditCtx?.userRole);
 
         const receiveAccountId = await validateReceiveAccountId(tx, body.receiveAccountId);
 
@@ -1846,7 +1879,8 @@ export async function updateInvoice(id: string, body: any, auditCtx?: AuditCtx) 
 
         // ✅ period lock: chặn sửa nếu issueDate thuộc kỳ khóa
         // (vì update có thể dẫn tới approve/post ở kỳ đó)
-        await ensureDateNotLocked(current.issueDate ?? new Date(), "cập nhật hóa đơn");
+        const nextIssueDate = body.issueDate ? new Date(body.issueDate) : (current.issueDate ?? new Date());
+        await ensureDateNotLocked(nextIssueDate, "cập nhật hóa đơn", auditCtx?.userRole);
 
         const nextType: InvoiceType = (body.type ?? current.type) as InvoiceType;
 
@@ -2119,7 +2153,7 @@ export async function deleteInvoice(id: string, auditCtx?: AuditCtx) {
   if (!inv) throw httpError(404, "Invoice not found");
 
   // ✅ period lock: chặn xóa hóa đơn ở kỳ đã khóa
-  await ensureDateNotLocked(inv.issueDate ?? new Date(), "xóa hóa đơn");
+  await ensureDateNotLocked(inv.issueDate ?? new Date(), "xóa hóa đơn", auditCtx?.userRole);
 
   if (inv.status === "APPROVED") {
     throw httpError(409, "Hóa đơn đã duyệt, không được xóa. Hãy dùng chứng từ điều chỉnh/hoàn trả.");
@@ -2258,7 +2292,7 @@ export async function submitInvoice(
       if (!inv) throw httpError(404, "Invoice not found");
 
       // ✅ period lock
-      await ensureDateNotLocked(inv.issueDate ?? new Date(), "gửi duyệt hóa đơn");
+      await ensureDateNotLocked(inv.issueDate ?? new Date(), "gửi duyệt hóa đơn", auditCtx?.userRole);
 
       if (inv.status === "APPROVED") throw httpError(409, "Hóa đơn đã duyệt rồi.");
       if (inv.status === "REJECTED") throw httpError(409, "Hóa đơn đã bị từ chối.");
@@ -2308,7 +2342,7 @@ export async function approveInvoice(
       if (!invoice) throw httpError(404, "Invoice not found");
 
       // ✅ period lock
-      await ensureDateNotLocked((invoice as any).issueDate ?? new Date(), "duyệt hóa đơn");
+      await ensureDateNotLocked((invoice as any).issueDate ?? new Date(), "duyệt hóa đơn", auditCtx?.userRole);
 
       if (invoice.status === "APPROVED") throw httpError(409, "Hóa đơn đã duyệt rồi.");
       if (invoice.status === "REJECTED") throw httpError(409, "Hóa đơn đã bị từ chối.");
@@ -2692,7 +2726,7 @@ export async function rejectInvoice(
       if (!inv) throw httpError(404, "Invoice not found");
 
       // ✅ period lock: chặn reject nếu kỳ khóa (tuỳ policy, mình set chặt để khớp chốt sổ)
-      await ensureDateNotLocked(inv.issueDate ?? new Date(), "từ chối hóa đơn");
+      await ensureDateNotLocked(inv.issueDate ?? new Date(), "từ chối hóa đơn", auditCtx?.userRole);
 
       if (inv.status === "APPROVED") throw httpError(409, "Hóa đơn đã duyệt, không thể từ chối.");
       if (inv.status === "REJECTED") throw httpError(409, "Hóa đơn đã bị từ chối rồi.");
@@ -2751,9 +2785,14 @@ export async function reopenApprovedInvoice(
       if (invoice.status !== "APPROVED") {
         throw httpError(409, "Chỉ hóa đơn đã DUYỆT (APPROVED) mới được mở lại.");
       }
+// ✅ NEW: window rule theo createdAt (admin 90d, accountant 7d)
+assertEditApprovedWindowOrThrow({
+  invoice: { createdAt: (invoice as any).createdAt },
+  userRole: auditCtx?.userRole,
+});
 
       // ✅ period lock
-      await ensureDateNotLocked(invoice.issueDate ?? new Date(), "mở lại hóa đơn đã duyệt");
+      await ensureDateNotLocked(invoice.issueDate ?? new Date(), "mở lại hóa đơn đã duyệt", auditCtx?.userRole);
 
       const warehouse = await ensureWarehouseTx(tx, params.warehouseId);
 
@@ -2920,7 +2959,7 @@ export async function recallInvoice(
       }
 
       // ✅ period lock: chặn recall nếu kỳ khóa
-      await ensureDateNotLocked(inv.issueDate ?? new Date(), "thu hồi hóa đơn");
+      await ensureDateNotLocked(inv.issueDate ?? new Date(), "thu hồi hóa đơn", auditCtx?.userRole);
 
       await tx.invoice.update({
         where: { id: params.invoiceId },
@@ -2982,7 +3021,7 @@ export async function unpostInvoiceStock(invoiceId: string, _auditCtx?: AuditCtx
   throw httpError(400, "unpostInvoiceStock đã deprecated theo mô hình chốt sổ.");
 }
 
-export async function hardDeleteInvoice(id: string) {
+export async function hardDeleteInvoice(id: string, auditCtx?: AuditCtx) {
   const inv = await prisma.invoice.findUnique({
     where: { id },
     select: { status: true, issueDate: true },
@@ -2990,7 +3029,7 @@ export async function hardDeleteInvoice(id: string) {
   if (!inv) throw httpError(404, "Invoice not found");
 
   // ✅ period lock
-  await ensureDateNotLocked(inv.issueDate ?? new Date(), "hard delete hóa đơn");
+  await ensureDateNotLocked(inv.issueDate ?? new Date(), "hard delete hóa đơn", auditCtx?.userRole);
 
   if (inv.status === "APPROVED") {
     throw httpError(409, "Hóa đơn đã duyệt (chốt sổ). Không hỗ trợ hard delete.");
@@ -3201,7 +3240,7 @@ export async function adminEditApprovedInvoiceInPlace(
       // ✅ period lock: check theo issueDate MỚI nếu admin gửi lên
       const nextIssueDate =
         body.issueDate !== undefined ? new Date(body.issueDate) : (invoice.issueDate ?? new Date());
-      await ensureDateNotLocked(nextIssueDate, "admin sửa hóa đơn đã duyệt");
+      await ensureDateNotLocked(nextIssueDate, "admin sửa hóa đơn đã duyệt",auditCtx?.userRole);
 
       const currentType: InvoiceType = invoice.type as InvoiceType;
       const nextType: InvoiceType = (body.type ?? currentType) as InvoiceType;
@@ -3209,7 +3248,11 @@ export async function adminEditApprovedInvoiceInPlace(
       if (nextType !== currentType) {
         throw httpError(409, "Admin-edit-approved hiện không cho đổi type của hóa đơn đã duyệt.");
       }
-
+// ✅ NEW: window rule theo createdAt (admin 90d, accountant 7d)
+assertEditApprovedWindowOrThrow({
+  invoice: { createdAt: (invoice as any).createdAt },
+  userRole: auditCtx?.userRole,
+});
       // ✅ TRIỆT ĐỂ (an toàn): nếu SALES đã có trả hàng apply (returnedTotal>0) thì cấm sửa in-place
       // (vì sửa lines/subtotal sẽ làm origin net/returned không còn đúng với return chain)
       if (currentType === "SALES") {

@@ -5,6 +5,16 @@ const prisma = new PrismaClient();
 
 export const VN_TZ = "Asia/Ho_Chi_Minh";
 
+/**
+ * ✅ Role-based rolling period lock (theo NGÀY VN)
+ * - admin: 90 ngày
+ * - accountant: 7 ngày
+ * - default (role khác / thiếu): 7 ngày
+ */
+export const ADMIN_LOCK_DAYS = 90;
+export const ACCOUNTANT_LOCK_DAYS = 7;
+export const DEFAULT_LOCK_DAYS = 7; // đổi thành 90 nếu muốn user thường cũng 90
+
 function fmtDateVN(d: Date) {
   // en-CA -> YYYY-MM-DD
   return new Intl.DateTimeFormat("en-CA", { timeZone: VN_TZ }).format(d);
@@ -18,7 +28,96 @@ function fmtMonthVN(d: Date) {
 }
 
 /**
- * ✅ NEW: Ensure date thuộc THÁNG HIỆN TẠI theo giờ VN
+ * Convert 'YYYY-MM-DD' (ngày VN) -> Date tại 00:00 VN (ISO +07:00)
+ * => Date object (UTC nội bộ) nhưng đại diện đúng mốc 00:00 VN.
+ */
+function vnMidnightToUTC(ymd: string) {
+  return new Date(`${ymd}T00:00:00+07:00`);
+}
+
+/**
+ * Cộng/trừ ngày trên trục NGÀY VN một cách ổn định:
+ * - input: ymd 'YYYY-MM-DD'
+ * - deltaDays: +/- N
+ * - output: ymd 'YYYY-MM-DD' (VN)
+ */
+function addDaysYMD_VN(ymd: string, deltaDays: number) {
+  const d = new Date(`${ymd}T00:00:00+07:00`);
+  d.setDate(d.getDate() + deltaDays);
+  return fmtDateVN(d);
+}
+
+function todayYMDVN(now = new Date()) {
+  return fmtDateVN(now);
+}
+
+function normalizeRole(role?: string | null) {
+  return String(role || "").trim().toLowerCase();
+}
+
+function lockDaysForRole(role?: string | null) {
+  const r = normalizeRole(role);
+  if (r === "admin") return ADMIN_LOCK_DAYS;
+  if (r === "accountant") return ACCOUNTANT_LOCK_DAYS;
+  return DEFAULT_LOCK_DAYS;
+}
+
+/* =========================================================
+   ✅ Rule: Rolling lock (source of truth)
+   Mốc khoá = 00:00 VN của (todayVN - lockDays)
+========================================================= */
+
+/**
+ * ✅ lockedUntil = 00:00 VN của (todayVN - lockDays)
+ * Ví dụ: hôm nay (VN) 2026-02-02, admin(90)
+ * => lockedUntilYMD = 2025-11-04
+ * => lockedUntilDate = 2025-11-04 00:00 (VN)
+ */
+function rollingLockedUntil(now = new Date(), userRole?: string | null) {
+  const days = lockDaysForRole(userRole);
+  const todayVN = todayYMDVN(now);
+  const lockedYMD = addDaysYMD_VN(todayVN, -days);
+  return { days, lockedYMD, lockedDate: vnMidnightToUTC(lockedYMD) };
+}
+
+/**
+ * ✅ So lock theo NGÀY VN (YYYY-MM-DD) để tránh lệch do giờ/UTC:
+ * LOCK nếu invYMD <= lockedYMD
+ */
+function isLockedByRollingWindow(date: Date, now = new Date(), userRole?: string | null) {
+  const invYMD = fmtDateVN(date);
+  const { lockedYMD } = rollingLockedUntil(now, userRole);
+  return invYMD <= lockedYMD;
+}
+
+/**
+ * Generic date check (rolling lock theo role)
+ */
+export async function isDateLocked(date: Date, userRole?: string | null): Promise<boolean> {
+  if (!date) return false;
+  return isLockedByRollingWindow(date, new Date(), userRole);
+}
+
+export async function ensureDateNotLocked(
+  date: Date,
+  actionLabel: string,
+  userRole?: string | null
+) {
+  if (await isDateLocked(date, userRole)) {
+    const { days, lockedYMD } = rollingLockedUntil(new Date(), userRole);
+    throw Object.assign(
+      new Error(
+        `Chứng từ quá hạn chỉnh sửa (${days} ngày). ` +
+          `Mốc khoá (VN): ${lockedYMD}. ` +
+          `Ngày chứng từ: ${fmtDateVN(date)}. Không được phép ${actionLabel}.`
+      ),
+      { status: 400, statusCode: 400 }
+    );
+  }
+}
+
+/**
+ * ✅ Ensure date thuộc THÁNG HIỆN TẠI theo giờ VN
  * - Dùng cho rule: chỉ được sửa chứng từ trong tháng hiện tại
  */
 export async function ensureDateInCurrentMonthVN(date: Date, actionLabel: string) {
@@ -38,12 +137,11 @@ export async function ensureDateInCurrentMonthVN(date: Date, actionLabel: string
   }
 }
 
-/**
- * Lấy ngày đã khoá gần nhất (max closedUntil)
- * Nếu chưa khoá lần nào -> null
- *
- * ✅ ASSUME: closedUntil đã được lưu đúng "cuối ngày VN" từ locks.routes.ts
- */
+/* =========================================================
+   Legacy DB-based period lock (kept for compatibility / UI)
+   NOTE: Not used to determine lock anymore.
+========================================================= */
+
 export async function getClosedUntil(): Promise<Date | null> {
   const row = await prisma.periodLock.findFirst({
     orderBy: { closedUntil: "desc" },
@@ -52,19 +150,29 @@ export async function getClosedUntil(): Promise<Date | null> {
 }
 
 async function getClosedUntilEOD(): Promise<Date | null> {
-  // ✅ do NOT recompute end-of-day again (tránh lệch ngày vì timezone)
   return getClosedUntil();
 }
 
-/**
- * Kiểm tra 1 movement có thuộc kỳ đã khoá không
- * ✅ Rule: effectiveDate <= closedUntil => LOCKED
- * - effectiveDate ưu tiên occurredAt (ngày phát sinh), fallback createdAt
- */
-export async function isMovementLocked(movementId: string): Promise<boolean> {
-  const closedUntil = await getClosedUntilEOD();
-  if (!closedUntil) return false;
+/* =========================================================
+   ✅ Movement lock (giữ rolling 90 ngày như bản cũ, KHÔNG theo role)
+========================================================= */
 
+// Nếu m muốn movement cũng theo 90/7 thì nói, còn hiện tại giữ nguyên 90 như logic cũ.
+export const PERIOD_LOCK_DAYS = 90;
+
+function rollingLockedUntil90(now = new Date()) {
+  const todayVN = todayYMDVN(now);
+  const lockedYMD = addDaysYMD_VN(todayVN, -PERIOD_LOCK_DAYS);
+  return { lockedYMD, lockedDate: vnMidnightToUTC(lockedYMD) };
+}
+
+function isLockedByRollingWindow90(date: Date, now = new Date()) {
+  const invYMD = fmtDateVN(date);
+  const { lockedYMD } = rollingLockedUntil90(now);
+  return invYMD <= lockedYMD;
+}
+
+export async function isMovementLocked(movementId: string): Promise<boolean> {
   const mv = await prisma.movement.findUnique({
     where: { id: movementId },
     select: { createdAt: true, occurredAt: true },
@@ -72,50 +180,40 @@ export async function isMovementLocked(movementId: string): Promise<boolean> {
   if (!mv) return false;
 
   const effective = mv.occurredAt ?? mv.createdAt;
-  return effective.getTime() <= closedUntil.getTime();
+  return isLockedByRollingWindow90(effective, new Date());
 }
 
-/**
- * Kiểm tra 1 dòng movement line có thuộc kỳ đã khoá không
- */
 export async function isMovementLineLocked(lineId: string): Promise<boolean> {
-  const closedUntil = await getClosedUntilEOD();
-  if (!closedUntil) return false;
-
   const line = await prisma.movementLine.findUnique({
     where: { id: lineId },
-    include: { movement: { select: { createdAt: true, occurredAt: true } } },
+    select: { movement: { select: { createdAt: true, occurredAt: true } } },
   });
   if (!line || !line.movement) return false;
 
-  const effective = (line.movement as any).occurredAt ?? line.movement.createdAt;
-  return effective.getTime() <= closedUntil.getTime();
+  const effective = line.movement.occurredAt ?? line.movement.createdAt;
+  return isLockedByRollingWindow90(effective, new Date());
 }
 
-/**
- * Nếu movement thuộc kỳ đã khoá -> throw error
- */
 export async function ensureMovementNotLocked(movementId: string) {
   if (await isMovementLocked(movementId)) {
-    const closedUntil = await getClosedUntilEOD();
+    const { lockedYMD } = rollingLockedUntil90(new Date());
     throw Object.assign(
       new Error(
-        `Chứng từ thuộc kỳ đã khoá đến ${closedUntil ? fmtDateVN(closedUntil) : ""}, không được phép sửa/xoá/post.`
+        `Chứng từ quá hạn chỉnh sửa (${PERIOD_LOCK_DAYS} ngày). ` +
+          `Mốc khoá (VN): ${lockedYMD}. Không được phép sửa/xoá/post.`
       ),
       { status: 400, statusCode: 400 }
     );
   }
 }
 
-/**
- * Nếu movement line thuộc kỳ đã khoá -> throw error
- */
 export async function ensureMovementLineNotLocked(lineId: string) {
   if (await isMovementLineLocked(lineId)) {
-    const closedUntil = await getClosedUntilEOD();
+    const { lockedYMD } = rollingLockedUntil90(new Date());
     throw Object.assign(
       new Error(
-        `Dòng chứng từ thuộc kỳ đã khoá đến ${closedUntil ? fmtDateVN(closedUntil) : ""}, không được phép sửa/xoá.`
+        `Dòng chứng từ quá hạn chỉnh sửa (${PERIOD_LOCK_DAYS} ngày). ` +
+          `Mốc khoá (VN): ${lockedYMD}. Không được phép sửa/xoá.`
       ),
       { status: 400, statusCode: 400 }
     );
@@ -123,50 +221,26 @@ export async function ensureMovementLineNotLocked(lineId: string) {
 }
 
 /* =========================================================
-   ✅ Lock helpers for StockCount / generic date check
+   ✅ StockCount locks (giữ rolling 90 ngày như bản cũ)
 ========================================================= */
 
-export async function isDateLocked(date: Date): Promise<boolean> {
-  const closedUntil = await getClosedUntilEOD();
-  if (!closedUntil) return false;
-  return date.getTime() <= closedUntil.getTime();
-}
-
-export async function ensureDateNotLocked(date: Date, actionLabel: string) {
-  if (await isDateLocked(date)) {
-    const closedUntil = await getClosedUntilEOD();
-    throw Object.assign(
-      new Error(
-        `Kỳ sổ đã khoá đến ${closedUntil ? fmtDateVN(closedUntil) : ""}, không được phép ${actionLabel}.`
-      ),
-      { status: 400, statusCode: 400 }
-    );
-  }
-}
-
-/**
- * Kiểm tra StockCount thuộc kỳ đã khoá không (dựa vào createdAt)
- * (nếu sau này bạn có countDate thì nên dùng countDate thay vì createdAt)
- */
 export async function isStockCountLocked(stockCountId: string): Promise<boolean> {
-  const closedUntil = await getClosedUntilEOD();
-  if (!closedUntil) return false;
-
   const sc = await prisma.stockCount.findUnique({
     where: { id: stockCountId },
     select: { createdAt: true },
   });
   if (!sc) return false;
 
-  return sc.createdAt.getTime() <= closedUntil.getTime();
+  return isLockedByRollingWindow90(sc.createdAt, new Date());
 }
 
 export async function ensureStockCountNotLocked(stockCountId: string) {
   if (await isStockCountLocked(stockCountId)) {
-    const closedUntil = await getClosedUntilEOD();
+    const { lockedYMD } = rollingLockedUntil90(new Date());
     throw Object.assign(
       new Error(
-        `Phiếu kiểm kê thuộc kỳ đã khoá đến ${closedUntil ? fmtDateVN(closedUntil) : ""}, không được phép sửa/xoá/post.`
+        `Phiếu kiểm kê quá hạn chỉnh sửa (${PERIOD_LOCK_DAYS} ngày). ` +
+          `Mốc khoá (VN): ${lockedYMD}. Không được phép sửa/xoá/post.`
       ),
       { status: 400, statusCode: 400 }
     );
@@ -174,26 +248,35 @@ export async function ensureStockCountNotLocked(stockCountId: string) {
 }
 
 export async function isStockCountLineLocked(lineId: string): Promise<boolean> {
-  const closedUntil = await getClosedUntilEOD();
-  if (!closedUntil) return false;
-
   const line = await prisma.stockCountLine.findUnique({
     where: { id: lineId },
-    include: { stockCount: { select: { createdAt: true } } },
+    select: { stockCount: { select: { createdAt: true } } },
   });
   if (!line || !line.stockCount) return false;
 
-  return line.stockCount.createdAt.getTime() <= closedUntil.getTime();
+  return isLockedByRollingWindow90(line.stockCount.createdAt, new Date());
 }
 
 export async function ensureStockCountLineNotLocked(lineId: string) {
   if (await isStockCountLineLocked(lineId)) {
-    const closedUntil = await getClosedUntilEOD();
+    const { lockedYMD } = rollingLockedUntil90(new Date());
     throw Object.assign(
       new Error(
-        `Dòng kiểm kê thuộc kỳ đã khoá đến ${closedUntil ? fmtDateVN(closedUntil) : ""}, không được phép sửa.`
+        `Dòng kiểm kê quá hạn chỉnh sửa (${PERIOD_LOCK_DAYS} ngày). ` +
+          `Mốc khoá (VN): ${lockedYMD}. Không được phép sửa.`
       ),
       { status: 400, statusCode: 400 }
     );
   }
 }
+
+/* =========================================================
+   Optional: expose rolling locked until for UI/debug
+========================================================= */
+
+export function getRollingLockedUntilDate(now = new Date(), userRole?: string | null) {
+  return rollingLockedUntil(now, userRole).lockedDate;
+}
+
+// (optional) kept for compatibility (if any old code imports it)
+export { getClosedUntilEOD };

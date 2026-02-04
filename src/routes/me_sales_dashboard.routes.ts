@@ -1,6 +1,7 @@
 // src/routes/me_sales_dashboard.routes.ts
 import { Router } from "express";
 import {
+  Prisma,
   PrismaClient,
   InvoiceStatus,
   InvoiceType,
@@ -44,7 +45,7 @@ function ymd(d: Date) {
 }
 
 /**
- * ✅ UTC month range (best practice)
+ * ✅ UTC month range
  * - start: inclusive
  * - endExclusive: exclusive (first day of next month)
  */
@@ -54,33 +55,49 @@ function monthRangeUTC(year: number, month: number) {
   return { start, endExclusive };
 }
 
-// tính holdTotal: ưu tiên amount, fallback pct
-function calcHoldTotal(inv: {
-  total: any;
+/**
+ * ✅ basis NET sau trả hàng
+ * - revenue dùng netSubtotal
+ * - công nợ dùng netTotal
+ */
+function getNetBasis(inv: any) {
+  const netSubtotal = num(inv.netSubtotal ?? inv.subtotal ?? 0);
+  const netTotal = num(inv.netTotal ?? inv.total ?? 0);
+  return {
+    netSubtotal: clamp0(netSubtotal),
+    netTotal: clamp0(netTotal),
+  };
+}
+
+// ✅ HOLD tính theo NET total (ưu tiên amount, fallback pct)
+function calcHoldTotalNet(inv: {
+  netTotal: any;
   hasWarrantyHold: boolean;
   warrantyHoldPct: any;
   warrantyHoldAmount: any;
 }) {
-  const total = clamp0(num(inv.total));
+  const netTotal = clamp0(num(inv.netTotal));
+  if (!inv.hasWarrantyHold) return 0;
+
   const holdAmt = clamp0(num(inv.warrantyHoldAmount));
-  if (holdAmt > 0.0001) return Math.min(total, holdAmt);
+  if (holdAmt > 0.0001) return Math.min(netTotal, holdAmt);
 
   const pct = clamp0(num(inv.warrantyHoldPct));
-  if (inv.hasWarrantyHold && pct > 0.0001) {
-    return clamp0((total * pct) / 100);
+  if (pct > 0.0001) {
+    return clamp0((netTotal * pct) / 100);
   }
   return 0;
 }
 
 /**
- * ✅ Quy đổi GROSS -> NET theo tỷ lệ subtotal/total
- * - mục tiêu: KPI "Đã thu" của staff không bị > "Doanh thu" (đều NET)
+ * ✅ Quy đổi GROSS -> NET theo tỷ lệ netSubtotal/netTotal
+ * (để KPI "Đã thu (NET)" không bị lệch)
  */
-function grossToNet(gross: number, subtotal: number, total: number) {
-  const g = clamp0(num(gross));
-  const sub = clamp0(num(subtotal));
-  const tot = clamp0(num(total));
-  if (g <= 0) return 0;
+function grossToNetByNetBasis(gross: number, netSubtotal: number, netTotal: number) {
+  const g = num(gross);
+  const sub = num(netSubtotal);
+  const tot = num(netTotal);
+  if (!Number.isFinite(g) || g === 0) return 0;
   if (tot <= 0) return 0;
   if (sub <= 0) return 0;
   return (g * sub) / tot;
@@ -98,7 +115,7 @@ type CustomerAgg = {
   // legacy
   outstanding: number;
 
-  // ✅ NEW: split (GROSS - tiền thực tế khách còn phải trả)
+  // split
   normalOutstanding: number;
   holdOutstanding: number;
   totalOutstanding: number;
@@ -110,8 +127,6 @@ type CustomerAgg = {
 type InvoiceListRow = {
   invoiceId: string;
   invoiceCode: string;
-
-  // ✅ giữ issueDate để hiển thị (dd/MM/yyyy)
   issueDate: string;
 
   partnerId: string | null;
@@ -122,21 +137,14 @@ type InvoiceListRow = {
   customerTaxCode: string | null;
   customerEmail: string | null;
 
-  subtotal: number; // NET
-  totalAmount: number; // GROSS
+  subtotal: number; // ✅ NET after return (netSubtotal)
+  totalAmount: number; // ✅ NET after return (netTotal)
 
-  /**
-   * ✅ collected: NET (đã thu quy về chưa VAT) để hiển thị cùng doanh thu
-   * (tránh "đã thu > doanh thu")
-   */
-  collected: number;
+  collected: number; // ✅ NET
+  collectedGross?: number; // signed gross for reconciliation
 
-  /** optional: đối soát kế toán */
-  collectedGross?: number;
+  outstanding: number; // legacy = totalOutstanding
 
-  outstanding: number; // legacy (TOTAL outstanding) (GROSS)
-
-  // ✅ NEW split (GROSS)
   normalOutstanding: number;
   holdOutstanding: number;
   totalOutstanding: number;
@@ -153,9 +161,7 @@ type TrendRow = { date: string; revenue: number };
 router.get("/sales-dashboard", requireAuth, async (req, res) => {
   const me = getUser(req);
   if (!me?.id) {
-    return res
-      .status(401)
-      .json({ code: "UNAUTHORIZED", message: "Unauthorized" });
+    return res.status(401).json({ code: "UNAUTHORIZED", message: "Unauthorized" });
   }
 
   const now = new Date();
@@ -171,16 +177,14 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
   const { start, endExclusive } = monthRangeUTC(year, month);
 
   /**
-   * ✅ IMPORTANT FIX
-   * Dashboard theo "tháng chốt doanh thu" => lọc theo approvedAt
-   * (tránh lệch TZ issueDate + đúng logic doanh thu)
+   * ✅ FIX: lấy SALES approved trong tháng của NV
+   * ✅ NEW: select netSubtotal/netTotal để trừ hàng trả
    */
   const invoices = await prisma.invoice.findMany({
     where: {
       status: InvoiceStatus.APPROVED,
       type: InvoiceType.SALES,
       saleUserId: me.id,
-
       approvedAt: { not: null, gte: start, lt: endExclusive },
     },
     select: {
@@ -207,19 +211,22 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
         },
       },
 
+      // gross
       subtotal: true,
       total: true,
+
+      // ✅ NET after return
+      netSubtotal: true,
+      netTotal: true,
+
       paidAmount: true,
       paymentStatus: true,
 
-      // ✅ NEW: warranty fields
       hasWarrantyHold: true,
       warrantyHoldPct: true,
       warrantyHoldAmount: true,
       warrantyDueDate: true,
-      warrantyHold: {
-        select: { status: true }, // OPEN | PAID | VOID
-      },
+      warrantyHold: { select: { status: true } }, // OPEN | PAID | VOID
     },
     orderBy: { approvedAt: "desc" },
   });
@@ -235,14 +242,11 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
       summary: {
         revenue: 0,
         collected: 0,
-        collectedGross: 0, // ✅ thêm để đối soát
-
+        collectedGross: 0,
         outstanding: 0,
-
         normalOutstanding: 0,
         holdOutstanding: 0,
         totalOutstanding: 0,
-
         orderCount: 0,
       },
       trend: [] as TrendRow[],
@@ -254,73 +258,107 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
 
   const invoiceIds = invoices.map((i) => i.id);
 
-  // 2) Allocations: group by invoiceId & kind (NORMAL + WARRANTY_HOLD)
-  const allocAgg = await prisma.paymentAllocation.groupBy({
-    by: ["invoiceId", "kind"],
-    where: {
-      invoiceId: { in: invoiceIds },
-      kind: { in: [AllocationKind.NORMAL, AllocationKind.WARRANTY_HOLD] },
-    },
-    _sum: { amount: true },
-  });
+  /**
+   * ✅ FIX SIGN + cắt theo tháng:
+   * - RECEIPT => +ABS(amount)
+   * - PAYMENT => -ABS(amount)
+   * - payment.date < endExclusive (chốt trong tháng)
+   */
+  const allocGroups: Array<{ invoice_id: string; kind: AllocationKind; sum_amt: any }> =
+    await prisma.$queryRaw`
+      SELECT
+        pa."invoiceId" AS invoice_id,
+        pa."kind"      AS kind,
+        COALESCE(SUM(
+          CASE
+            WHEN p."type"::text = 'PAYMENT' THEN -ABS(COALESCE(pa."amount",0))
+            WHEN p."type"::text = 'RECEIPT' THEN  ABS(COALESCE(pa."amount",0))
+            ELSE COALESCE(pa."amount",0)
+          END
+        ),0) AS sum_amt
+      FROM "PaymentAllocation" pa
+      JOIN "Payment" p ON p."id" = pa."paymentId"
+      WHERE
+        pa."invoiceId" IN (${Prisma.join(invoiceIds)})
+        AND pa."kind" IN ('NORMAL','WARRANTY_HOLD')
+        AND p."date" >= ${start}
+        AND p."date" <  ${endExclusive}
+      GROUP BY 1,2
+    `;
 
   const normalPaidByInvoice = new Map<string, number>();
   const holdPaidByInvoice = new Map<string, number>();
 
-  for (const a of allocAgg) {
-    const amt = clamp0(num(a._sum.amount));
-    if (a.kind === AllocationKind.WARRANTY_HOLD) {
-      holdPaidByInvoice.set(a.invoiceId, amt);
+  for (const g of allocGroups) {
+    const signed = num(g.sum_amt); // signed already
+    if (g.kind === AllocationKind.WARRANTY_HOLD) {
+      holdPaidByInvoice.set(g.invoice_id, signed);
     } else {
-      normalPaidByInvoice.set(a.invoiceId, amt);
+      normalPaidByInvoice.set(g.invoice_id, signed);
     }
   }
 
-  // 3) Build invoices rows
-  let sumRevenue = 0; // NET (subtotal)
-  let sumCollectedNet = 0; // ✅ NET
-  let sumCollectedGross = 0; // optional đối soát
+  // ===== Build invoice rows =====
+  let sumRevenue = 0; // ✅ NET revenue (netSubtotal)
+  let sumCollectedNet = 0; // ✅ NET collected
+  let sumCollectedGross = 0; // signed gross (đối soát)
 
-  let sumNormalOutstanding = 0; // GROSS
-  let sumHoldOutstanding = 0; // GROSS
-  let sumTotalOutstanding = 0; // GROSS
+  let sumNormalOutstanding = 0;
+  let sumHoldOutstanding = 0;
+  let sumTotalOutstanding = 0;
 
   const invoiceRows: InvoiceListRow[] = invoices.map((inv: any) => {
-    const invSubtotal = num(inv.subtotal); // NET
-    const invTotal = num(inv.total); // GROSS
+    const { netSubtotal, netTotal } = getNetBasis(inv);
 
-    // paid split (GROSS)
-    const normalPaidGross = clamp0(normalPaidByInvoice.get(inv.id) ?? 0);
-    const holdPaidGross = clamp0(holdPaidByInvoice.get(inv.id) ?? 0);
+    // ✅ ignore FULL RETURN (netTotal <= 0) => coi như không phát sinh phải thu
+    // (vẫn trả invoices list để FE nhìn thấy, nhưng nợ = 0)
+    const isFullyReturned = netTotal <= 0.0001;
 
-    // ✅ collected NET để hiển thị cùng revenue
-    const normalPaidNet = grossToNet(normalPaidGross, invSubtotal, invTotal);
+    // paid split (signed gross)
+    const paidNormalSignedGross = num(normalPaidByInvoice.get(inv.id) ?? 0);
+    const paidHoldSignedGross = num(holdPaidByInvoice.get(inv.id) ?? 0);
 
-    // hold total theo invoice (GROSS)
-    const holdTotal = calcHoldTotal(inv);
+    // ✅ không cho paid âm làm "nợ tăng ảo"
+    const paidNormalGross = clamp0(paidNormalSignedGross);
+    const paidHoldGross = clamp0(paidHoldSignedGross);
 
-    // holdOutstanding: nếu warrantyHold.status = PAID/VOID => 0
+    // collected NET để hiển thị cùng revenue (dùng tỷ lệ netSubtotal/netTotal)
+    const paidNormalNet = grossToNetByNetBasis(paidNormalGross, netSubtotal, netTotal);
+
+    // hold total theo NET
+    const holdTotal = calcHoldTotalNet({
+      netTotal,
+      hasWarrantyHold: Boolean(inv.hasWarrantyHold),
+      warrantyHoldPct: inv.warrantyHoldPct,
+      warrantyHoldAmount: inv.warrantyHoldAmount,
+    });
+
+    // holdOutstanding:
+    // - nếu warrantyHold.status = PAID/VOID => 0
+    // - còn lại: max(0, holdTotal - paidHoldGross)
     const holdStatus = String(inv.warrantyHold?.status || "").toUpperCase();
     const holdOutstanding =
-      holdStatus === "PAID" || holdStatus === "VOID"
+      holdStatus === "PAID" || holdStatus === "VOID" || isFullyReturned
         ? 0
-        : clamp0(holdTotal - holdPaidGross);
+        : clamp0(holdTotal - paidHoldGross);
 
-    // normalOutstanding: phần còn lại (total - holdTotal) trừ NORMAL đã thu (GROSS)
-    const normalBase = clamp0(invTotal - holdTotal);
-    const normalOutstanding = clamp0(normalBase - normalPaidGross);
+    // ✅ tổng phải thu trong tháng này theo NET (sau trả hàng)
+    const totalDebt = isFullyReturned ? 0 : clamp0(netTotal - paidNormalGross);
+
+    // normalOutstanding = totalDebt - holdOutstanding (không âm)
+    const normalOutstanding = clamp0(totalDebt - holdOutstanding);
 
     const totalOutstanding = normalOutstanding + holdOutstanding;
 
-    sumRevenue += invSubtotal;
-    sumCollectedNet += normalPaidNet;
-    sumCollectedGross += normalPaidGross;
+    sumRevenue += netSubtotal;
+    sumCollectedNet += paidNormalNet;
+    sumCollectedGross += paidNormalSignedGross; // giữ signed để đối soát
 
     sumNormalOutstanding += normalOutstanding;
     sumHoldOutstanding += holdOutstanding;
     sumTotalOutstanding += totalOutstanding;
 
-    // Resolve partner info: prefer partner relation, fallback snapshot on invoice
+    // Resolve partner info
     const customerName = String(inv.partner?.name || inv.partnerName || "Khách lẻ");
     const phone =
       (inv.partner?.phone != null ? String(inv.partner.phone) : null) ??
@@ -337,7 +375,6 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
       invoiceId: String(inv.id),
       invoiceCode: String(inv.code),
 
-      // ✅ hiển thị theo issueDate (nếu null thì fallback approvedAt)
       issueDate: formatDateVN(new Date(inv.issueDate || inv.approvedAt)),
 
       partnerId: inv.partnerId ? String(inv.partnerId) : null,
@@ -348,18 +385,15 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
       customerTaxCode: taxCode,
       customerEmail: email,
 
-      subtotal: Math.round(invSubtotal),
-      totalAmount: Math.round(invTotal),
+      // ✅ NET after return
+      subtotal: Math.round(netSubtotal),
+      totalAmount: Math.round(netTotal),
 
-      // ✅ collected NET (đã thu chưa VAT)
-      collected: Math.round(normalPaidNet),
-      // optional: đối soát kế toán
-      collectedGross: Math.round(normalPaidGross),
+      collected: Math.round(paidNormalNet),
+      collectedGross: Math.round(paidNormalSignedGross),
 
-      // legacy fields
       outstanding: Math.round(totalOutstanding),
 
-      // ✅ NEW split (GROSS)
       normalOutstanding: Math.round(normalOutstanding),
       holdOutstanding: Math.round(holdOutstanding),
       totalOutstanding: Math.round(totalOutstanding),
@@ -371,6 +405,7 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
     };
   });
 
+  // debts: chỉ lấy invoice còn nợ
   const debts = invoiceRows
     .filter((x) => x.totalOutstanding > 0)
     .sort((a, b) => {
@@ -379,11 +414,12 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
       return pa < pb ? 1 : -1;
     });
 
-  // 4) Trend by approvedAt (sum subtotal per day) ✅ NET (giữ nhất quán với filter)
+  // Trend theo approvedAt (NET revenue = netSubtotal)
   const trendMap = new Map<string, number>();
   for (const inv of invoices as any[]) {
     const k = ymd(new Date(inv.approvedAt));
-    trendMap.set(k, (trendMap.get(k) || 0) + num(inv.subtotal));
+    const netSub = num(inv.netSubtotal ?? inv.subtotal ?? 0);
+    trendMap.set(k, (trendMap.get(k) || 0) + netSub);
   }
 
   const trend: TrendRow[] = Array.from(trendMap.entries())
@@ -393,7 +429,7 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
       return { date: `${pad2(dd)}/${pad2(mm)}`, revenue: Math.round(v) };
     });
 
-  // 5) Customers aggregation (from debts) — split normal/hold (GROSS)
+  // Customers aggregation (from debts)
   const customerMap = new Map<string, CustomerAgg>();
 
   for (const d of debts) {
@@ -421,9 +457,7 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
     cur.holdOutstanding += num(d.holdOutstanding);
     cur.totalOutstanding += num(d.totalOutstanding);
 
-    // legacy
     cur.outstanding += num(d.outstanding);
-
     cur.invoiceCount += 1;
 
     if (!cur.phone && d.customerPhone) cur.phone = d.customerPhone;
@@ -437,7 +471,7 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
   const customers = Array.from(customerMap.values())
     .map((c) => ({
       ...c,
-      outstanding: Math.round(c.totalOutstanding), // legacy = total (GROSS)
+      outstanding: Math.round(c.totalOutstanding),
       normalOutstanding: Math.round(c.normalOutstanding),
       holdOutstanding: Math.round(c.holdOutstanding),
       totalOutstanding: Math.round(c.totalOutstanding),
@@ -446,14 +480,12 @@ router.get("/sales-dashboard", requireAuth, async (req, res) => {
     .sort((a, b) => b.totalOutstanding - a.totalOutstanding);
 
   const summary = {
-    revenue: Math.round(sumRevenue), // NET
-    collected: Math.round(sumCollectedNet), // ✅ NET (đã thu chưa VAT)
-    collectedGross: Math.round(sumCollectedGross), // optional đối soát
+    revenue: Math.round(sumRevenue), // ✅ NET (after return)
+    collected: Math.round(sumCollectedNet), // ✅ NET
+    collectedGross: Math.round(sumCollectedGross), // signed gross for reconciliation
 
-    // legacy
-    outstanding: Math.round(sumTotalOutstanding), // GROSS
+    outstanding: Math.round(sumTotalOutstanding),
 
-    // ✅ NEW split (GROSS)
     normalOutstanding: Math.round(sumNormalOutstanding),
     holdOutstanding: Math.round(sumHoldOutstanding),
     totalOutstanding: Math.round(sumTotalOutstanding),

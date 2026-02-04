@@ -14,15 +14,8 @@ import {
   rejectInvoice,
   submitInvoice,
   recallInvoice,
-  // ✅ NEW: admin reopen approved -> draft (service must implement)
   reopenApprovedInvoice,
-  adminEditApprovedInvoiceInPlace,
-  adminSaveAndPostInvoice,
-
 } from "../services/invoices.service";
-
-// ✅ NEW: limit edits to current month VN
-import { ensureDateInCurrentMonthVN } from "../services/periodLock.service";
 
 const r = Router();
 
@@ -152,7 +145,6 @@ function sanitizeInvoiceForRole(inv: any, role: string) {
     }
   }
 
-  // warranty fields: staff được xem
   return cloned;
 }
 
@@ -209,17 +201,6 @@ function ensureSubmittedForRecallOrThrow(inv: any) {
   if (inv.status !== "SUBMITTED") {
     throw httpError(409, "Chỉ có thể HỦY GỬI DUYỆT khi hóa đơn đang ở trạng thái CHỜ DUYỆT.");
   }
-}
-
-/**
- * ✅ NEW: Rule “chỉ cho phép sửa trong tháng”
- * - áp dụng cho các hành động thay đổi dữ liệu (edit/delete/submit/approve/reopen...)
- * - ưu tiên issueDate; fallback createdAt nếu thiếu (tránh crash)
- */
-async function ensureInvoiceInCurrentMonthOrThrow(inv: any, actionLabel: string) {
-  const d = inv?.issueDate ? new Date(inv.issueDate) : inv?.createdAt ? new Date(inv.createdAt) : null;
-  if (!d) return; // nếu thiếu cả 2 thì bỏ qua (hiếm)
-  await ensureDateInCurrentMonthVN(d, actionLabel);
 }
 
 /** ========================= ROUTES ========================= **/
@@ -329,7 +310,7 @@ r.post("/", async (req, res, next) => {
 
       // ✅ staff: cho tick bảo hành nhưng ép % = 5 nếu có
       if (body.hasWarrantyHold === true) body.warrantyHoldPct = 5;
-      if (body.warrantyHoldPct !== undefined) delete body.warrantyHoldPct; // staff không tự set %
+      if (body.warrantyHoldPct !== undefined) delete body.warrantyHoldPct;
       if (body.hasWarrantyHold !== true) {
         body.hasWarrantyHold = false;
         body.warrantyHoldPct = 0;
@@ -350,20 +331,17 @@ r.post("/", async (req, res, next) => {
 });
 
 /**
- * ✅ NEW: POST /invoices/:id/reopen
- * - ADMIN mở lại hoá đơn đã APPROVED (rollback stock + xoá movement) -> DRAFT để sửa
- * - Rule: chỉ trong THÁNG HIỆN TẠI (VN)
+ * POST /invoices/:id/reopen
+ * - ADMIN + ACCOUNTANT mở lại hoá đơn đã APPROVED -> DRAFT để sửa
+ * - Period lock + 90/7 nằm ở SERVICE
  */
-r.post("/:id/reopen", requireRole("admin"), async (req, res, next) => {
+r.post("/:id/reopen", requireRole("admin", "accountant"), async (req, res, next) => {
   try {
     const u = getUser(req)!;
     const id = req.params.id;
 
     const inv = await mustGetInvoice(id);
     ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
-
-    // ✅ chỉ trong tháng
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "mở lại để sửa hóa đơn");
 
     const data = await reopenApprovedInvoice(
       { invoiceId: id, actorId: u.id },
@@ -395,9 +373,6 @@ r.put("/:id", async (req, res, next) => {
       throw httpError(403, "Xuất trả NCC chỉ dành cho ADMIN.");
     }
 
-    // ✅ rule: chỉ trong tháng (mọi thao tác update)
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "sửa hóa đơn");
-
     const body = { ...(req.body || {}) };
 
     if (isStaff(u.role)) {
@@ -406,18 +381,10 @@ r.put("/:id", async (req, res, next) => {
 
       // ✅ staff: cho tick bảo hành nhưng ép % = 5 nếu có
       if (body.hasWarrantyHold === true) body.warrantyHoldPct = 5;
-      if (body.warrantyHoldPct !== undefined) delete body.warrantyHoldPct; // staff không tự set %
+      if (body.warrantyHoldPct !== undefined) delete body.warrantyHoldPct;
       if (body.hasWarrantyHold === false) {
         body.warrantyHoldPct = 0;
       }
-
-      const data = await updateInvoice(id, body, {
-        userId: u.id,
-        userRole: u.role,
-        meta: buildAuditMeta(req),
-      });
-
-      return res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
     }
 
     const data = await updateInvoice(id, body, {
@@ -445,9 +412,6 @@ r.patch("/:id/note", async (req, res, next) => {
     const inv = await mustGetInvoice(id);
     ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
 
-    // ✅ rule: chỉ trong tháng
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "sửa ghi chú hóa đơn");
-
     if (isStaff(u.role)) {
       ensureStaffOwnInvoiceOrThrow(inv, u.id);
       ensureDraftForStaffOrThrow(inv);
@@ -474,6 +438,11 @@ r.patch("/:id/payment", requireRole("accountant", "admin"), async (_req, res) =>
   });
 });
 
+/**
+ * POST /invoices/:id/submit
+ * - staff: chỉ invoice của mình + chỉ DRAFT
+ * - accountant/admin: như nhau, rule time nằm ở SERVICE
+ */
 r.post("/:id/submit", async (req, res, next) => {
   try {
     const u = getUser(req)!;
@@ -481,9 +450,6 @@ r.post("/:id/submit", async (req, res, next) => {
 
     const inv = await mustGetInvoice(id);
     ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
-
-    // ✅ rule: chỉ trong tháng (vì submit cũng là “chốt gửi duyệt”)
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "gửi duyệt hóa đơn");
 
     if (isStaff(u.role)) {
       ensureStaffOwnInvoiceOrThrow(inv, u.id);
@@ -495,16 +461,16 @@ r.post("/:id/submit", async (req, res, next) => {
       { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
     );
 
-    res.json({
-      ok: true,
-      data: sanitizeInvoiceForRole(data, u.role),
-    });
+    res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
   } catch (e: any) {
     if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
     next(e);
   }
 });
 
+/**
+ * POST /invoices/:id/recall
+ */
 r.post("/:id/recall", async (req, res, next) => {
   try {
     const u = getUser(req)!;
@@ -512,9 +478,6 @@ r.post("/:id/recall", async (req, res, next) => {
 
     const inv = await mustGetInvoice(id);
     ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
-
-    // ✅ rule: chỉ trong tháng (thu hồi gửi duyệt)
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "thu hồi gửi duyệt hóa đơn");
 
     if (isStaff(u.role)) {
       ensureStaffOwnInvoiceOrThrow(inv, u.id);
@@ -526,16 +489,19 @@ r.post("/:id/recall", async (req, res, next) => {
       { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
     );
 
-    res.json({
-      ok: true,
-      data: sanitizeInvoiceForRole(data, u.role),
-    });
+    res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
   } catch (e: any) {
     if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
     next(e);
   }
 });
 
+/**
+ * POST /invoices/:id/approve
+ * - accountant/admin: như nhau ở route
+ * - PURCHASE_RETURN: admin-only
+ * - rule time (period lock) nằm ở SERVICE
+ */
 r.post("/:id/approve", requireRole("accountant", "admin"), async (req, res, next) => {
   try {
     const u = getUser(req)!;
@@ -544,9 +510,6 @@ r.post("/:id/approve", requireRole("accountant", "admin"), async (req, res, next
     if (inv.type === "PURCHASE_RETURN" && !isAdmin(u.role)) {
       throw httpError(403, "Xuất trả NCC chỉ ADMIN mới được duyệt.");
     }
-
-    // ✅ rule: chỉ trong tháng (approve là post tồn)
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "duyệt hóa đơn");
 
     const { warehouseId } = req.body || {};
 
@@ -559,16 +522,18 @@ r.post("/:id/approve", requireRole("accountant", "admin"), async (req, res, next
       { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
     );
 
-    res.json({
-      ok: true,
-      data: sanitizeInvoiceForRole(data, u.role),
-    });
+    res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
   } catch (e: any) {
     if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
     next(e);
   }
 });
 
+/**
+ * POST /invoices/:id/reject
+ * - accountant/admin: như nhau ở route
+ * - PURCHASE_RETURN: admin-only
+ */
 r.post("/:id/reject", requireRole("accountant", "admin"), async (req, res, next) => {
   try {
     const u = getUser(req)!;
@@ -577,9 +542,6 @@ r.post("/:id/reject", requireRole("accountant", "admin"), async (req, res, next)
     if (inv.type === "PURCHASE_RETURN" && !isAdmin(u.role)) {
       throw httpError(403, "Xuất trả NCC chỉ ADMIN mới được từ chối.");
     }
-
-    // ✅ rule: chỉ trong tháng
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "từ chối hóa đơn");
 
     const { reason } = req.body || {};
 
@@ -592,16 +554,16 @@ r.post("/:id/reject", requireRole("accountant", "admin"), async (req, res, next)
       { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
     );
 
-    res.json({
-      ok: true,
-      data: sanitizeInvoiceForRole(data, u.role),
-    });
+    res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
   } catch (e: any) {
     if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
     next(e);
   }
 });
 
+/**
+ * DELETE /invoices/:id
+ */
 r.delete("/:id", async (req, res, next) => {
   try {
     const u = getUser(req)!;
@@ -609,9 +571,6 @@ r.delete("/:id", async (req, res, next) => {
 
     const inv = await mustGetInvoice(id);
     ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
-
-    // ✅ rule: chỉ trong tháng (xoá)
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "xóa hóa đơn");
 
     if (isStaff(u.role)) {
       ensureStaffOwnInvoiceOrThrow(inv, u.id);
@@ -626,92 +585,41 @@ r.delete("/:id", async (req, res, next) => {
   }
 });
 
-r.post("/:id/post", requireRole("accountant", "admin"), async (req, res, next) => {
-  try {
-    // ✅ deprecated function, không truyền auditCtx để khỏi TS error
-    const result = await postInvoiceToStock(req.params.id);
-    res.json({ ok: true, data: result });
-  } catch (e: any) {
-    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
-    next(e);
-  }
+// r.post("/:id/post", requireRole("accountant", "admin"), async (req, res, next) => {
+//   try {
+//     // ✅ deprecated function, không truyền auditCtx để khỏi TS error
+//     const result = await postInvoiceToStock(req.params.id);
+//     res.json({ ok: true, data: result });
+//   } catch (e: any) {
+//     if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+//     next(e);
+//   }
+// });
+
+// r.post("/:id/unpost", requireRole("accountant", "admin"), async (req, res, next) => {
+//   try {
+//     // ✅ deprecated function, không truyền auditCtx để khỏi TS error
+//     const result = await unpostInvoiceStock(req.params.id);
+//     res.json({ ok: true, data: result });
+//   } catch (e: any) {
+//     if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
+//     next(e);
+//   }
+// });
+r.post("/:id/post", requireRole("accountant", "admin"), async (_req, res) => {
+  return res.status(410).json({
+    ok: false,
+    message:
+      "Route /invoices/:id/post đã deprecated. Vui lòng dùng POST /invoices/:id/approve để duyệt + post tồn.",
+  });
 });
 
-r.post("/:id/unpost", requireRole("accountant", "admin"), async (req, res, next) => {
-  try {
-    // ✅ deprecated function, không truyền auditCtx để khỏi TS error
-    const result = await unpostInvoiceStock(req.params.id);
-    res.json({ ok: true, data: result });
-  } catch (e: any) {
-    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
-    next(e);
-  }
-});
-/**
- * ✅ NEW: PUT /invoices/:id/admin-edit-approved
- * - ADMIN chỉnh sửa trực tiếp invoice đã APPROVED (in-place)
- * - Cơ chế: rollback movements + update invoice/lines + repost movement mới
- * - Rule: chỉ trong THÁNG TẠO hóa đơn (VN)
- */
-r.put("/:id/admin-edit-approved", requireRole("admin"), async (req, res, next) => {
-  try {
-    const u = getUser(req)!;
-    const id = req.params.id;
-
-    const inv = await mustGetInvoice(id);
-    ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
-
-    // ✅ chỉ trong tháng tạo
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "admin sửa hóa đơn đã duyệt");
-
-    const body = { ...(req.body || {}) };
-
-    const data = await adminEditApprovedInvoiceInPlace(
-      { invoiceId: id, actorId: u.id, warehouseId: body.warehouseId ? String(body.warehouseId) : undefined, body },
-      { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
-    );
-
-    res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
-  } catch (e: any) {
-    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
-    next(e);
-  }
-});
-
-/**
- * ✅ NEW: POST /invoices/:id/admin-save-and-post
- * - ADMIN: rollback stock (từ movements cũ) -> update invoice -> approve lại
- * - atomic transaction (1 lần bấm)
- * - Rule: chỉ trong THÁNG HIỆN TẠI (VN)
- */
-r.post("/:id/admin-save-and-post", requireRole("admin"), async (req, res, next) => {
-  try {
-    const u = getUser(req)!;
-    const id = req.params.id;
-
-    const inv = await mustGetInvoice(id);
-    ensureNoPurchaseReturnAccessOrThrow(inv, u.role);
-
-    // ✅ chỉ trong tháng
-    await ensureInvoiceInCurrentMonthOrThrow(inv, "điều chỉnh & post lại hóa đơn");
-
-    const body = { ...(req.body || {}) };
-
-    const data = await adminSaveAndPostInvoice(
-      {
-        invoiceId: id,
-        actorId: u.id,
-        updateBody: body,                 // giống payload PUT /invoices/:id
-        warehouseId: body.warehouseId,    // nếu FE có truyền
-      },
-      { userId: u.id, userRole: u.role, meta: buildAuditMeta(req) }
-    );
-
-    res.json({ ok: true, data: sanitizeInvoiceForRole(data, u.role) });
-  } catch (e: any) {
-    if (e?.statusCode) return res.status(e.statusCode).json({ ok: false, message: e.message });
-    next(e);
-  }
+r.post("/:id/unpost", requireRole("accountant", "admin"), async (_req, res) => {
+  return res.status(410).json({
+    ok: false,
+    message:
+      "Route /invoices/:id/unpost đã deprecated. Nếu cần sửa hóa đơn đã duyệt, hãy dùng /invoices/:id/reopen (hoặc flow điều chỉnh).",
+  });
 });
 
 export default r;
