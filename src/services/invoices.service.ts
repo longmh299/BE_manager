@@ -2785,11 +2785,11 @@ export async function reopenApprovedInvoice(
       if (invoice.status !== "APPROVED") {
         throw httpError(409, "Chỉ hóa đơn đã DUYỆT (APPROVED) mới được mở lại.");
       }
-// ✅ NEW: window rule theo createdAt (admin 90d, accountant 7d)
-assertEditApprovedWindowOrThrow({
-  invoice: { createdAt: (invoice as any).createdAt },
-  userRole: auditCtx?.userRole,
-});
+      // ✅ NEW: window rule theo createdAt (admin 90d, accountant 7d)
+      assertEditApprovedWindowOrThrow({
+        invoice: { createdAt: (invoice as any).createdAt },
+        userRole: auditCtx?.userRole,
+      });
 
       // ✅ period lock
       await ensureDateNotLocked(invoice.issueDate ?? new Date(), "mở lại hóa đơn đã duyệt", auditCtx?.userRole);

@@ -87,7 +87,7 @@ model Item {
   stocks          Stock[]
   countLines      StockCountLine[]
   stockSnapshots  StockSnapshot[]
-
+  serviceLogs ServiceLog[]
   @@index([unitId])
   @@index([kind])
   @@index([isSerialized])
@@ -117,7 +117,7 @@ model ItemSerial {
   createdAt  DateTime  @default(now())
   item       Item      @relation(fields: [itemId], references: [id], onDelete: Cascade)
   location   Location? @relation(fields: [locationId], references: [id])
-
+  serviceLogs ServiceLog[]
   @@index([itemId])
   @@index([locationId])
   @@index([status])
@@ -244,6 +244,9 @@ model Partner {
   updatedAt DateTime  @updatedAt
   invoices  Invoice[]
   payments  Payment[]
+  customerActivities CustomerActivity[]
+  customerNotes      CustomerNote[]
+  serviceLogs        ServiceLog[]
 }
 
 model Invoice {
@@ -645,4 +648,54 @@ enum AllocationKind {
 enum AdjustmentKind {
   DEBIT
   CREDIT
+}
+model CustomerNote {
+  id        String   @id @default(cuid())
+  partnerId String
+  content   String
+  createdBy String?
+  createdAt DateTime @default(now())
+
+  partner   Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  @@index([partnerId])
+  @@index([createdAt])
+}
+model CustomerActivity {
+  id         String   @id @default(cuid())
+  partnerId  String
+  type       ActivityType
+  content    String?
+  createdBy  String?
+  createdAt  DateTime @default(now())
+
+  partner    Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  @@index([partnerId, createdAt])
+  @@index([type])
+}
+enum ActivityType {
+  CALL
+  MESSAGE
+  VISIT
+  NOTE
+  SUPPORT
+}
+model ServiceLog {
+  id         String   @id @default(cuid())
+  partnerId  String
+  itemId     String?
+  serialId   String?
+  issue      String
+  solution   String?
+  status     String   @default("OPEN")
+  createdAt  DateTime @default(now())
+
+  partner    Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  item       Item?    @relation(fields: [itemId], references: [id])
+  serial     ItemSerial? @relation(fields: [serialId], references: [id])
+
+  @@index([partnerId])
+  @@index([serialId])
+  @@index([status])
 }

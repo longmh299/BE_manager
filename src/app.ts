@@ -29,7 +29,7 @@ import meSalesDashboardRoutes from'./routes/me_sales_dashboard.routes';
 import auditLogsRouter from'./routes/auditLogs.routes';
 import invoiceStatusRoutes from'./routes/Invoice.Status'
 import assistantAlertsRoute from "./routes/assistant.alerts.routes";
-
+import customersRoutes from './routes/customers.routes';
 const app = express();
 
 // ================== CORS CONFIG (đơn giản) ==================
@@ -91,7 +91,7 @@ api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
 app.use("/api/assistant/alerts", assistantAlertsRoute);
 api.use("/invoices-status", invoiceStatusRoutes);
-
+api.use('/customers', customersRoutes);
 // ✅ Reports: mount chung prefix /reports
 api.use('/reports', reportsRouter);
 api.use('/reports', stockInOutReportRoutes); // ✅ ADD (endpoint /api/reports/stock-inout)
