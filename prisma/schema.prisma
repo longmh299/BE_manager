@@ -321,7 +321,7 @@ model Invoice {
   returnMapsTo       SalesReturnLineMap[] @relation("ReturnMap_OriginInvoice")
   returnMapsFrom     SalesReturnLineMap[] @relation("ReturnMap_ReturnInvoice")
   warrantyHold       WarrantyHold?
-
+  
   @@index([partnerId, issueDate])
   @@index([saleUserId])
   @@index([techUserId])
@@ -500,7 +500,7 @@ model MachinePart {
 
 model PaymentAccount {
   id        String      @id @default(cuid())
-  code      String      @unique
+  code      String      
   name      String
   type      AccountType @default(BANK)
   bankName  String?
