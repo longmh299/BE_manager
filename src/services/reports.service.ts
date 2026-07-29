@@ -514,6 +514,15 @@ export async function getSalesLedger(params: {
 
   const rows: SalesLedgerRow[] = [];
 
+  // ✅ FIX: tổng "Đã thu"/"Còn nợ" ở đầu báo cáo tính RIÊNG theo cơ sở GỒM VAT
+  // (dùng inv.netTotal — field đã trừ trả hàng, gồm VAT, đang được dùng làm chuẩn
+  // ở module Công nợ). Trước đây tổng này lấy từ paidBase bị giới hạn theo netBase
+  // (net, THIẾU VAT) nên bị báo thiếu so với số tiền thực đã thu (paidAmount vốn
+  // tính theo giá gồm VAT). Các dòng chi tiết từng hoá đơn bên dưới vẫn giữ nguyên
+  // hiển thị theo net (đơn giá/thành tiền chưa VAT) như quy ước cũ, không đổi.
+  let totalRevenueGross = 0;
+  let totalPaidGross = 0;
+
   for (const inv of invoices as any[]) {
     const invId = String(inv.id);
     const invPaid = toNum(inv.paidAmount);
@@ -578,6 +587,14 @@ export async function getSalesLedger(params: {
     const netBase = round2(netLines.reduce((s: number, x: any) => s + toNum(x.lineAmount), 0));
     if (netBase <= 0.0001) continue;
 
+    // ✅ Trần đúng: dùng netTotal (gross, đã trừ trả hàng) thay vì netBase (net,
+    // thiếu VAT) để không bị cắt nhầm mất phần VAT của các hoá đơn đã thu đủ/thu dư.
+    const invNetTotalGross = toNum(inv.netTotal);
+    const grossCapBase = invNetTotalGross > 0 ? invNetTotalGross : netBase;
+    const grossPaid = Math.min(invPaid, grossCapBase);
+    totalRevenueGross = round2(totalRevenueGross + grossCapBase);
+    totalPaidGross = round2(totalPaidGross + grossPaid);
+
     const paidBase = Math.min(invPaid, netBase > 0 ? netBase : invPaid);
 
     let paidAllocatedSum = 0;
@@ -629,16 +646,27 @@ export async function getSalesLedger(params: {
 
   await attachMonthlyAvgCostToSalesRows(rows, { asOf });
 
-  const totals = rows.reduce(
+  const totalsFromRows = rows.reduce(
     (acc, r) => {
-      acc.totalRevenue = round2(acc.totalRevenue + r.lineAmount);
+      acc.totalRevenue = round2(acc.totalRevenue + r.lineAmount); // net, chưa VAT — giữ nguyên như cũ
       acc.totalCost = round2(acc.totalCost + r.costTotal);
-      acc.totalPaid = round2(acc.totalPaid + r.paid);
-      acc.totalDebt = round2(acc.totalDebt + r.debt);
       return acc;
     },
-    { totalRevenue: 0, totalCost: 0, totalPaid: 0, totalDebt: 0 }
+    { totalRevenue: 0, totalCost: 0 }
   );
+
+  // ✅ "Đã thu"/"Còn nợ" tổng tính theo cơ sở GỒM VAT (khớp Dashboard, đúng số tiền
+  // thực khách đã trả / còn phải trả). "Doanh thu" vẫn giữ nguyên là net-chưa-VAT
+  // như trước — vì vậy Đã thu + Còn nợ giờ sẽ KHÔNG còn khớp tuyệt đối bằng Doanh
+  // thu nữa (chênh đúng phần VAT) — đây là điều ĐÚNG, không phải lỗi mới.
+  const totalDebtGross = round2(Math.max(0, totalRevenueGross - totalPaidGross));
+
+  const totals = {
+    totalRevenue: totalsFromRows.totalRevenue,
+    totalCost: totalsFromRows.totalCost,
+    totalPaid: totalPaidGross,
+    totalDebt: totalDebtGross,
+  };
 
   return { rows, totals };
 }
@@ -697,6 +725,9 @@ export async function exportSalesLedgerExcel(params: {
       right: { style: "thin", color: { argb: "FFCBD5E1" } },
     };
   });
+
+  // ✅ Bật filter (dropdown lọc/sắp xếp) ngay ở dòng tiêu đề
+  ws.autoFilter = "A2:M2";
 
   for (const r of rows) {
     const d = new Date(r.issueDate + "T00:00:00");

@@ -2,7 +2,10 @@ export type Intent =
   | "GET_STOCK"              // hỏi tồn
   | "LOW_STOCK"              // sắp hết
   | "OUT_OF_STOCK"           // hết hàng
+  | "NEGATIVE_STOCK"         // tồn âm (< 0) — dấu hiệu lỗi dữ liệu, bán vượt tồn kho
+  | "CUSTOMER_INFO"          // tra cứu khách hàng: đã mua gì, còn nợ gì
   | "GET_INVOICES_BY_DATE"   // hóa đơn theo ngày
+  | "GET_REVENUE"            // doanh thu/số lượng bán của 1 sản phẩm
   | "UNKNOWN";
 
 export type ItemKindPref = "MACHINE" | "PART" | "ALL";
@@ -58,15 +61,35 @@ function dashifySku(s: string) {
 }
 
 function extractSkus(normalized: string) {
+  // ✅ Ghép các cặp "chữ + số" gõ rời rạc (vd: "jl 600", "jl-600") thành 1 mã hoàn
+  // chỉnh (JL-600) TRƯỚC khi tách token thường — nếu không, phần chữ ngắn (vd "jl")
+  // dễ bị bỏ sót và chỉ còn lại số ("600") trơ trọi, dẫn đến khớp nhầm với mọi mã
+  // khác chỉ vì tình cờ cùng chứa số đó (DZ-600, SF-600, SFTD-600...).
+  const combined: string[] = [];
+  const pairRe = /\b([a-z]{1,4})[\s-]+(\d{2,6}[a-z0-9]*)\b/g;
+  let pm: RegExpExecArray | null;
+  while ((pm = pairRe.exec(normalized))) {
+    combined.push(`${pm[1]}-${pm[2]}`.toUpperCase());
+  }
+
   // bắt token kiểu JL-660 / FRD1000 / PCX-20 / ST-608...
   const tokens = normalized.match(/[a-z0-9][a-z0-9\-_]{2,30}/g) || [];
   const stop = new Set(["ton","tonkho","con","bao","nhieu","may","linh","kien","phu","tung","kho","hoa","don","nhap","xuat","hang","sap","het","het"]);
   const skus = tokens
+    // ✅ chỉ coi là SKU nếu token có chứa ít nhất 1 chữ số — tránh nhầm từ tiếng Việt
+    // thường (dây, hàn, nhiệt, ...) thành mã sản phẩm, vì SKU thật luôn có số
+    // (JL-660, PCX20, K8, 45079...).
+    .filter((t) => /\d/.test(t))
+    // ✅ loại token TOÀN CHỮ SỐ dài hơn 7 ký tự — đây gần như chắc chắn là số điện
+    // thoại (9-10 số), không phải mã sản phẩm, tránh bị so khớp mờ bừa bãi (số dài
+    // luôn "chứa" được các mã ngắn như "5", "20"... gây khớp sai hoàn toàn).
+    .filter((t) => !(/^\d+$/.test(t) && t.length > 7))
     .map(t => t.toUpperCase())
     .filter(t => !stop.has(t.toLowerCase()))
     .map(dashifySku);
-  // unique + giới hạn
-  return Array.from(new Set(skus)).slice(0, 10);
+
+  // mã đã ghép (combined) ưu tiên đứng trước vì đầy đủ thông tin hơn
+  return Array.from(new Set([...combined, ...skus])).slice(0, 10);
 }
 
 function extractWarehouse(normalized: string) {
@@ -85,6 +108,18 @@ function extractThreshold(normalized: string) {
 }
 
 function extractDate(normalized: string) {
+  // "X thang gan day" / "X ngay gan day" -> khoảng ngày cụ thể tính từ hôm nay
+  const mRange = normalized.match(/\b(\d{1,2})\s*(thang|ngay)\s*gan\s*day\b/);
+  if (mRange) {
+    const n = Number(mRange[1]);
+    const unit = mRange[2];
+    const now = new Date();
+    const from = new Date(now);
+    if (unit === "thang") from.setMonth(from.getMonth() - n);
+    else from.setDate(from.getDate() - n);
+    return { from: from.toISOString().slice(0, 10), to: now.toISOString().slice(0, 10) };
+  }
+
   // preset
   if (/\bhom nay\b/.test(normalized)) return { preset: "today" as const };
   if (/\bhom qua\b/.test(normalized)) return { preset: "yesterday" as const };
@@ -110,7 +145,9 @@ function scoreIntents(n: string, skus: string[], threshold?: number) : Score[] {
     { intent: "GET_STOCK", score: 0, reasons: [] },
     { intent: "LOW_STOCK", score: 0, reasons: [] },
     { intent: "OUT_OF_STOCK", score: 0, reasons: [] },
+    { intent: "NEGATIVE_STOCK", score: 0, reasons: [] },
     { intent: "GET_INVOICES_BY_DATE", score: 0, reasons: [] },
+    { intent: "GET_REVENUE", score: 0, reasons: [] },
   ];
 
   const has = (re: RegExp) => re.test(n);
@@ -119,6 +156,11 @@ function scoreIntents(n: string, skus: string[], threshold?: number) : Score[] {
     s.score += pts;
     s.reasons.push(`${pts>=0?"+":""}${pts}:${why}`);
   };
+
+  // tồn âm (< 0) — câu hỏi liệt kê theo điều kiện, khác hẳn tra 1 sản phẩm cụ thể.
+  // Điểm cao để luôn thắng GET_STOCK (vốn cũng được cộng điểm vì có chữ "tồn"/"máy").
+  if (has(/\bton\s*<\s*0\b/) || has(/\bam\b/) || has(/\bton am\b/) || has(/\bnho hon 0\b/))
+    add("NEGATIVE_STOCK", 10, "negative stock keyword");
 
   // stock keywords
   if (has(/\bton\b/) || has(/\bton kho\b/) || has(/\bcon bao nhieu\b/)) add("GET_STOCK", 6, "stock keyword");
@@ -137,6 +179,24 @@ function scoreIntents(n: string, skus: string[], threshold?: number) : Score[] {
   // invoices
   if (has(/\bhoa don\b/) || has(/\binvoice\b/)) add("GET_INVOICES_BY_DATE", 8, "invoice keyword");
   if (has(/\bngay\b/) || has(/\bhom nay\b/) || has(/\bhom qua\b/)) add("GET_INVOICES_BY_DATE", 2, "date hint");
+
+  // doanh thu / doanh số của 1 sản phẩm — điểm cao để không bị "may"+sku (GET_STOCK)
+  // lấn át khi câu hỏi có cả tên máy lẫn từ "doanh thu"
+  if (has(/\bdoanh thu\b/) || has(/\bdoanh so\b/) || has(/\bban duoc\b/) || has(/\bban chay\b/))
+    add("GET_REVENUE", 9, "revenue keyword");
+
+  // tra cứu khách hàng: đã mua gì / còn nợ gì / lịch sử mua hàng / theo SĐT
+  if (
+    has(/\bkhach hang\b/) ||
+    has(/\bcon no cua\b/) ||
+    has(/\bda mua\b/) ||
+    has(/\blich su mua\b/) ||
+    has(/\bmua gi\b/) ||
+    has(/\bsdt\b/) ||
+    has(/\bso dien thoai\b/) ||
+    has(/\bmua lan nao\b/)
+  )
+    add("CUSTOMER_INFO", 8, "customer lookup keyword");
 
   return scores.sort((a,b)=>b.score-a.score);
 }
@@ -160,14 +220,52 @@ export function parsePro(raw: string): ParseResult {
   const confidence = Math.max(0, Math.min(1, best.score / 10));
 
   // queryText fallback: nếu không có sku mà có "ton/may ..." thì lấy phần sau làm query
+  const FILLER_WORDS = new Set([
+    "con", "nhieu", "ko", "khong", "het", "sap", "du", "a", "ha", "nhe", "the", "vay", "nay",
+  ]);
   let queryText: string | undefined;
   if (skus.length === 0) {
-    const m = normalized.match(/\b(ton|may|hoa don)\b\s*(.+)$/);
-    if (m?.[2]) queryText = m[2].trim();
+    const m = normalized.match(/\b(ton|may|hoa don|khach hang|khach|con no cua|da mua|lich su mua)\b\s*(.+)$/);
+    if (m?.[2]) {
+      const cleaned = m[2]
+        .split(" ")
+        .filter((w) => w && !FILLER_WORDS.has(w))
+        .join(" ")
+        .trim();
+      queryText = cleaned || m[2].trim();
+    }
   }
 
   // Nếu best score quá thấp -> UNKNOWN
   const intent: Intent = best.score >= 4 ? best.intent : "UNKNOWN";
+
+  // Với câu hỏi tra cứu khách hàng, tên khách có thể nằm TRƯỚC cụm từ khóa (cách
+  // nói tự nhiên: "công ty X đã mua gì", "khách A còn nợ bao nhiêu") — khác với
+  // GET_STOCK/GET_REVENUE nơi tên luôn nằm SAU từ khóa ("tồn X", "doanh thu của X").
+  // Nên xử lý riêng, ưu tiên phần đứng trước từ khóa nếu có.
+  if (intent === "CUSTOMER_INFO") {
+    // Ưu tiên cao nhất: nếu câu có 1 chuỗi số dài kiểu số điện thoại (9-11 số),
+    // dùng thẳng nó — đáng tin cậy hơn nhiều so với đoán vị trí trong câu, vì số
+    // điện thoại có thể nằm bất kỳ đâu trong câu (đầu/giữa/cuối).
+    const phoneMatch = normalized.match(/\b(\d{9,11})\b/);
+    if (phoneMatch?.[1]) {
+      queryText = phoneMatch[1];
+    } else {
+      const beforeMatch = normalized.match(/^(.*?)\b(da mua|con no cua|mua gi|lich su mua|mua lan nao)\b/);
+      let beforeText = beforeMatch?.[1]?.trim();
+      if (beforeText) {
+        // bỏ các từ mở đầu câu thường gặp, không phải một phần tên khách hàng
+        beforeText = beforeText.replace(/^(con|thi|xem|cho toi biet|cho hoi|ban)\s+/, "").trim();
+      }
+      if (beforeText) {
+        queryText = beforeText;
+      } else {
+        // fallback: tên đứng SAU "khach hang"/"khach" (vd "khách Nguyễn Văn A")
+        const afterMatch = normalized.match(/\b(khach hang|khach)\b\s*(.+)$/);
+        if (afterMatch?.[2]) queryText = afterMatch[2].trim();
+      }
+    }
+  }
 
   return {
     intent,

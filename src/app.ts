@@ -30,6 +30,8 @@ import auditLogsRouter from'./routes/auditLogs.routes';
 import invoiceStatusRoutes from'./routes/Invoice.Status'
 import assistantAlertsRoute from "./routes/assistant.alerts.routes";
 import customersRoutes from './routes/customers.routes';
+import assistantChatRoutes from "./routes/assistant.chat.routes";
+import reportMailerRoutes from "./routes/reportMailer.routes";
 const app = express();
 
 // ================== CORS CONFIG (đơn giản) ==================
@@ -92,6 +94,7 @@ api.use('/partners', partnersRoutes);
 app.use("/api/assistant/alerts", assistantAlertsRoute);
 api.use("/invoices-status", invoiceStatusRoutes);
 api.use('/customers', customersRoutes);
+
 // ✅ Reports: mount chung prefix /reports
 api.use('/reports', reportsRouter);
 api.use('/reports', stockInOutReportRoutes); // ✅ ADD (endpoint /api/reports/stock-inout)
@@ -111,7 +114,8 @@ app.use("/api/receivables_report", receivablesReportRoute);
 app.use("/api/me", meSalesDashboardRoutes);
 app.use("/api/audit-logs", auditLogsRouter);
 // app.use("/assistant", assistantRoute);
-
+app.use("/api/assistant", assistantChatRoutes);
+app.use("/api/report-mail", reportMailerRoutes);
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
 
