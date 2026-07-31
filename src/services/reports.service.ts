@@ -689,7 +689,7 @@ export async function exportSalesLedgerExcel(params: {
     views: [{ state: "frozen", ySplit: 2 }],
   });
 
-  ws.mergeCells("A1:M1");
+  ws.mergeCells("A1:N1");
   ws.getCell("A1").value = "BẢNG KÊ BÁN HÀNG";
   ws.getCell("A1").font = { size: 14, bold: true };
   ws.getCell("A1").alignment = { vertical: "middle", horizontal: "center" };
@@ -700,15 +700,16 @@ export async function exportSalesLedgerExcel(params: {
     "Số chứng từ",
     "Tên khách hàng",
     "Tên sản phẩm",
+    "Số lượng",
     "Đơn giá",
-    "Đơn giá vốn",
-    "Giá vốn TB (kỳ)",
-    "Tiền vốn",
     "Thành tiền",
+    "Đơn giá vốn",
+    "Tiền vốn",
     "Đã thanh toán",
     "Còn nợ",
     "NV sale",
     "Kĩ thuật",
+    "Giá vốn TB tháng (tham khảo)",
   ];
   ws.addRow(header);
 
@@ -727,7 +728,7 @@ export async function exportSalesLedgerExcel(params: {
   });
 
   // ✅ Bật filter (dropdown lọc/sắp xếp) ngay ở dòng tiêu đề
-  ws.autoFilter = "A2:M2";
+  ws.autoFilter = "A2:N2";
 
   for (const r of rows) {
     const d = new Date(r.issueDate + "T00:00:00");
@@ -736,20 +737,22 @@ export async function exportSalesLedgerExcel(params: {
       r.code,
       r.partnerName,
       r.itemName,
+      r.qty,
       r.unitPrice,
-      r.unitCost,
-      r.unitCostMonthAvg,
-      r.costTotal,
       r.lineAmount,
+      r.unitCost,
+      r.costTotal,
       r.paid,
       r.debt,
       r.saleUserName,
       r.techUserName,
+      r.unitCostMonthAvg,
     ]);
   }
 
   ws.getColumn(1).numFmt = "dd/mm/yyyy";
-  [5, 6, 7, 8, 9, 10, 11].forEach((col) => (ws.getColumn(col).numFmt = "#,##0"));
+  ws.getColumn(5).numFmt = "#,##0.###";
+  [6, 7, 8, 9, 10, 11, 14].forEach((col) => (ws.getColumn(col).numFmt = "#,##0"));
 
   ws.getColumn(1).alignment = { vertical: "middle", horizontal: "left" };
   ws.getColumn(2).alignment = { vertical: "middle", horizontal: "left" };
@@ -760,6 +763,7 @@ export async function exportSalesLedgerExcel(params: {
   }
   ws.getColumn(12).alignment = { vertical: "middle", horizontal: "left" };
   ws.getColumn(13).alignment = { vertical: "middle", horizontal: "left" };
+  ws.getColumn(14).alignment = { vertical: "middle", horizontal: "right" };
 
   for (let i = 3; i <= ws.rowCount; i++) {
     ws.getRow(i).eachCell((c) => {
@@ -788,7 +792,7 @@ export async function exportSalesLedgerExcel(params: {
   ["A", "D", "G", "J"].forEach((col) => (ws.getCell(`${col}${summaryRowIndex}`).font = { bold: true }));
   ["B", "E", "H", "K"].forEach((col) => (ws.getCell(`${col}${summaryRowIndex}`).numFmt = "#,##0"));
 
-  const widths = [12, 18, 26, 28, 12, 12, 14, 14, 14, 14, 14, 18, 18];
+  const widths = [12, 18, 26, 28, 10, 12, 14, 12, 14, 14, 14, 18, 18, 16];
   widths.forEach((w, idx) => (ws.getColumn(idx + 1).width = w));
 
   const buffer = await wb.xlsx.writeBuffer();

@@ -32,6 +32,7 @@ import assistantAlertsRoute from "./routes/assistant.alerts.routes";
 import customersRoutes from './routes/customers.routes';
 import assistantChatRoutes from "./routes/assistant.chat.routes";
 import reportMailerRoutes from "./routes/reportMailer.routes";
+import quoteDocumentsRoutes from './routes/quoteDocuments.routes'; // ✅ thêm dòng này
 const app = express();
 
 // ================== CORS CONFIG (đơn giản) ==================
@@ -116,6 +117,7 @@ app.use("/api/audit-logs", auditLogsRouter);
 // app.use("/assistant", assistantRoute);
 app.use("/api/assistant", assistantChatRoutes);
 app.use("/api/report-mail", reportMailerRoutes);
+api.use('/quote-documents', quoteDocumentsRoutes); // ✅ thêm dòng này
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
 
@@ -145,7 +147,7 @@ app.get('/api/__routes', (_req, res) =>
 // Errors & 404
 app.use((err: any, _req: any, res: any, _next: any) => {
   console.error(err);
-  res.status(err.status || 500).json({
+  res.status(err.statusCode || err.status || 500).json({
     ok: false,
     message: err.message || 'Server error',
   });

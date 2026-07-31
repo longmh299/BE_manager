@@ -24,6 +24,7 @@ model User {
   technicianInvoices Invoice[]     @relation("InvoiceTechUser")
   createdPayments    Payment[]     @relation("UserCreatedPayments")
   sessions           Session[]
+  uploadedQuoteDocs QuoteDocument[] @relation("QuoteDocumentUploadedBy")
 }
 
 model Session {
@@ -698,4 +699,28 @@ model ServiceLog {
   @@index([partnerId])
   @@index([serialId])
   @@index([status])
+}
+model QuoteDocument {
+  id           String   @id @default(cuid())
+
+  title        String // tên hiển thị để tìm, vd "Máy đóng vỉ DPP-150E"
+  machineCode  String? // mã máy, vd "DPP-150E" — để tìm nhanh theo mã
+  category     String? // nhóm máy (tuỳ chọn), vd "Máy đóng gói"
+  note         String? // ghi chú thêm
+
+  fileName     String // tên file gốc khi upload
+  mimeType     String
+  fileSize     Int // bytes
+  fileData     Bytes // nội dung file (doc/docx/pdf...)
+
+  uploadedById String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  uploadedBy   User?    @relation("QuoteDocumentUploadedBy", fields: [uploadedById], references: [id])
+
+  @@index([title])
+  @@index([machineCode])
+  @@index([category])
+  @@index([createdAt])
 }
