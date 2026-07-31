@@ -9,6 +9,27 @@ function toNum(d: Prisma.Decimal | number | string | null | undefined): number {
   return Number(d.toString());
 }
 
+// ✅ Bỏ dấu tiếng Việt — Postgres "contains ... insensitive" chỉ bỏ qua hoa/thường,
+// KHÔNG bỏ dấu, nên gõ "may ep" sẽ không tìm ra "Máy ép" nếu lọc thẳng bằng SQL.
+// Dùng để lọc lại trong JS sau khi lấy danh sách item theo `kind`.
+const VN_DIACRITIC_MAP: Record<string, string> = {
+  à: "a", á: "a", ạ: "a", ả: "a", ã: "a", â: "a", ầ: "a", ấ: "a", ậ: "a", ẩ: "a", ẫ: "a",
+  ă: "a", ằ: "a", ắ: "a", ặ: "a", ẳ: "a", ẵ: "a",
+  è: "e", é: "e", ẹ: "e", ẻ: "e", ẽ: "e", ê: "e", ề: "e", ế: "e", ệ: "e", ể: "e", ễ: "e",
+  ì: "i", í: "i", ị: "i", ỉ: "i", ĩ: "i",
+  ò: "o", ó: "o", ọ: "o", ỏ: "o", õ: "o", ô: "o", ồ: "o", ố: "o", ộ: "o", ổ: "o", ỗ: "o",
+  ơ: "o", ờ: "o", ớ: "o", ợ: "o", ở: "o", ỡ: "o",
+  ù: "u", ú: "u", ụ: "u", ủ: "u", ũ: "u", ư: "u", ừ: "u", ứ: "u", ự: "u", ử: "u", ữ: "u",
+  ỳ: "y", ý: "y", ỵ: "y", ỷ: "y", ỹ: "y",
+  đ: "d",
+};
+
+function normalizeVN(raw: string): string {
+  const lower = (raw || "").trim().toLowerCase();
+  const noDiacritic = lower.replace(/[à-ỹđ]/g, (c) => VN_DIACRITIC_MAP[c] || c);
+  return noDiacritic.replace(/\s+/g, " ").trim();
+}
+
 /**
  * -------- LIST TỒN KHO CHI TIẾT THEO KHO (/stocks) --------
  */
@@ -97,20 +118,34 @@ export async function getStockSummaryByItem(params: GetStockSummaryParams = {}) 
 
   const whereItem: any = {};
 
-  if (q && q.trim()) {
-    const keyword = q.trim();
-    whereItem.OR = [
-      { sku: { contains: keyword, mode: "insensitive" } },
-      { name: { contains: keyword, mode: "insensitive" } },
-    ];
-  }
-
   if (kind) {
     const k =
       typeof kind === "string"
         ? (kind.toUpperCase() as ItemKind)
         : (kind as ItemKind);
     whereItem.kind = k;
+  }
+
+  if (q && q.trim()) {
+    // ✅ FIX: trước đây dùng `contains ... insensitive` của Postgres — chỉ bỏ
+    // qua hoa/thường, KHÔNG bỏ dấu tiếng Việt, nên gõ không dấu sẽ ra rỗng dù
+    // sản phẩm có tồn thật. Lấy trước danh sách theo `kind`, lọc lại bằng
+    // normalizeVN (bỏ dấu, tách từ, không cần đúng thứ tự) rồi mới phân trang.
+    const qTokens = normalizeVN(q).split(" ").filter(Boolean);
+
+    const candidates = await prisma.item.findMany({
+      where: kind ? { kind: whereItem.kind } : {},
+      select: { id: true, sku: true, name: true },
+    });
+
+    const matchedIds = candidates
+      .filter((it) => {
+        const hay = normalizeVN(`${it.sku || ""} ${it.name || ""}`);
+        return qTokens.every((t) => hay.includes(t));
+      })
+      .map((it) => it.id);
+
+    whereItem.id = { in: matchedIds }; // rỗng -> Prisma trả 0 dòng, không lỗi
   }
 
   const skip = (page - 1) * pageSize;

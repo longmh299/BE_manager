@@ -44,6 +44,13 @@ export async function listItems(q?: string, page = 1, pageSize = 20, actor?: Act
   const keyword = q?.trim();
   const isAdmin = actor?.role === "admin";
 
+  // ✅ gộp mảng stocks (theo từng kho) thành 1 số tổng, dọn field thô khỏi response cho gọn
+  function withStockQty<T extends { stocks?: Array<{ qty: any }> }>(item: T) {
+    const { stocks, ...rest } = item;
+    const stockQty = (stocks || []).reduce((sum, s) => sum + Number(s.qty || 0), 0);
+    return { ...rest, stockQty };
+  }
+
   // --- 1. Exact match SKU ---
   if (keyword) {
     const exactSku = await prisma.item.findMany({
@@ -59,6 +66,7 @@ export async function listItems(q?: string, page = 1, pageSize = 20, actor?: Act
             note: true,
             kind: true,
             isSerialized: true,
+            stocks: { select: { qty: true } }, // ✅ để tính tồn kho tổng cho FE hiện trong gợi ý
             unit: { select: { id: true, code: true, name: true } },
             createdAt: true,
             updatedAt: true,
@@ -71,6 +79,7 @@ export async function listItems(q?: string, page = 1, pageSize = 20, actor?: Act
             note: true,
             kind: true,
             isSerialized: true,
+            stocks: { select: { qty: true } }, // ✅ để tính tồn kho tổng cho FE hiện trong gợi ý
             unit: { select: { id: true, code: true, name: true } },
             createdAt: true,
             updatedAt: true,
@@ -79,7 +88,7 @@ export async function listItems(q?: string, page = 1, pageSize = 20, actor?: Act
 
     if (exactSku.length > 0) {
       return {
-        data: exactSku,
+        data: exactSku.map(withStockQty),
         page: 1,
         pageSize: exactSku.length,
         total: exactSku.length,
@@ -112,6 +121,7 @@ export async function listItems(q?: string, page = 1, pageSize = 20, actor?: Act
             note: true,
             kind: true,
             isSerialized: true,
+            stocks: { select: { qty: true } }, // ✅ để tính tồn kho tổng cho FE hiện trong gợi ý
             unit: { select: { id: true, code: true, name: true } },
             createdAt: true,
             updatedAt: true,
@@ -124,6 +134,7 @@ export async function listItems(q?: string, page = 1, pageSize = 20, actor?: Act
             note: true,
             kind: true,
             isSerialized: true,
+            stocks: { select: { qty: true } }, // ✅ để tính tồn kho tổng cho FE hiện trong gợi ý
             unit: { select: { id: true, code: true, name: true } },
             createdAt: true,
             updatedAt: true,
@@ -132,7 +143,7 @@ export async function listItems(q?: string, page = 1, pageSize = 20, actor?: Act
     prisma.item.count({ where }),
   ]);
 
-  return { data: rows, page, pageSize, total };
+  return { data: rows.map(withStockQty), page, pageSize, total };
 }
 
 /**
