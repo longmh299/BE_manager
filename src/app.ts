@@ -33,6 +33,8 @@ import customersRoutes from './routes/customers.routes';
 import assistantChatRoutes from "./routes/assistant.chat.routes";
 import reportMailerRoutes from "./routes/reportMailer.routes";
 import quoteDocumentsRoutes from './routes/quoteDocuments.routes'; // ✅ thêm dòng này
+import machineVideosRoutes from './routes/machineVideos.routes';
+
 const app = express();
 
 // ================== CORS CONFIG (đơn giản) ==================
@@ -118,6 +120,7 @@ app.use("/api/audit-logs", auditLogsRouter);
 app.use("/api/assistant", assistantChatRoutes);
 app.use("/api/report-mail", reportMailerRoutes);
 api.use('/quote-documents', quoteDocumentsRoutes); // ✅ thêm dòng này
+api.use('/machine-videos', machineVideosRoutes);
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
 

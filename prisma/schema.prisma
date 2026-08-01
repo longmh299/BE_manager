@@ -25,6 +25,7 @@ model User {
   createdPayments    Payment[]     @relation("UserCreatedPayments")
   sessions           Session[]
   uploadedQuoteDocs QuoteDocument[] @relation("QuoteDocumentUploadedBy")
+  uploadedMachineVideos MachineVideo[] @relation("MachineVideoUploadedBy")
 }
 
 model Session {
@@ -722,5 +723,38 @@ model QuoteDocument {
   @@index([title])
   @@index([machineCode])
   @@index([category])
+  @@index([createdAt])
+}
+enum MachineVideoStatus {
+  PENDING   // đã tạo record, đang chờ upload lên R2 xong
+  READY     // upload xong, có thể tải về
+  FAILED    // upload lỗi/bỏ dở
+}
+
+model MachineVideo {
+  id           String             @id @default(cuid())
+
+  title        String // tên hiển thị, vd "Vận hành máy đóng vỉ DPP-150E"
+  machineCode  String? // mã máy để tìm nhanh, vd "DPP-150E"
+  category     String? // nhóm máy (tuỳ chọn)
+  note         String?
+
+  fileName     String // tên file gốc
+  mimeType     String
+  fileSize     Int // bytes
+  r2Key        String             @unique // đường dẫn object trên R2, vd "videos/abc123/van-hanh.mp4"
+
+  status       MachineVideoStatus @default(PENDING)
+
+  uploadedById String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  uploadedBy   User?              @relation("MachineVideoUploadedBy", fields: [uploadedById], references: [id])
+
+  @@index([title])
+  @@index([machineCode])
+  @@index([category])
+  @@index([status])
   @@index([createdAt])
 }
