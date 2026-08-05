@@ -26,6 +26,8 @@ model User {
   sessions           Session[]
   uploadedQuoteDocs QuoteDocument[] @relation("QuoteDocumentUploadedBy")
   uploadedMachineVideos MachineVideo[] @relation("MachineVideoUploadedBy")
+    createdMachineVideoShares MachineVideoShare[] @relation("MachineVideoShareCreatedBy")
+
 }
 
 model Session {
@@ -751,10 +753,26 @@ model MachineVideo {
   updatedAt    DateTime           @updatedAt
 
   uploadedBy   User?              @relation("MachineVideoUploadedBy", fields: [uploadedById], references: [id])
-
+  shares       MachineVideoShare[]
   @@index([title])
   @@index([machineCode])
   @@index([category])
   @@index([status])
   @@index([createdAt])
+}
+
+model MachineVideoShare {
+  id          String    @id @default(cuid())
+  videoId     String
+  token       String    @unique // chuỗi ngẫu nhiên trong URL, vd /s/xxxxx
+  expiresAt   DateTime? // null = không giới hạn
+  revokedAt   DateTime? // khác null = đã bị thu hồi tay
+  createdById String?
+  createdAt   DateTime  @default(now())
+
+  video       MachineVideo @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  createdBy   User?        @relation("MachineVideoShareCreatedBy", fields: [createdById], references: [id])
+
+  @@index([videoId])
+  @@index([token])
 }

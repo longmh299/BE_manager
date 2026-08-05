@@ -34,6 +34,7 @@ import assistantChatRoutes from "./routes/assistant.chat.routes";
 import reportMailerRoutes from "./routes/reportMailer.routes";
 import quoteDocumentsRoutes from './routes/quoteDocuments.routes'; // ✅ thêm dòng này
 import machineVideosRoutes from './routes/machineVideos.routes';
+import publicMachineVideosRoutes from './routes/publicMachineVideos.routes'; // ✅ share link công khai, không auth
 
 const app = express();
 
@@ -121,6 +122,9 @@ app.use("/api/assistant", assistantChatRoutes);
 app.use("/api/report-mail", reportMailerRoutes);
 api.use('/quote-documents', quoteDocumentsRoutes); // ✅ thêm dòng này
 api.use('/machine-videos', machineVideosRoutes);
+// ⚠️ KHÔNG mount qua `api` router chung nếu sau này ai đó lỡ thêm auth vào đó —
+// mount thẳng vào `app` với prefix riêng để luôn chắc chắn route này public.
+app.use('/api/public/machine-videos', publicMachineVideosRoutes);
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
 

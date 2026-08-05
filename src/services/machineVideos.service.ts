@@ -2,7 +2,7 @@
 import { PrismaClient, Prisma, MachineVideoStatus } from "@prisma/client";
 import { auditLog, type AuditCtx } from "./audit.service";
 import { getUploadUrl, getDownloadUrl, getPreviewUrl, deleteObject, objectExists } from "../lib/r2Client";
-import { randomUUID } from "crypto";
+import { randomUUID, randomBytes } from "crypto";
 
 const prisma = new PrismaClient();
 
@@ -185,6 +185,128 @@ export async function updateMachineVideoMeta(
   });
 
   return updated;
+}
+
+// ============================================================
+// ✅ SHARE LINK — chia sẻ video cho khách xem, không cần đăng nhập,
+// không cho tải xuống (chặn ở mức UI/HTTP, không phải DRM tuyệt đối).
+// ============================================================
+
+const SHARE_SELECT = {
+  id: true,
+  token: true,
+  expiresAt: true,
+  revokedAt: true,
+  createdAt: true,
+  createdBy: { select: { id: true, username: true } },
+} as const;
+
+/** Tạo link chia sẻ mới cho 1 video. Ai đăng nhập cũng tạo được (mọi role). */
+export async function createMachineVideoShare(
+  videoId: string,
+  input: { expiresInDays?: number | null },
+  ctx: AuditCtx
+) {
+  const video = await prisma.machineVideo.findUnique({ where: { id: videoId } });
+  if (!video) throw httpError(404, "Không tìm thấy video");
+  if (video.status !== "READY") throw httpError(400, "Video chưa upload xong, chưa chia sẻ được.");
+
+  // token ngẫu nhiên, an toàn cho URL (base64url), không đoán được
+  const token = randomBytes(16).toString("base64url");
+
+  const days = input.expiresInDays;
+  const expiresAt =
+    typeof days === "number" && days > 0
+      ? new Date(Date.now() + days * 24 * 60 * 60 * 1000)
+      : null;
+
+  const share = await prisma.machineVideoShare.create({
+    data: {
+      videoId,
+      token,
+      expiresAt,
+      createdById: ctx?.userId ?? null,
+    },
+    select: SHARE_SELECT,
+  });
+
+  await auditLog(prisma, {
+    userId: ctx?.userId,
+    userRole: ctx?.userRole,
+    action: "CREATE_SHARE",
+    entity: "MachineVideoShare",
+    entityId: share.id,
+    after: { videoId, expiresAt },
+    meta: ctx?.meta,
+  });
+
+  return share;
+}
+
+/** Liệt kê các link chia sẻ (còn hạn/hết hạn/đã thu hồi) của 1 video, mới nhất trước. */
+export async function listMachineVideoShares(videoId: string) {
+  const items = await prisma.machineVideoShare.findMany({
+    where: { videoId },
+    select: SHARE_SELECT,
+    orderBy: [{ createdAt: "desc" }],
+  });
+  return { items };
+}
+
+/** Thu hồi 1 link chia sẻ — sau đó khách bấm vào link sẽ báo lỗi ngay. */
+export async function revokeMachineVideoShare(shareId: string, ctx: AuditCtx) {
+  const existing = await prisma.machineVideoShare.findUnique({ where: { id: shareId } });
+  if (!existing) throw httpError(404, "Không tìm thấy link chia sẻ");
+
+  if (existing.revokedAt) {
+    return { id: existing.id, revokedAt: existing.revokedAt };
+  }
+
+  const updated = await prisma.machineVideoShare.update({
+    where: { id: shareId },
+    data: { revokedAt: new Date() },
+    select: { id: true, revokedAt: true },
+  });
+
+  await auditLog(prisma, {
+    userId: ctx?.userId,
+    userRole: ctx?.userRole,
+    action: "REVOKE_SHARE",
+    entity: "MachineVideoShare",
+    entityId: shareId,
+    meta: ctx?.meta,
+  });
+
+  return updated;
+}
+
+/**
+ * ✅ Dùng cho route CÔNG KHAI (không đăng nhập).
+ * Kiểm tra token còn hợp lệ không, trả về thông tin video + URL xem trực tiếp
+ * (tạo mới mỗi lần gọi, không lưu URL cố định — URL R2 có hạn dùng ngắn).
+ */
+export async function getPublicMachineVideoShare(token: string) {
+  const share = await prisma.machineVideoShare.findUnique({
+    where: { token },
+    include: { video: true },
+  });
+
+  if (!share) throw httpError(404, "Link chia sẻ không tồn tại.");
+  if (share.revokedAt) throw httpError(410, "Link chia sẻ này đã bị thu hồi.");
+  if (share.expiresAt && share.expiresAt.getTime() < Date.now()) {
+    throw httpError(410, "Link chia sẻ này đã hết hạn.");
+  }
+  if (share.video.status !== "READY") throw httpError(400, "Video chưa sẵn sàng để xem.");
+
+  const url = await getPreviewUrl(share.video.r2Key);
+
+  return {
+    title: share.video.title,
+    machineCode: share.video.machineCode,
+    note: share.video.note,
+    mimeType: share.video.mimeType,
+    url,
+  };
 }
 
 export async function deleteMachineVideo(id: string, ctx: AuditCtx) {

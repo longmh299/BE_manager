@@ -9,6 +9,9 @@ import {
   getMachineVideoPreviewUrl,
   updateMachineVideoMeta,
   deleteMachineVideo,
+  createMachineVideoShare,
+  listMachineVideoShares,
+  revokeMachineVideoShare,
 } from "../services/machineVideos.service";
 
 const r = Router();
@@ -99,6 +102,50 @@ r.put("/:id", async (req, res, next) => {
   try {
     const u = getUser(req)!;
     const data = await updateMachineVideoMeta(req.params.id, req.body ?? {}, {
+      userId: u.id,
+      userRole: u.role,
+      meta: buildAuditMeta(req),
+    });
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/machine-videos/:id/shares
+ * Body: { expiresInDays?: number | null }  (7, 30, hoặc null = không giới hạn)
+ * -> tạo link chia sẻ mới, mọi role đăng nhập đều tạo được
+ */
+r.post("/:id/shares", async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+    const data = await createMachineVideoShare(req.params.id, req.body ?? {}, {
+      userId: u.id,
+      userRole: u.role,
+      meta: buildAuditMeta(req),
+    });
+    res.status(201).json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** GET /api/machine-videos/:id/shares  -> danh sách link đã tạo cho video này */
+r.get("/:id/shares", async (req, res, next) => {
+  try {
+    const data = await listMachineVideoShares(req.params.id);
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** DELETE /api/machine-videos/shares/:shareId  -> thu hồi 1 link chia sẻ */
+r.delete("/shares/:shareId", async (req, res, next) => {
+  try {
+    const u = getUser(req)!;
+    const data = await revokeMachineVideoShare(req.params.shareId, {
       userId: u.id,
       userRole: u.role,
       meta: buildAuditMeta(req),
