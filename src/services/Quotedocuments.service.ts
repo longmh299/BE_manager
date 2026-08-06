@@ -1,6 +1,7 @@
 // src/services/quoteDocuments.service.ts
 import { PrismaClient, Prisma } from "@prisma/client";
 import { auditLog, type AuditCtx } from "./audit.service";
+import { isDocx, patchDocxContact } from "../lib/docxContactPatch";
 
 const prisma = new PrismaClient();
 
@@ -73,6 +74,37 @@ export async function getQuoteDocumentFile(id: string) {
   const doc = await prisma.quoteDocument.findUnique({ where: { id } });
   if (!doc) throw httpError(404, "Không tìm thấy file báo giá");
   return doc;
+}
+
+/**
+ * ✅ Lấy file để tải xuống, TỰ ĐỘNG thay "Email:"/"Mobile:" trong file .docx
+ * bằng email/SĐT của người đang tải (nếu người đó đã lưu trong hồ sơ cá nhân).
+ * File gốc lưu trong kho KHÔNG bị đổi — chỉ tạo bản vá tạm trong bộ nhớ để trả
+ * về ngay lúc này. Nếu không phải .docx, hoặc user chưa lưu email/phone, hoặc
+ * file không khớp mẫu "Email:"/"Mobile:" -> trả nguyên file gốc, không lỗi.
+ */
+export async function getQuoteDocumentFileForDownload(id: string, userId?: string) {
+  const doc = await prisma.quoteDocument.findUnique({ where: { id } });
+  if (!doc) throw httpError(404, "Không tìm thấy file báo giá");
+
+  if (!userId || !isDocx(doc.mimeType, doc.fileName)) {
+    return { ...doc, fileData: Buffer.from(doc.fileData) };
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { email: true, phone: true },
+  });
+  if (!user || (!user.email && !user.phone)) {
+    return { ...doc, fileData: Buffer.from(doc.fileData) };
+  }
+
+  const { buffer, replacedEmail, replacedPhone } = await patchDocxContact(
+    Buffer.from(doc.fileData),
+    { email: user.email, phone: user.phone }
+  );
+
+  return { ...doc, fileData: buffer, patchedEmail: replacedEmail, patchedPhone: replacedPhone };
 }
 
 export type CreateQuoteDocumentInput = {

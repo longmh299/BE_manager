@@ -3,7 +3,6 @@ import { PrismaClient } from "@prisma/client";
 import {
   signJwt,
   requireAuth,
-  meHandler,
   requireRole,
   getUser,
 } from "../middlewares/auth";
@@ -80,8 +79,47 @@ authRouter.post("/login", async (req, res) => {
   }
 });
 
-/** Ai đang đăng nhập */
-authRouter.get("/me", requireAuth, meHandler);
+/** Ai đang đăng nhập — trả thêm email/phone (dùng để tự động chèn vào file báo giá khi tải xuống) */
+authRouter.get("/me", requireAuth, async (req, res) => {
+  const u = getUser(req);
+  if (!u) return res.status(401).json({ message: "Unauthorized" });
+  try {
+    const dbUser = await prisma.user.findUnique({
+      where: { id: u.id },
+      select: { id: true, username: true, role: true, email: true, phone: true },
+    });
+    if (!dbUser) return res.status(404).json({ message: "User not found" });
+    return res.json(dbUser);
+  } catch (e: any) {
+    return res.status(500).json({ message: e.message ?? "Internal error" });
+  }
+});
+
+/** ✅ Lưu email/SĐT liên hệ của chính user — dùng để tự động chèn vào file báo giá khi tải xuống */
+authRouter.put("/profile", requireAuth, async (req, res) => {
+  try {
+    const u = getUser(req);
+    if (!u) return res.status(401).json({ message: "Unauthorized" });
+
+    const { email, phone } = req.body ?? {};
+    if (email !== undefined && email !== null && email.trim() && !/^\S+@\S+\.\S+$/.test(email.trim())) {
+      return res.status(400).json({ message: "Email không hợp lệ." });
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: u.id },
+      data: {
+        email: email !== undefined ? (email.trim() || null) : undefined,
+        phone: phone !== undefined ? (phone.trim() || null) : undefined,
+      },
+      select: { id: true, username: true, role: true, email: true, phone: true },
+    });
+    return res.json(updated);
+  } catch (e: any) {
+    console.error("Update profile error:", e);
+    return res.status(500).json({ message: e.message ?? "Không lưu được thông tin." });
+  }
+});
 
 /** Đổi mật khẩu */
 authRouter.post("/change-password", requireAuth, async (req, res) => {

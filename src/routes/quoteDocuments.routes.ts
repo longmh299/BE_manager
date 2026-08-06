@@ -5,7 +5,7 @@ import { requireAuth, requireRole, getUser } from "../middlewares/auth";
 import {
   listQuoteDocuments,
   getQuoteDocumentMeta,
-  getQuoteDocumentFile,
+  getQuoteDocumentFileForDownload,
   createQuoteDocument,
   updateQuoteDocument,
   deleteQuoteDocument,
@@ -82,16 +82,17 @@ r.get("/:id", async (req, res, next) => {
   }
 });
 
-/** GET /api/quote-documents/:id/download  (stream file nhị phân) */
+/** GET /api/quote-documents/:id/download  (stream file nhị phân, tự chèn email/SĐT người tải nếu file .docx và đã lưu hồ sơ) */
 r.get("/:id/download", async (req, res, next) => {
   try {
-    const doc = await getQuoteDocumentFile(req.params.id);
+    const u = getUser(req);
+    const doc = await getQuoteDocumentFileForDownload(req.params.id, u?.id);
     res.setHeader("Content-Type", doc.mimeType || "application/octet-stream");
     res.setHeader(
       "Content-Disposition",
       `attachment; filename*=UTF-8''${encodeURIComponent(doc.fileName)}`
     );
-    res.send(Buffer.from(doc.fileData));
+    res.send(doc.fileData);
   } catch (err) {
     next(err);
   }

@@ -16,6 +16,8 @@ model User {
   role               UserRole      @default(staff)
   createdAt          DateTime      @default(now())
   updatedAt          DateTime      @updatedAt
+  email              String?
+  phone              String?
   auditLogs          AuditLog[]
   deviceTok          DeviceToken[]
   approvedInvoices   Invoice[]     @relation("InvoiceApprovedBy")
