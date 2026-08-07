@@ -275,11 +275,80 @@ export async function getItemSalesSummary(params: ItemSalesParams) {
   };
 }
 
+export type RecentSalePricesParams = {
+  itemQuery: string;
+  limit?: number; // số lần bán gần nhất muốn xem, mặc định 5
+};
+
+/**
+ * Trả về danh sách các lần bán GẦN NHẤT (giá + số lượng + ngày + mã hóa đơn) của
+ * MỘT sản phẩm — để người dùng TỰ so sánh, thay vì gộp thành 1 con số bình quân
+ * (dễ "làm phẳng" mất biến động giá thật giữa các lần bán khác nhau).
+ * Lấy theo SỐ LẦN bán gần nhất (không theo khoảng thời gian cố định) — nên vẫn tìm
+ * ra dữ liệu cho sản phẩm bán chậm (vd máy móc, cả tháng chỉ bán 1-2 lần), không bị
+ * "không có dữ liệu" oan uổng như cách tính theo cửa sổ thời gian cố định.
+ */
+export async function getRecentSalePrices(params: RecentSalePricesParams) {
+  const { itemQuery, limit = 5 } = params;
+  if (!itemQuery?.trim()) {
+    return { matched: [], note: "Thiếu tên/mã sản phẩm" };
+  }
+
+  const allItems = await prisma.item.findMany({
+    select: { id: true, sku: true, name: true, kind: true },
+  });
+
+  const scored = allItems
+    .map((it) => ({
+      item: it,
+      score: Math.max(scoreText(itemQuery, it.name || ""), scoreText(itemQuery, it.sku || "")),
+    }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+
+  if (scored.length === 0) {
+    return { matched: [], note: "Không tìm thấy sản phẩm phù hợp" };
+  }
+
+  const results = [];
+  for (const s of scored) {
+    const lines = await prisma.invoiceLine.findMany({
+      where: {
+        itemId: s.item.id,
+        invoice: { type: "SALES" as any, status: "APPROVED" as any },
+      },
+      orderBy: { invoice: { issueDate: "desc" } },
+      select: {
+        qty: true,
+        price: true,
+        invoice: { select: { issueDate: true, code: true } },
+      },
+      take: limit,
+    });
+
+    results.push({
+      itemId: s.item.id,
+      sku: s.item.sku,
+      name: s.item.name,
+      kind: s.item.kind,
+      recentSales: lines.map((l) => ({
+        date: l.invoice.issueDate.toISOString().slice(0, 10),
+        invoiceCode: l.invoice.code,
+        qty: l.qty.toString(),
+        price: l.price.toString(),
+      })),
+    });
+  }
+
+  return { matched: results };
+}
+
+type CoverageItem = { id: string; sku: string; name: string; kind: string };
+
 export type StockCoverageParams = {
   itemQuery: string;
 };
-
-type CoverageItem = { id: string; sku: string; name: string; kind: string };
 
 /**
  * Tính coverage (tồn / tốc độ bán / verdict) cho một danh sách item ĐÃ XÁC ĐỊNH
@@ -414,7 +483,7 @@ function verdictRank(v: string) {
  */
 export async function getItemFamilyReport(itemQuery: string) {
   if (!itemQuery?.trim()) {
-    return { machines: [], parts: [], note: "Thiếu tên/mã sản phẩm" };
+    return { machines: [], parts: [], note: "Không tìm thấy sản phẩm phù hợp" };
   }
 
   const allItems = await prisma.item.findMany({
@@ -632,4 +701,89 @@ export async function searchInvoices(params: SearchInvoicesParams) {
     total: r.total?.toString?.() ?? String(r.total),
     paidAmount: r.paidAmount?.toString?.() ?? String(r.paidAmount),
   }));
+}
+
+// ---------- Chi tiết từng dòng sản phẩm trong 1 hóa đơn (kèm GIÁ BÁN từng dòng) ----------
+// searchInvoices ở trên chỉ trả tổng tiền cả hóa đơn (Invoice.total), KHÔNG có giá
+// bán từng sản phẩm bên trong (nằm ở bảng InvoiceLine.price, nhập lúc tạo hóa đơn).
+// Tool này đọc thêm tầng chi tiết đó — vẫn CHỈ ĐỌC, không tạo/sửa gì.
+// ⚠️ Chỉ select price/qty/amount — KHÔNG select unitCost/costTotal (giá vốn), nên
+// tự động không lộ giá vốn cho role staff mà không cần lọc riêng như search_stock.
+
+export type InvoiceDetailParams = {
+  code: string;
+  limit?: number;
+};
+
+export async function getInvoiceDetail(params: InvoiceDetailParams) {
+  const { code, limit = 5 } = params;
+  if (!code?.trim()) {
+    return { matched: [], note: "Thiếu mã hóa đơn" };
+  }
+
+  const invoices = await prisma.invoice.findMany({
+    where: { code: { contains: code.trim(), mode: "insensitive" } },
+    select: {
+      id: true,
+      code: true,
+      codeYear: true,
+      type: true,
+      issueDate: true,
+      partnerName: true,
+      total: true,
+      status: true,
+    },
+    orderBy: [{ issueDate: "desc" }],
+    take: limit,
+  });
+
+  if (invoices.length === 0) {
+    return { matched: [], note: "Không tìm thấy hóa đơn nào khớp mã này" };
+  }
+
+  // Nhiều hóa đơn khớp cùng mã (khác năm/khác loại chứng từ) -> trả về danh sách để
+  // hỏi lại người dùng, KHÔNG tự chọn đại 1 hóa đơn (giống cách xử lý SKU trùng mã
+  // ở search_stock — tránh trả lời nhầm hóa đơn).
+  if (invoices.length > 1) {
+    return {
+      matched: invoices.map((iv) => ({
+        code: iv.code,
+        codeYear: iv.codeYear,
+        type: iv.type,
+        issueDate: iv.issueDate.toISOString(),
+        partnerName: iv.partnerName,
+        total: iv.total?.toString?.() ?? String(iv.total),
+      })),
+      note: "Có nhiều hóa đơn khớp mã này, cần hỏi lại người dùng để chọn đúng hóa đơn (theo năm hoặc tên khách)",
+    };
+  }
+
+  const invoice = invoices[0];
+  const lines = await prisma.invoiceLine.findMany({
+    where: { invoiceId: invoice.id },
+    select: {
+      itemName: true,
+      itemSku: true,
+      qty: true,
+      price: true,
+      amount: true,
+    },
+  });
+
+  return {
+    code: invoice.code,
+    codeYear: invoice.codeYear,
+    type: invoice.type,
+    issueDate: invoice.issueDate.toISOString(),
+    partnerName: invoice.partnerName,
+    status: invoice.status,
+    total: invoice.total?.toString?.() ?? String(invoice.total),
+    lines: lines.map((l) => ({
+      itemName: l.itemName,
+      itemSku: l.itemSku,
+      qty: l.qty.toString(),
+      price: l.price.toString(), // ✅ giá bán/đơn vị của đúng dòng sản phẩm này
+      amount: l.amount.toString(),
+    })),
+  };
 }

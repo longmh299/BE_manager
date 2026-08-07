@@ -1,5 +1,6 @@
 export type Intent =
   | "GET_STOCK"              // hỏi tồn
+  | "GET_PRICE"              // hỏi giá bán niêm yết
   | "LOW_STOCK"              // sắp hết
   | "OUT_OF_STOCK"           // hết hàng
   | "NEGATIVE_STOCK"         // tồn âm (< 0) — dấu hiệu lỗi dữ liệu, bán vượt tồn kho
@@ -143,6 +144,7 @@ type Score = { intent: Intent; score: number; reasons: string[] };
 function scoreIntents(n: string, skus: string[], threshold?: number) : Score[] {
   const scores: Score[] = [
     { intent: "GET_STOCK", score: 0, reasons: [] },
+    { intent: "GET_PRICE", score: 0, reasons: [] },
     { intent: "LOW_STOCK", score: 0, reasons: [] },
     { intent: "OUT_OF_STOCK", score: 0, reasons: [] },
     { intent: "NEGATIVE_STOCK", score: 0, reasons: [] },
@@ -166,6 +168,12 @@ function scoreIntents(n: string, skus: string[], threshold?: number) : Score[] {
   if (has(/\bton\b/) || has(/\bton kho\b/) || has(/\bcon bao nhieu\b/)) add("GET_STOCK", 6, "stock keyword");
   if (has(/\bmay\b/)) add("GET_STOCK", 3, "mentions 'may' (often stock check)");
   if (skus.length) add("GET_STOCK", 4, "has sku token");
+
+  // giá bán niêm yết — điểm CAO hơn hẳn "has sku token" của GET_STOCK (4 điểm), vì
+  // câu hỏi kiểu "giá của jl 660" cũng chứa SKU nên vốn sẽ tự cộng điểm nhầm sang
+  // GET_STOCK nếu không có luật riêng này (đã xảy ra thật, bị trả lời nhầm tồn kho).
+  if (has(/\bgia\b/) || has(/\bgia ban\b/) || has(/\bbao nhieu tien\b/) || has(/\bgia bao nhieu\b/))
+    add("GET_PRICE", 8, "price keyword");
 
   // low stock
   if (has(/\bsap het\b/) || has(/\bgan het\b/) || has(/\bcon it\b/)) add("LOW_STOCK", 6, "low-stock keyword");
@@ -221,11 +229,11 @@ export function parsePro(raw: string): ParseResult {
 
   // queryText fallback: nếu không có sku mà có "ton/may ..." thì lấy phần sau làm query
   const FILLER_WORDS = new Set([
-    "con", "nhieu", "ko", "khong", "het", "sap", "du", "a", "ha", "nhe", "the", "vay", "nay",
+    "con", "nhieu", "ko", "khong", "het", "sap", "du", "a", "ha", "nhe", "the", "vay", "nay", "cua", "ban",
   ]);
   let queryText: string | undefined;
   if (skus.length === 0) {
-    const m = normalized.match(/\b(ton|may|hoa don|khach hang|khach|con no cua|da mua|lich su mua)\b\s*(.+)$/);
+    const m = normalized.match(/\b(ton|may|gia|hoa don|khach hang|khach|con no cua|da mua|lich su mua)\b\s*(.+)$/);
     if (m?.[2]) {
       const cleaned = m[2]
         .split(" ")

@@ -8,7 +8,7 @@
 // lời luôn khớp với dữ liệu thật trong DB.
 
 import { prisma } from "../tool/prisma";
-import { searchStock, searchInvoices, getItemSalesSummary, getStockCoverage, getNegativeStockItems, getCustomerInfo } from "./tools";
+import { searchStock, searchInvoices, getItemSalesSummary, getStockCoverage, getNegativeStockItems, getCustomerInfo, getInvoiceDetail, getRecentSalePrices } from "./tools";
 import { buildLowStockAlerts } from "../services/assistant/alerts/lowStock.service";
 
 // ---------- 1. Tool schema (theo format Anthropic tool-use) ----------
@@ -18,7 +18,8 @@ export const chatToolDefinitions = [
     name: "search_stock",
     description:
       "Tra cứu tồn kho theo SKU, tên sản phẩm, mã kho hoặc loại (máy/linh kiện). " +
-      "Dùng khi người dùng hỏi 'còn hàng không', 'tồn kho bao nhiêu'.",
+      "Dùng khi người dùng hỏi 'còn hàng không', 'tồn kho bao nhiêu'. KHÔNG dùng tool " +
+      "này cho câu hỏi về GIÁ — tool này không có giá bán, dùng get_item_sales.",
     input_schema: {
       type: "object",
       properties: {
@@ -79,7 +80,8 @@ export const chatToolDefinitions = [
     description:
       "Tính doanh thu và số lượng ĐÃ BÁN của MỘT sản phẩm cụ thể (theo tên hoặc SKU) " +
       "trong một khoảng thời gian. Dùng khi người dùng hỏi 'doanh thu của [sản phẩm] " +
-      "trong [khoảng thời gian]', 'bán được bao nhiêu cái [sản phẩm]'. " +
+      "trong [khoảng thời gian]', 'bán được bao nhiêu cái [sản phẩm]'. KHÔNG dùng tool " +
+      "này cho câu hỏi về GIÁ — dùng get_recent_sale_prices. " +
       "KHÔNG dùng search_invoices cho câu hỏi kiểu này vì search_invoices chỉ lọc theo " +
       "mã hóa đơn hoặc tên/SĐT khách hàng, không lọc được theo sản phẩm.",
     input_schema: {
@@ -147,6 +149,49 @@ export const chatToolDefinitions = [
         },
       },
       required: ["customerQuery"],
+    },
+  },
+  {
+    name: "get_invoice_detail",
+    description:
+      "Lấy chi tiết TỪNG DÒNG SẢN PHẨM bên trong 1 hóa đơn cụ thể, kèm GIÁ BÁN của " +
+      "từng dòng (không phải chỉ tổng tiền cả hóa đơn). Dùng khi người dùng hỏi " +
+      "'hóa đơn [mã] bán [sản phẩm] giá bao nhiêu', 'hóa đơn [mã] gồm những sản phẩm " +
+      "gì, giá từng cái', hoặc bất kỳ câu hỏi nào cần xem GIÁ BÁN của 1 sản phẩm CỤ " +
+      "THỂ trong 1 hóa đơn cụ thể. KHÔNG dùng search_invoices cho việc này vì tool đó " +
+      "chỉ trả về tổng tiền cả hóa đơn, không có giá bán từng dòng sản phẩm.",
+    input_schema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "Mã hóa đơn (hoặc một phần mã)" },
+      },
+      required: ["code"],
+    },
+  },
+  {
+    name: "get_recent_sale_prices",
+    description:
+      "Lấy danh sách CÁC LẦN BÁN GẦN NHẤT (giá, số lượng, ngày, mã hóa đơn) của MỘT " +
+      "sản phẩm — dùng khi người dùng hỏi GIÁ BÁN của 1 sản phẩm KHÔNG kèm mã hóa đơn " +
+      "cụ thể (vd 'giá bán [sản phẩm] bao nhiêu', 'sản phẩm X giá nhiêu'). Hệ thống " +
+      "này KHÔNG có khái niệm giá niêm yết cố định — trả về NGUYÊN các lần bán thật " +
+      "gần đây để người dùng tự so sánh, KHÔNG tự gộp/tính trung bình các mức giá đó " +
+      "lại thành 1 con số duy nhất. Nếu chỉ có 1 lần bán, nói rõ đó là lần bán gần " +
+      "nhất/duy nhất. Nếu mảng recentSales rỗng, nghĩa là sản phẩm chưa từng bán được " +
+      "lần nào — nói rõ điều đó, không suy diễn giá.",
+    input_schema: {
+      type: "object",
+      properties: {
+        itemQuery: {
+          type: "string",
+          description: "Tên hoặc SKU sản phẩm cần tra giá",
+        },
+        limit: {
+          type: "number",
+          description: "Số lần bán gần nhất muốn xem, mặc định 5",
+        },
+      },
+      required: ["itemQuery"],
     },
   },
 ] as const;
@@ -217,6 +262,14 @@ export async function executeChatTool(name: string, input: any, role?: string): 
 
     case "get_customer_info": {
       return await getCustomerInfo(input?.customerQuery);
+    }
+
+    case "get_invoice_detail": {
+      return await getInvoiceDetail({ code: input?.code });
+    }
+
+    case "get_recent_sale_prices": {
+      return await getRecentSalePrices({ itemQuery: input?.itemQuery, limit: input?.limit });
     }
 
     default:

@@ -8,7 +8,7 @@
 // chatService.ts).
 
 import { parsePro, type ParseResult } from "./parsePro";
-import { searchStock, getItemFamilyReport, getItemSalesSummary, getNegativeStockItems, getCustomerInfo } from "../../assistant/tools";
+import { searchStock, getItemFamilyReport, getItemSalesSummary, getNegativeStockItems, getCustomerInfo, getRecentSalePrices } from "../../assistant/tools";
 import { buildLowStockAlerts } from "./alerts/lowStock.service";
 import { prisma } from "../../tool/prisma";
 
@@ -128,6 +128,37 @@ async function answerGetStock(entities: ParseResult["entities"]): Promise<string
       : "Kết quả:";
 
   return [header, ...lines].join("\n");
+}
+
+/**
+ * Trả lời câu hỏi "giá bán [sản phẩm] bao nhiêu" bằng cách LIỆT KÊ NGUYÊN các lần
+ * bán gần nhất (giá + ngày + mã hóa đơn) để người dùng tự so sánh — KHÔNG gộp thành
+ * 1 con số trung bình (dễ che mất biến động giá thật giữa các lần bán khác nhau).
+ * Lấy theo SỐ LẦN bán gần nhất (không theo khoảng thời gian cố định), nên vẫn ra
+ * được kết quả cho sản phẩm bán chậm (máy móc), không bị "không có dữ liệu" oan.
+ */
+async function answerGetPrice(entities: ParseResult["entities"]): Promise<string | null> {
+  const query = entities.skus?.[0] || entities.queryText;
+  if (!query) return null;
+
+  const result = await getRecentSalePrices({ itemQuery: query, limit: 5 });
+
+  if (!result.matched || result.matched.length === 0) {
+    return result.note || "Không tìm thấy sản phẩm phù hợp.";
+  }
+
+  const blocks = result.matched.map((m: any) => {
+    const header = `**${m.sku || "(không mã)"} — ${m.name}**`;
+    if (!m.recentSales || m.recentSales.length === 0) {
+      return `${header}: chưa từng bán được lần nào.`;
+    }
+    const saleLines = m.recentSales.map(
+      (s: any) => `  - ${s.date} (${s.invoiceCode}): **${fmtMoney(s.price)}đ**/cái × ${fmtQty(s.qty)}`
+    );
+    return [header, ...saleLines].join("\n");
+  });
+
+  return blocks.join("\n\n");
 }
 
 async function answerLowStock(entities: ParseResult["entities"]): Promise<string> {
@@ -258,6 +289,8 @@ export async function tryFastAnswer(userMessage: string): Promise<string | null>
   switch (parsed.intent) {
     case "GET_STOCK":
       return answerGetStock(parsed.entities);
+    case "GET_PRICE":
+      return answerGetPrice(parsed.entities);
     case "LOW_STOCK":
       return answerLowStock(parsed.entities);
     case "OUT_OF_STOCK":
