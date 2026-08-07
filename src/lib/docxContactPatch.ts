@@ -31,8 +31,10 @@ export function isDocx(mimeType: string, fileName: string): boolean {
  *    2 khối XML tách biệt (do hyperlink tạo khối riêng) -> thử khớp CÙNG khối
  *    trước, không được thì thử khớp kiểu "nhảy qua các thẻ hyperlink" tới khối kế.
  * 2. Nhãn số điện thoại không đồng nhất giữa các file ("Mobile:" hay "hot line:"
- *    hay "Hotline:") -> chấp nhận nhiều biến thể nhãn. Nếu công ty dùng thêm cách
- *    ghi nào khác nữa (vd "SĐT:", "ĐT:"), cần bổ sung thêm vào PHONE_LABEL_PATTERN.
+ *    hay "Hotline:") -> chấp nhận nhiều biến thể nhãn, và LUÔN CHUẨN HOÁ nhãn hiển
+ *    thị ra file kết quả thành "Mobile:" bất kể file gốc ghi kiểu gì. Nếu công ty
+ *    dùng thêm cách ghi nào khác nữa (vd "SĐT:", "ĐT:"), cần bổ sung thêm vào
+ *    PHONE_LABEL_PATTERN.
  */
 const PHONE_LABEL_PATTERN = "Mobile|Hot\\s*Line";
 // nhãn khác có thể xuất hiện gần đó trong cùng khối text, dùng để KHÔNG nuốt lố
@@ -104,9 +106,11 @@ export async function patchDocxContact(
       const re = sameRunPattern(PHONE_LABEL_PATTERN);
       const m = re.exec(xml);
       if (m && m[2].trim()) {
-        xml = xml.replace(re, (_full, label: string) => {
+        // ✅ Ép nhãn hiển thị thành "Mobile:" luôn, bất kể file gốc ghi là
+        // "hot line:", "Hotline:"... — theo đúng yêu cầu chuẩn hoá nhãn.
+        xml = xml.replace(re, () => {
           replacedPhone = true;
-          return `${label}${phone}`;
+          return `Mobile: ${phone}`;
         });
       }
     }
