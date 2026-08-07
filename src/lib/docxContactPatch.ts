@@ -21,12 +21,37 @@ export function isDocx(mimeType: string, fileName: string): boolean {
 }
 
 /**
- * Thay "Email: ..." và "Mobile: ..." trong file .docx bằng giá trị mới.
- * Trả về buffer đã patch + cờ báo có tìm thấy mẫu để thay không (để biết
- * file này có đang dùng đúng format công ty hay không, phục vụ audit log).
- * Nếu không có gì để thay (thiếu email/phone, hoặc file không khớp mẫu),
+ * Thay "Email: ..." và "Mobile:"/"hot line:"/"Hotline:" trong file .docx bằng giá
+ * trị mới. Trả về buffer đã patch + cờ báo có tìm thấy mẫu để thay không.
+ * Nếu không có gì để thay (thiếu email/phone, hoặc file không khớp mẫu nào),
  * trả nguyên buffer gốc.
+ *
+ * ⚠️ Xử lý 2 tình huống thực tế đã gặp:
+ * 1. Word tự nhận diện email là hyperlink -> nhãn "Email:" và địa chỉ email nằm ở
+ *    2 khối XML tách biệt (do hyperlink tạo khối riêng) -> thử khớp CÙNG khối
+ *    trước, không được thì thử khớp kiểu "nhảy qua các thẻ hyperlink" tới khối kế.
+ * 2. Nhãn số điện thoại không đồng nhất giữa các file ("Mobile:" hay "hot line:"
+ *    hay "Hotline:") -> chấp nhận nhiều biến thể nhãn. Nếu công ty dùng thêm cách
+ *    ghi nào khác nữa (vd "SĐT:", "ĐT:"), cần bổ sung thêm vào PHONE_LABEL_PATTERN.
  */
+const PHONE_LABEL_PATTERN = "Mobile|Hot\\s*Line";
+// nhãn khác có thể xuất hiện gần đó trong cùng khối text, dùng để KHÔNG nuốt lố
+// sang phần nhãn kế tiếp khi giá trị được phép chứa khoảng trắng (SĐT có dấu cách)
+const ANY_LABEL_PATTERN = `Email|${PHONE_LABEL_PATTERN}`;
+
+function sameRunPattern(labelPattern: string) {
+  // Giá trị: mọi ký tự KHÔNG phải '<', cho phép có khoảng trắng bên trong (SĐT dạng
+  // "0985 545757"), nhưng DỪNG LẠI nếu sắp gặp 1 nhãn khác trong cùng khối văn bản
+  // (tránh nuốt nhầm nhãn kế tiếp — lỗi thực tế đã gặp khi Email/Mobile chung 1 dòng).
+  return new RegExp(`(${labelPattern}\\s*:\\s*)((?:(?!${ANY_LABEL_PATTERN})[^<])*)`, "i");
+}
+
+// Trường hợp Word biến email thành hyperlink: "Email:" đóng khối ngay
+// (</w:t></w:r>), sau đó là các thẻ <w:hyperlink>/<w:r>/<w:rPr>... rồi mới tới
+// khối <w:t> thật sự chứa địa chỉ email — "nhảy qua" các thẻ đó để tới đúng chỗ.
+const EMAIL_HYPERLINK_PATTERN =
+  /(Email\s*:\s*<\/w:t>[\s\S]*?<w:t[^>]*>)([^<]*)(<\/w:t>)/i;
+
 export async function patchDocxContact(
   buffer: Buffer,
   contact: { email?: string | null; phone?: string | null }
@@ -40,8 +65,6 @@ export async function patchDocxContact(
 
   const zip = await JSZip.loadAsync(buffer);
 
-  // header có thể là header1/2/3.xml (trang đầu/trang chẵn khác nhau);
-  // thử luôn document.xml + footer phòng trường hợp thông tin nằm chỗ khác.
   const headerFiles = Object.keys(zip.files).filter((name) =>
     /^word\/header\d*\.xml$/.test(name)
   );
@@ -59,22 +82,29 @@ export async function patchDocxContact(
     let xml = await zip.files[name].async("string");
     const before = xml;
 
-    // ⚠️ Dừng đúng ở khoảng trắng/dấu "<" gần nhất — KHÔNG dùng [^<]* tham lam,
-    // vì "Email:" và "Mobile:" thường nằm chung 1 khối text trong file gốc;
-    // tham lam sẽ nuốt luôn phần Mobile khi thay Email (đã kiểm chứng thực tế).
     if (email) {
-      const re = /(Email:\s*)([^\s<]+)/i;
-      if (re.test(xml)) {
-        xml = xml.replace(re, (_m, label: string) => {
+      const re = sameRunPattern("Email");
+      const m = re.exec(xml);
+      if (m && m[2].trim()) {
+        // ✅ tìm thấy ngay trong cùng khối, có giá trị thật để thay
+        xml = xml.replace(re, (_full, label: string) => {
           replacedEmail = true;
           return `${label}${email}`;
         });
+      } else if (EMAIL_HYPERLINK_PATTERN.test(xml)) {
+        // ✅ Email bị tách khối do Word tự gắn hyperlink -> nhảy qua các thẻ để tới đúng chỗ
+        xml = xml.replace(EMAIL_HYPERLINK_PATTERN, (_full, open: string, _old: string, close: string) => {
+          replacedEmail = true;
+          return `${open}${email}${close}`;
+        });
       }
     }
+
     if (phone) {
-      const re = /(Mobile:\s*)([^\s<]+)/i;
-      if (re.test(xml)) {
-        xml = xml.replace(re, (_m, label: string) => {
+      const re = sameRunPattern(PHONE_LABEL_PATTERN);
+      const m = re.exec(xml);
+      if (m && m[2].trim()) {
+        xml = xml.replace(re, (_full, label: string) => {
           replacedPhone = true;
           return `${label}${phone}`;
         });
@@ -85,9 +115,6 @@ export async function patchDocxContact(
   }
 
   if (!replacedEmail && !replacedPhone) {
-    // không tìm thấy mẫu nào để thay -> trả nguyên file gốc, tránh sinh ra file
-    // đã "generate lại" không cần thiết (dù nội dung như cũ, đóng gói lại ZIP
-    // có thể lệch byte-for-byte so với bản gốc)
     return { buffer, replacedEmail: false, replacedPhone: false };
   }
 
