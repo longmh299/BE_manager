@@ -10,26 +10,26 @@ datasource db {
 }
 
 model User {
-  id                 String        @id @default(cuid())
-  username           String        @unique
-  password           String
-  role               UserRole      @default(staff)
-  createdAt          DateTime      @default(now())
-  updatedAt          DateTime      @updatedAt
-  email              String?
-  phone              String?
-  auditLogs          AuditLog[]
-  deviceTok          DeviceToken[]
-  approvedInvoices   Invoice[]     @relation("InvoiceApprovedBy")
-  cancelledInvoices  Invoice[]     @relation("InvoiceCancelledBy")
-  salesInvoices      Invoice[]     @relation("InvoiceSaleUser")
-  technicianInvoices Invoice[]     @relation("InvoiceTechUser")
-  createdPayments    Payment[]     @relation("UserCreatedPayments")
-  sessions           Session[]
-  uploadedQuoteDocs QuoteDocument[] @relation("QuoteDocumentUploadedBy")
-  uploadedMachineVideos MachineVideo[] @relation("MachineVideoUploadedBy")
-    createdMachineVideoShares MachineVideoShare[] @relation("MachineVideoShareCreatedBy")
-
+  id                        String              @id @default(cuid())
+  username                  String              @unique
+  password                  String
+  role                      UserRole            @default(staff)
+  createdAt                 DateTime            @default(now())
+  updatedAt                 DateTime            @updatedAt
+  email                     String?
+  phone                     String?
+  auditLogs                 AuditLog[]
+  deviceTok                 DeviceToken[]
+  approvedInvoices          Invoice[]           @relation("InvoiceApprovedBy")
+  cancelledInvoices         Invoice[]           @relation("InvoiceCancelledBy")
+  salesInvoices             Invoice[]           @relation("InvoiceSaleUser")
+  technicianInvoices        Invoice[]           @relation("InvoiceTechUser")
+  createdPayments           Payment[]           @relation("UserCreatedPayments")
+  sessions                  Session[]
+  uploadedQuoteDocs         QuoteDocument[]     @relation("QuoteDocumentUploadedBy")
+  uploadedMachineVideos     MachineVideo[]      @relation("MachineVideoUploadedBy")
+  createdMachineVideoShares MachineVideoShare[] @relation("MachineVideoShareCreatedBy")
+  uploadedMachineImages     MachineImage[]      @relation("MachineImageUploadedBy")
 }
 
 model Session {
@@ -60,7 +60,6 @@ model Location {
   stocks           Stock[]
   stockCounts      StockCount[]
   stockSnapshots   StockSnapshot[]
-  
 }
 
 model Unit {
@@ -93,7 +92,8 @@ model Item {
   stocks          Stock[]
   countLines      StockCountLine[]
   stockSnapshots  StockSnapshot[]
-  serviceLogs ServiceLog[]
+  serviceLogs     ServiceLog[]
+
   @@index([unitId])
   @@index([kind])
   @@index([isSerialized])
@@ -114,16 +114,17 @@ model Stock {
 }
 
 model ItemSerial {
-  id         String    @id @default(cuid())
-  itemId     String
-  serialNo   String    @unique
-  status     String    @default("in_stock")
-  locationId String?
-  note       String?
-  createdAt  DateTime  @default(now())
-  item       Item      @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  location   Location? @relation(fields: [locationId], references: [id])
+  id          String       @id @default(cuid())
+  itemId      String
+  serialNo    String       @unique
+  status      String       @default("in_stock")
+  locationId  String?
+  note        String?
+  createdAt   DateTime     @default(now())
+  item        Item         @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  location    Location?    @relation(fields: [locationId], references: [id])
   serviceLogs ServiceLog[]
+
   @@index([itemId])
   @@index([locationId])
   @@index([status])
@@ -157,60 +158,54 @@ model AssetAssignment {
 }
 
 model Movement {
-  id          String         @id @default(cuid())
-  type        MovementType
+  id   String       @id @default(cuid())
+  type MovementType
 
-  refNo       String?        @unique
-  note        String?
+  refNo String? @unique
+  note  String?
 
-  posted      Boolean        @default(false)
-  postedAt    DateTime?      // ✅ ok
+  posted   Boolean   @default(false)
+  postedAt DateTime? // ✅ ok
 
-  occurredAt  DateTime       @default(now()) // ✅ ngày phát sinh
-  createdAt   DateTime       @default(now())
-  updatedAt   DateTime       @updatedAt
+  occurredAt DateTime @default(now()) // ✅ ngày phát sinh
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
-  invoiceId   String?
-  invoice     Invoice?       @relation(fields: [invoiceId], references: [id])
+  invoiceId String?
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id])
 
   // ✅ NEW: kho “ngữ cảnh” của movement (không thay thế from/to ở lines)
-    warehouseId String?     // ✅ chỉ lưu ID Location (kho default)
+  warehouseId String? // ✅ chỉ lưu ID Location (kho default)
 
-
-
-  lines       MovementLine[]
+  lines MovementLine[]
 
   @@index([posted, postedAt])
   @@index([type, occurredAt])
   @@index([invoiceId])
- 
 }
 
-
 model MovementLine {
-  id             String    @id @default(cuid())
+  id             String   @id @default(cuid())
   movementId     String
   itemId         String
   fromLocationId String?
   toLocationId   String?
-  qty            Decimal   @db.Decimal(18, 3)
-  unitCost       Decimal?  @db.Decimal(18, 4)
-  costTotal      Decimal?  @db.Decimal(18, 4)
+  qty            Decimal  @db.Decimal(18, 3)
+  unitCost       Decimal? @db.Decimal(18, 4)
+  costTotal      Decimal? @db.Decimal(18, 4)
   note           String?
 
-  fromLoc        Location? @relation("FromLocation", fields: [fromLocationId], references: [id])
-  item           Item      @relation(fields: [itemId], references: [id])
-  movement       Movement  @relation(fields: [movementId], references: [id])
-  toLoc          Location? @relation("ToLocation", fields: [toLocationId], references: [id])
+  fromLoc  Location? @relation("FromLocation", fields: [fromLocationId], references: [id])
+  item     Item      @relation(fields: [itemId], references: [id])
+  movement Movement  @relation(fields: [movementId], references: [id])
+  toLoc    Location? @relation("ToLocation", fields: [toLocationId], references: [id])
 
   // ✅ Dùng khi load lines theo movement
   @@index([movementId])
-
   // ✅ Dùng cho recompute/unpost: filter theo item + kho
   @@index([itemId, fromLocationId])
   @@index([itemId, toLocationId])
 }
-
 
 model StockCount {
   id         String           @id @default(cuid())
@@ -237,124 +232,119 @@ model StockCountLine {
 }
 
 model Partner {
-  id        String    @id @default(cuid())
-  code      String?   @unique
-  name      String
-  taxCode   String?   @db.VarChar(20)
-  phone     String?   @db.VarChar(20)
-  email     String?
-  address   String?
-  type      String    @default("customer")
-  note      String?
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  invoices  Invoice[]
-  payments  Payment[]
+  id                 String             @id @default(cuid())
+  code               String?            @unique
+  name               String
+  taxCode            String?            @db.VarChar(20)
+  phone              String?            @db.VarChar(20)
+  email              String?
+  address            String?
+  type               String             @default("customer")
+  note               String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  invoices           Invoice[]
+  payments           Payment[]
   customerActivities CustomerActivity[]
   customerNotes      CustomerNote[]
   serviceLogs        ServiceLog[]
 }
 
 model Invoice {
-  id                 String               @id @default(cuid())
-  code               String
-  codeYear           Int                  @default(0)
-  type               InvoiceType
-  issueDate          DateTime
-  partnerId          String?
-  saleUserId         String?
-  techUserId         String?
-  receiveAccountId   String?
-  saleUserName       String?
-  techUserName       String?
-  partnerName        String?
-  partnerTax         String?
-  partnerPhone       String?
-  partnerAddr        String?
-  partnerCode        String?
-  currency           String               @default("VND")
-  subtotal           Decimal              @default(0) @db.Decimal(18, 2)
-  tax                Decimal              @default(0) @db.Decimal(18, 2)
-  total              Decimal              @default(0) @db.Decimal(18, 2)
-  totalCost          Decimal?             @db.Decimal(18, 2)
-  note               String?
-  attachment         String?
+  id               String      @id @default(cuid())
+  code             String
+  codeYear         Int         @default(0)
+  type             InvoiceType
+  issueDate        DateTime
+  partnerId        String?
+  saleUserId       String?
+  techUserId       String?
+  receiveAccountId String?
+  saleUserName     String?
+  techUserName     String?
+  partnerName      String?
+  partnerTax       String?
+  partnerPhone     String?
+  partnerAddr      String?
+  partnerCode      String?
+  currency         String      @default("VND")
+  subtotal         Decimal     @default(0) @db.Decimal(18, 2)
+  tax              Decimal     @default(0) @db.Decimal(18, 2)
+  total            Decimal     @default(0) @db.Decimal(18, 2)
+  totalCost        Decimal?    @db.Decimal(18, 2)
+  note             String?
+  attachment       String?
 
   // ====== RETURN (GIỮ NGUYÊN - KHÔNG ĐỘNG) ======
-  refInvoiceId       String?
-  refInvoice         Invoice?             @relation("InvoiceReturnRef", fields: [refInvoiceId], references: [id])
-  returns            Invoice[]            @relation("InvoiceReturnRef")
+  refInvoiceId String?
+  refInvoice   Invoice?  @relation("InvoiceReturnRef", fields: [refInvoiceId], references: [id])
+  returns      Invoice[] @relation("InvoiceReturnRef")
 
   // ====== ADJUSTMENT (MỚI - TÁCH RIÊNG) ======
-  adjustsInvoiceId   String?
-  adjustmentKind     AdjustmentKind?
-  adjustmentReason   String?
+  adjustsInvoiceId String?
+  adjustmentKind   AdjustmentKind?
+  adjustmentReason String?
 
-  adjustsInvoice     Invoice?             @relation("InvoiceAdjustRef", fields: [adjustsInvoiceId], references: [id])
-  adjustments        Invoice[]            @relation("InvoiceAdjustRef")
+  adjustsInvoice Invoice?  @relation("InvoiceAdjustRef", fields: [adjustsInvoiceId], references: [id])
+  adjustments    Invoice[] @relation("InvoiceAdjustRef")
 
-  hasWarrantyHold    Boolean              @default(false)
-  warrantyHoldPct    Decimal              @default(0) @db.Decimal(5, 2)
-  warrantyHoldAmount Decimal              @default(0) @db.Decimal(18, 2)
+  hasWarrantyHold    Boolean       @default(false)
+  warrantyHoldPct    Decimal       @default(0) @db.Decimal(5, 2)
+  warrantyHoldAmount Decimal       @default(0) @db.Decimal(18, 2)
   warrantyDueDate    DateTime?
   approvedById       String?
   approvedAt         DateTime?
-  createdAt          DateTime             @default(now())
-  updatedAt          DateTime             @updatedAt
-  paymentStatus      PaymentStatus        @default(UNPAID)
-  paidAmount         Decimal              @default(0) @db.Decimal(18, 2)
-  status             InvoiceStatus        @default(DRAFT)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  paymentStatus      PaymentStatus @default(UNPAID)
+  paidAmount         Decimal       @default(0) @db.Decimal(18, 2)
+  status             InvoiceStatus @default(DRAFT)
   cancelReason       String?
   cancelledAt        DateTime?
   cancelledById      String?
-  netSubtotal        Decimal              @default(0) @db.Decimal(18, 2)
-  netTax             Decimal              @default(0) @db.Decimal(18, 2)
-  netTotal           Decimal              @default(0) @db.Decimal(18, 2)
-  returnedSubtotal   Decimal              @default(0) @db.Decimal(18, 2)
-  returnedTax        Decimal              @default(0) @db.Decimal(18, 2)
-  returnedTotal      Decimal              @default(0) @db.Decimal(18, 2)
+  netSubtotal        Decimal       @default(0) @db.Decimal(18, 2)
+  netTax             Decimal       @default(0) @db.Decimal(18, 2)
+  netTotal           Decimal       @default(0) @db.Decimal(18, 2)
+  returnedSubtotal   Decimal       @default(0) @db.Decimal(18, 2)
+  returnedTax        Decimal       @default(0) @db.Decimal(18, 2)
+  returnedTotal      Decimal       @default(0) @db.Decimal(18, 2)
 
-  approvedBy         User?                @relation("InvoiceApprovedBy", fields: [approvedById], references: [id])
-  cancelledBy        User?                @relation("InvoiceCancelledBy", fields: [cancelledById], references: [id])
-  partner            Partner?             @relation(fields: [partnerId], references: [id])
-  receiveAccount     PaymentAccount?      @relation("InvoiceReceiveAccount", fields: [receiveAccountId], references: [id])
-  saleUser           User?                @relation("InvoiceSaleUser", fields: [saleUserId], references: [id])
-  techUser           User?                @relation("InvoiceTechUser", fields: [techUserId], references: [id])
+  approvedBy     User?           @relation("InvoiceApprovedBy", fields: [approvedById], references: [id])
+  cancelledBy    User?           @relation("InvoiceCancelledBy", fields: [cancelledById], references: [id])
+  partner        Partner?        @relation(fields: [partnerId], references: [id])
+  receiveAccount PaymentAccount? @relation("InvoiceReceiveAccount", fields: [receiveAccountId], references: [id])
+  saleUser       User?           @relation("InvoiceSaleUser", fields: [saleUserId], references: [id])
+  techUser       User?           @relation("InvoiceTechUser", fields: [techUserId], references: [id])
 
-  lines              InvoiceLine[]
-  movements          Movement[]
-  allocations        PaymentAllocation[]
-  returnMapsTo       SalesReturnLineMap[] @relation("ReturnMap_OriginInvoice")
-  returnMapsFrom     SalesReturnLineMap[] @relation("ReturnMap_ReturnInvoice")
-  warrantyHold       WarrantyHold?
-  
+  lines          InvoiceLine[]
+  movements      Movement[]
+  allocations    PaymentAllocation[]
+  returnMapsTo   SalesReturnLineMap[] @relation("ReturnMap_OriginInvoice")
+  returnMapsFrom SalesReturnLineMap[] @relation("ReturnMap_ReturnInvoice")
+  warrantyHold   WarrantyHold?
+
+  @@unique([codeYear, type, code])
   @@index([partnerId, issueDate])
   @@index([saleUserId])
   @@index([techUserId])
   @@index([receiveAccountId])
-
   // RETURN index (GIỮ NGUYÊN)
   @@index([refInvoiceId])
-
   // ADJUSTMENT index (MỚI)
   @@index([adjustsInvoiceId])
   @@index([adjustmentKind])
-
   @@index([type, status, issueDate])
   @@index([cancelledById])
   @@index([cancelledAt])
-
-  @@unique([codeYear, type, code])
   @@index([codeYear, type, code])
 }
-
 
 model InvoiceCounter {
   // ✅ counter theo năm + loại hoá đơn (SALES/PURCHASE/RETURN...)
   year      Int
   type      InvoiceType
-  nextNo    Int      @default(1)
-  updatedAt DateTime @updatedAt
+  nextNo    Int         @default(1)
+  updatedAt DateTime    @updatedAt
 
   @@id([year, type])
   @@index([year])
@@ -506,7 +496,7 @@ model MachinePart {
 
 model PaymentAccount {
   id        String      @id @default(cuid())
-  code      String      
+  code      String
   name      String
   type      AccountType @default(BANK)
   bankName  String?
@@ -651,10 +641,12 @@ enum AllocationKind {
   WARRANTY_HOLD
   TAX
 }
+
 enum AdjustmentKind {
   DEBIT
   CREDIT
 }
+
 model CustomerNote {
   id        String   @id @default(cuid())
   partnerId String
@@ -662,24 +654,26 @@ model CustomerNote {
   createdBy String?
   createdAt DateTime @default(now())
 
-  partner   Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  partner Partner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
 
   @@index([partnerId])
   @@index([createdAt])
 }
-model CustomerActivity {
-  id         String   @id @default(cuid())
-  partnerId  String
-  type       ActivityType
-  content    String?
-  createdBy  String?
-  createdAt  DateTime @default(now())
 
-  partner    Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+model CustomerActivity {
+  id        String       @id @default(cuid())
+  partnerId String
+  type      ActivityType
+  content   String?
+  createdBy String?
+  createdAt DateTime     @default(now())
+
+  partner Partner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
 
   @@index([partnerId, createdAt])
   @@index([type])
 }
+
 enum ActivityType {
   CALL
   MESSAGE
@@ -687,75 +681,79 @@ enum ActivityType {
   NOTE
   SUPPORT
 }
-model ServiceLog {
-  id         String   @id @default(cuid())
-  partnerId  String
-  itemId     String?
-  serialId   String?
-  issue      String
-  solution   String?
-  status     String   @default("OPEN")
-  createdAt  DateTime @default(now())
 
-  partner    Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
-  item       Item?    @relation(fields: [itemId], references: [id])
-  serial     ItemSerial? @relation(fields: [serialId], references: [id])
+model ServiceLog {
+  id        String   @id @default(cuid())
+  partnerId String
+  itemId    String?
+  serialId  String?
+  issue     String
+  solution  String?
+  status    String   @default("OPEN")
+  createdAt DateTime @default(now())
+
+  partner Partner     @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  item    Item?       @relation(fields: [itemId], references: [id])
+  serial  ItemSerial? @relation(fields: [serialId], references: [id])
 
   @@index([partnerId])
   @@index([serialId])
   @@index([status])
 }
+
 model QuoteDocument {
-  id           String   @id @default(cuid())
+  id String @id @default(cuid())
 
-  title        String // tên hiển thị để tìm, vd "Máy đóng vỉ DPP-150E"
-  machineCode  String? // mã máy, vd "DPP-150E" — để tìm nhanh theo mã
-  category     String? // nhóm máy (tuỳ chọn), vd "Máy đóng gói"
-  note         String? // ghi chú thêm
+  title       String // tên hiển thị để tìm, vd "Máy đóng vỉ DPP-150E"
+  machineCode String? // mã máy, vd "DPP-150E" — để tìm nhanh theo mã
+  category    String? // nhóm máy (tuỳ chọn), vd "Máy đóng gói"
+  note        String? // ghi chú thêm
 
-  fileName     String // tên file gốc khi upload
-  mimeType     String
-  fileSize     Int // bytes
-  fileData     Bytes // nội dung file (doc/docx/pdf...)
+  fileName String // tên file gốc khi upload
+  mimeType String
+  fileSize Int // bytes
+  fileData Bytes // nội dung file (doc/docx/pdf...)
 
   uploadedById String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  uploadedBy   User?    @relation("QuoteDocumentUploadedBy", fields: [uploadedById], references: [id])
+  uploadedBy User? @relation("QuoteDocumentUploadedBy", fields: [uploadedById], references: [id])
 
   @@index([title])
   @@index([machineCode])
   @@index([category])
   @@index([createdAt])
 }
+
 enum MachineVideoStatus {
-  PENDING   // đã tạo record, đang chờ upload lên R2 xong
-  READY     // upload xong, có thể tải về
-  FAILED    // upload lỗi/bỏ dở
+  PENDING // đã tạo record, đang chờ upload lên R2 xong
+  READY // upload xong, có thể tải về
+  FAILED // upload lỗi/bỏ dở
 }
 
 model MachineVideo {
-  id           String             @id @default(cuid())
+  id String @id @default(cuid())
 
-  title        String // tên hiển thị, vd "Vận hành máy đóng vỉ DPP-150E"
-  machineCode  String? // mã máy để tìm nhanh, vd "DPP-150E"
-  category     String? // nhóm máy (tuỳ chọn)
-  note         String?
+  title       String // tên hiển thị, vd "Vận hành máy đóng vỉ DPP-150E"
+  machineCode String? // mã máy để tìm nhanh, vd "DPP-150E"
+  category    String? // nhóm máy (tuỳ chọn)
+  note        String?
 
-  fileName     String // tên file gốc
-  mimeType     String
-  fileSize     Int // bytes
-  r2Key        String             @unique // đường dẫn object trên R2, vd "videos/abc123/van-hanh.mp4"
+  fileName String // tên file gốc
+  mimeType String
+  fileSize Int // bytes
+  r2Key    String @unique // đường dẫn object trên R2, vd "videos/abc123/van-hanh.mp4"
 
-  status       MachineVideoStatus @default(PENDING)
+  status MachineVideoStatus @default(PENDING)
 
   uploadedById String?
-  createdAt    DateTime           @default(now())
-  updatedAt    DateTime           @updatedAt
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
-  uploadedBy   User?              @relation("MachineVideoUploadedBy", fields: [uploadedById], references: [id])
-  shares       MachineVideoShare[]
+  uploadedBy User?               @relation("MachineVideoUploadedBy", fields: [uploadedById], references: [id])
+  shares     MachineVideoShare[]
+
   @@index([title])
   @@index([machineCode])
   @@index([category])
@@ -772,9 +770,43 @@ model MachineVideoShare {
   createdById String?
   createdAt   DateTime  @default(now())
 
-  video       MachineVideo @relation(fields: [videoId], references: [id], onDelete: Cascade)
-  createdBy   User?        @relation("MachineVideoShareCreatedBy", fields: [createdById], references: [id])
+  video     MachineVideo @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  createdBy User?        @relation("MachineVideoShareCreatedBy", fields: [createdById], references: [id])
 
   @@index([videoId])
   @@index([token])
+}
+
+enum MachineImageStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+model MachineImage {
+  id String @id @default(cuid())
+
+  title       String
+  machineCode String?
+  category    String?
+  note        String?
+
+  fileName String
+  mimeType String
+  fileSize Int
+  r2Key    String @unique
+
+  status MachineImageStatus @default(PENDING)
+
+  uploadedById String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  uploadedBy User? @relation("MachineImageUploadedBy", fields: [uploadedById], references: [id])
+
+  @@index([title])
+  @@index([machineCode])
+  @@index([category])
+  @@index([status])
+  @@index([createdAt])
 }
