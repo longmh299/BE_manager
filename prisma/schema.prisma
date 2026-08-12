@@ -711,7 +711,7 @@ model QuoteDocument {
 
   fileName String // tên file gốc khi upload
   mimeType String
-  fileSize Int // bytes
+  fileSize BigInt // bytes
   fileData Bytes // nội dung file (doc/docx/pdf...)
 
   uploadedById String?
@@ -742,7 +742,7 @@ model MachineVideo {
 
   fileName String // tên file gốc
   mimeType String
-  fileSize Int // bytes
+  fileSize BigInt // bytes
   r2Key    String @unique // đường dẫn object trên R2, vd "videos/abc123/van-hanh.mp4"
 
   status MachineVideoStatus @default(PENDING)
@@ -793,7 +793,7 @@ model MachineImage {
 
   fileName String
   mimeType String
-  fileSize Int
+  fileSize BigInt
   r2Key    String @unique
 
   status MachineImageStatus @default(PENDING)
