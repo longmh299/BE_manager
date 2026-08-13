@@ -6,6 +6,22 @@ import { randomUUID, randomBytes } from "crypto";
 
 const prisma = new PrismaClient();
 
+// ✅ Tách "video hướng dẫn vận hành" khỏi "video chạy máy" mà KHÔNG cần thêm
+// cột mới / chạy migration: dùng field "category" có sẵn làm nhãn ẩn cố định.
+// Video nào có category = giá trị này thì được xem là video hướng dẫn, và bị
+// loại khỏi danh sách mặc định (tab "Kho video vận hành máy") để 2 tab không
+// lẫn vào nhau. Giá trị cố tình đặt lạ để không trùng với "nhóm máy" người
+// dùng tự gõ (vd "CNC", "Laser"...).
+export const OPERATION_MANUAL_CATEGORY = "__operation_manual__";
+
+// ✅ Ghi tường minh cho "video chạy máy" thay vì gửi chuỗi rỗng ("") — vì
+// updateMachineVideoMeta phía dưới coi chuỗi rỗng là "xoá field" và tự động
+// lưu thành NULL, gây khó hiểu khi xem trực tiếp trong DB (NULL trông như
+// "chưa phân loại" dù thực chất là "video chạy máy"). Video cũ có category
+// NULL hoặc bất kỳ giá trị tự do nào khác (từ trước khi có tính năng này)
+// vẫn được tính là "video chạy máy" như bình thường — xem listMachineVideos.
+export const OPERATION_DEMO_CATEGORY = "__operation_demo__";
+
 function httpError(status: number, message: string) {
   const err: any = new Error(message);
   err.statusCode = status;
@@ -33,13 +49,32 @@ export async function listMachineVideos(params: {
   page?: number;
   pageSize?: number;
 }) {
-  const { q, category } = params;
+  const { q } = params;
   const page = Math.max(1, params.page ?? 1);
   const pageSize = Math.min(200, Math.max(1, params.pageSize ?? 20));
 
+  // ✅ Nếu FE truyền category cụ thể (vd tab "Video hướng dẫn vận hành" luôn
+  // truyền category = OPERATION_MANUAL_CATEGORY) -> lọc đúng category đó.
+  // Nếu không truyền gì (tab "Kho video vận hành máy" mặc định) -> loại video
+  // hướng dẫn ra, để 2 tab không lẫn vào nhau.
+  //
+  // ⚠️ CHÚ Ý: KHÔNG dùng { category: { not: OPERATION_MANUAL_CATEGORY } } ở
+  // đây — về mặt SQL, so sánh NULL != 'x' trả về NULL (không phải true), nên
+  // các video cũ có category = NULL (chưa từng điền "Nhóm máy") sẽ bị loại
+  // nhầm khỏi kết quả. Phải liệt kê rõ "khác giá trị này HOẶC null" để chắc
+  // chắn không ẩn nhầm video cũ.
+  const categoryFilter: Prisma.MachineVideoWhereInput = params.category
+    ? { category: params.category }
+    : {
+        OR: [
+          { category: { not: OPERATION_MANUAL_CATEGORY } },
+          { category: null },
+        ],
+      };
+
   const where: Prisma.MachineVideoWhereInput = {
     status: "READY", // ✅ chưa upload xong thì không hiện cho người khác thấy
-    ...(category ? { category } : {}),
+    ...categoryFilter,
     ...(q
       ? {
           OR: [
