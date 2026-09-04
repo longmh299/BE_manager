@@ -36,6 +36,7 @@ import quoteDocumentsRoutes from './routes/quoteDocuments.routes'; // ✅ thêm 
 import machineVideosRoutes from './routes/machineVideos.routes';
 import publicMachineVideosRoutes from './routes/publicMachineVideos.routes'; // ✅ share link công khai, không auth
 import machineImagesRoutes from './routes/machineImages.routes';
+import analyticsRoutes from './routes/analytics.routes'; // ✅ NEW: thống kê truy cập web (GA4)
 const app = express();
 
 // ================== CORS CONFIG (đơn giản) ==================
@@ -126,9 +127,10 @@ api.use('/machine-videos', machineVideosRoutes);
 // mount thẳng vào `app` với prefix riêng để luôn chắc chắn route này public.
 app.use('/api/public/machine-videos', publicMachineVideosRoutes);
 api.use('/machine-images', machineImagesRoutes);
+
 // Mount đúng 1 lần dưới /api
 app.use('/api', api);
-
+api.use('/analytics', analyticsRoutes); // ✅ NEW: /api/analytics/overview
 // Debug: liệt kê routes (dev only)
 function listRoutes(router: any) {
   const rts: string[] = [];
