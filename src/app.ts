@@ -12,6 +12,7 @@ import stockCountRoutes from './routes/stockcounts.routes';
 import stockRoutes from './routes/stocks.routes';
 import assetRoutes from './routes/assets.routes';
 import invoiceRoutes from './routes/invoices.routes';
+import invoiceTraceRoutes from './routes/Invoicetrace.routes'; // ✅ ADD: truy xuất hoá đơn theo mã sản phẩm
 import stockImportRoutes from './routes/stocks_import.routes';
 import partnersRoutes from './routes/partners.routes';
 import { reportsRouter } from './routes/reports.routes';
@@ -94,6 +95,7 @@ api.use('/stock-counts', stockCountRoutes);
 api.use('/stocks', stockRoutes);
 api.use('/assets', assetRoutes);
 api.use('/invoices', invoiceRoutes);
+api.use('/invoice-trace', invoiceTraceRoutes); // ✅ ADD: GET /api/invoice-trace?code=&type=PURCHASE|SALES
 api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
 app.use("/api/assistant/alerts", assistantAlertsRoute);
