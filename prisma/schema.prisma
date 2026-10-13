@@ -30,6 +30,7 @@ model User {
   uploadedMachineVideos     MachineVideo[]      @relation("MachineVideoUploadedBy")
   createdMachineVideoShares MachineVideoShare[] @relation("MachineVideoShareCreatedBy")
   uploadedMachineImages     MachineImage[]      @relation("MachineImageUploadedBy")
+  translatedDocs            TranslatedDoc[]     @relation("TranslatedDocCreatedBy")
 }
 
 model Session {
@@ -810,3 +811,28 @@ model MachineImage {
   @@index([status])
   @@index([createdAt])
 }
+   /// Lịch sử tài liệu đã dịch (tab "Dịch tài liệu"): bản dịch + file gốc trên R2 + nháp báo giá.
+   /// Người dịch chỉ thấy tài liệu của mình, admin thấy hết.
+   model TranslatedDoc {
+     id          String   @id @default(cuid())
+     title       String // tên file, hoặc "5 trang ảnh chụp"
+     kind        String // pdf | images | docx | xlsx
+     context     String? // "Tài liệu về máy gì?" người dùng nhập
+     quality     String   @default("fast") // fast | deep (Dịch chuyên sâu)
+     pageCount   Int      @default(0)
+     sources     Json     @default("[]") // file gốc trên R2: [{ key, name, type, size, uploaded }]
+     pages       Json? // bản dịch PDF / ảnh / Word
+     sheets      Json? // bản dịch Excel
+     usage       Json? // chi phí AI cộng dồn { cost, models }
+     cost        Float    @default(0)
+     quoteDraft  Json? // nháp báo giá { q, machine }
+     machineCode String? // mã máy (lấy từ nháp báo giá) để tìm nhanh
+     createdById String
+     createdAt   DateTime @default(now())
+     updatedAt   DateTime @updatedAt
+
+     createdBy User @relation("TranslatedDocCreatedBy", fields: [createdById], references: [id], onDelete: Cascade)
+
+     @@index([createdById, createdAt])
+     @@index([createdAt])
+   }

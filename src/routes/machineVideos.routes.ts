@@ -12,6 +12,7 @@ import {
   createMachineVideoShare,
   listMachineVideoShares,
   revokeMachineVideoShare,
+  resolveMachineForUpload,
 } from "../services/machineVideos.service";
 
 const r = Router();
@@ -44,9 +45,24 @@ r.get("/", async (req, res, next) => {
 });
 
 /**
+ * GET /api/machine-videos/resolve-machine?q=jl1000
+ * -> { match: {id, sku, name} | null, suggestions: [...] }
+ * FE gọi khi người dùng đang gõ tên máy (debounce ~300ms) để hiện máy khớp / gợi ý.
+ */
+r.get("/resolve-machine", async (req, res, next) => {
+  try {
+    res.json(await resolveMachineForUpload(String(req.query.q ?? "")));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * POST /api/machine-videos/init
- * Body JSON: { title, machineCode?, category?, note?, fileName, mimeType, fileSize }
- * -> trả { id, uploadUrl } để FE PUT file thẳng lên R2 (không qua backend)
+ * Body JSON: { title?, machineCode?, category?, note?, fileName, mimeType, fileSize, strictMachine? }
+ * -> trả { id, uploadUrl, r2Key, machine, suggestions } để FE PUT file thẳng lên R2 (không qua backend)
+ * - machineCode gõ tự do; server dò ra mã chuẩn và đặt tên file theo mã máy
+ * - strictMachine=true: không khớp máy nào -> 422 { data: { suggestions } }
  */
 r.post("/init", async (req, res, next) => {
   try {

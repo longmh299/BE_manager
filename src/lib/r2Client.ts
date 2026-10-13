@@ -1,5 +1,5 @@
 // src/lib/r2Client.ts
-import { S3Client, DeleteObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, DeleteObjectCommand, HeadObjectCommand, CopyObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 
@@ -52,6 +52,25 @@ export async function getPreviewUrl(key: string, expiresInSeconds = 600) {
 
 export async function deleteObject(key: string) {
   await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: key }));
+}
+
+/**
+ * Chuyển file sang key mới NGAY TRÊN R2 (copy rồi xoá bản cũ, không tải về backend).
+ * An toàn: chỉ xoá bản cũ sau khi chắc chắn bản mới đã tồn tại.
+ * R2 copy 1 lần tối đa 5GB — đủ cho video 4K thông thường.
+ */
+export async function moveObject(fromKey: string, toKey: string, contentType?: string) {
+  if (fromKey === toKey) return;
+  await r2.send(
+    new CopyObjectCommand({
+      Bucket: R2_BUCKET_NAME,
+      Key: toKey,
+      CopySource: `${R2_BUCKET_NAME}/${fromKey.split("/").map(encodeURIComponent).join("/")}`,
+      ...(contentType ? { ContentType: contentType, MetadataDirective: "REPLACE" as const } : {}),
+    })
+  );
+  if (!(await objectExists(toKey))) throw new Error(`Chuyển file thất bại: không thấy ${toKey}`);
+  await deleteObject(fromKey);
 }
 
 /** Kiểm tra file đã thật sự upload xong lên R2 chưa (dùng khi FE báo "complete") */

@@ -37,6 +37,7 @@ import quoteDocumentsRoutes from './routes/quoteDocuments.routes'; // ✅ thêm 
 import machineVideosRoutes from './routes/machineVideos.routes';
 import publicMachineVideosRoutes from './routes/publicMachineVideos.routes'; // ✅ share link công khai, không auth
 import machineImagesRoutes from './routes/machineImages.routes';
+import translateRoutes from './routes/translate.routes'; // ✅ dịch tài liệu Trung/Anh -> Việt
 import analyticsRoutes from './routes/analytics.routes'; // ✅ NEW: thống kê truy cập web (GA4)
 const app = express();
 
@@ -69,6 +70,8 @@ app.use(
 
 // Middlewares khác
 app.use(helmet());
+// ✅ Dịch tài liệu gửi file lớn (PDF/ảnh base64) -> body parser riêng 32MB, gắn TRƯỚC express.json() mặc định 100KB
+app.use('/api/translate', translateRoutes);
 app.use(express.json());
 app.use(morgan('dev'));
 

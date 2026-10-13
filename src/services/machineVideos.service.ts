@@ -1,8 +1,9 @@
 // src/services/machineVideos.service.ts
 import { PrismaClient, Prisma, MachineVideoStatus } from "@prisma/client";
 import { auditLog, type AuditCtx } from "./audit.service";
-import { getUploadUrl, getDownloadUrl, getPreviewUrl, deleteObject, objectExists } from "../lib/r2Client";
-import { randomUUID, randomBytes } from "crypto";
+import { getUploadUrl, getDownloadUrl, getPreviewUrl, deleteObject, objectExists, moveObject } from "../lib/r2Client";
+import { randomBytes } from "crypto";
+import { resolveMachine, keySafe, vnStamp, fileExt, modelFromName } from "../utils/machineMatch";
 
 const prisma = new PrismaClient();
 
@@ -22,9 +23,10 @@ export const OPERATION_MANUAL_CATEGORY = "__operation_manual__";
 // vẫn được tính là "video chạy máy" như bình thường — xem listMachineVideos.
 export const OPERATION_DEMO_CATEGORY = "__operation_demo__";
 
-function httpError(status: number, message: string) {
+function httpError(status: number, message: string, data?: unknown) {
   const err: any = new Error(message);
   err.statusCode = status;
+  if (data !== undefined) err.data = data;
   return err;
 }
 
@@ -100,33 +102,135 @@ export async function listMachineVideos(params: {
   return { items, total, page, pageSize };
 }
 
+/**
+ * ✅ Tra "tên máy người dùng gõ" -> máy chuẩn trong danh mục.
+ * GET /api/machine-videos/resolve-machine?q=... (FE dùng để gợi ý khi đang gõ)
+ */
+export async function resolveMachineForUpload(q: string) {
+  return resolveMachine(q);
+}
+
+// ============================================================
+// ✅ TÁCH BẠCH 2 LOẠI VIDEO — KHÔNG ĐƯỢC LẪN
+//   - Video chạy máy   = video THÔ  -> videos/raw/...       (AI được phép đọc để dựng nội dung)
+//   - Video hướng dẫn  = NGƯỜI DỰNG -> videos/huong-dan/... (AI KHÔNG BAO GIỜ đọc / sửa / dùng)
+// Tách ở 2 tầng: thư mục R2 riêng + cột category trong DB.
+// Mọi công cụ AI chỉ được lấy video qua AI_ELIGIBLE_WHERE / isAiEligible bên dưới,
+// và chỉ được quét prefix VIDEO_PREFIX_RAW.
+// ============================================================
+export const VIDEO_PREFIX_RAW = "videos/raw/";
+export const VIDEO_PREFIX_MANUAL = "videos/huong-dan/";
+
+/** Khu chứa video của máy mới chưa có trong danh mục Item */
+export const MACHINE_NEW_FOLDER = "_may-moi";
+
+export function isManual(category?: string | null) {
+  return category === OPERATION_MANUAL_CATEGORY;
+}
+
+/** Điều kiện Prisma: chỉ video thô, đã upload xong — dùng cho MỌI chỗ AI lấy video */
+export const AI_ELIGIBLE_WHERE: Prisma.MachineVideoWhereInput = {
+  status: "READY",
+  OR: [{ category: { not: OPERATION_MANUAL_CATEGORY } }, { category: null }],
+  r2Key: { startsWith: VIDEO_PREFIX_RAW },
+};
+
+/** Kiểm tra 2 lớp: đúng loại + đúng thư mục. Thiếu 1 trong 2 là AI không được đụng. */
+export function isAiEligible(v: { category?: string | null; r2Key: string; status?: string }) {
+  return !isManual(v.category) && v.r2Key.startsWith(VIDEO_PREFIX_RAW) && (v.status ?? "READY") === "READY";
+}
+
+/**
+ * Đặt đường dẫn R2 theo mã máy chuẩn:
+ *   video thô:      videos/raw/JL-1000/JL-1000_20261013_095012_a1b2.mp4
+ *   video hướng dẫn: videos/huong-dan/JL-1000/JL-1000_huong-dan_20261013_095012_a1b2.mp4
+ * - có giờ + 4 ký tự ngẫu nhiên -> nhiều video cùng máy không bao giờ trùng tên
+ * - không dấu, không khoảng trắng -> link không lỗi ở bất kỳ công cụ nào
+ */
+export function buildVideoKey(
+  sku: string | null,
+  category: string | null | undefined,
+  fileName: string,
+  mimeType: string,
+  at: Date = new Date(),
+  /** máy mới chưa có trong danh mục -> để trong khu riêng _may-moi/ cho dễ gắn mã sau */
+  newMachine = false
+) {
+  const { stamp } = vnStamp(at);
+  const rand = randomBytes(2).toString("hex");
+  const ext = fileExt(fileName, mimeType);
+  const manual = isManual(category);
+  const prefix = manual ? VIDEO_PREFIX_MANUAL : VIDEO_PREFIX_RAW;
+  const tag = manual ? "_huong-dan" : "";
+  const code = sku ? keySafe(sku) : "_chua-ro"; // chưa xác định máy -> gom 1 chỗ, vẫn đúng loại
+  const nice = sku ? code : "chua-ro";
+  const folder = sku && newMachine ? `${MACHINE_NEW_FOLDER}/${code}` : code;
+  return {
+    r2Key: `${prefix}${folder}/${nice}${tag}_${stamp}_${rand}.${ext}`,
+    niceName: `${nice}${tag}_${stamp}.${ext}`,
+  };
+}
+
 /** BƯỚC 1 của upload: tạo record + trả URL để FE PUT thẳng file lên R2 */
 export async function initMachineVideoUpload(
   input: {
-    title: string;
-    machineCode?: string | null;
+    title?: string;
+    machineCode?: string | null; // người dùng gõ tự do — server sẽ dò ra mã chuẩn
     category?: string | null;
     note?: string | null;
     fileName: string;
     mimeType: string;
     fileSize: number;
+    /** true = bắt buộc khớp máy trong danh mục, không khớp thì trả 422 + gợi ý (dùng cho trang upload điện thoại) */
+    strictMachine?: boolean;
+    /** true = người dùng xác nhận đây là MÁY MỚI chưa có trong danh mục -> vẫn cho upload */
+    newMachine?: boolean;
   },
   ctx: AuditCtx
 ) {
-  if (!input.title?.trim()) throw httpError(400, "Thiếu tên video");
   if (!input.fileName) throw httpError(400, "Thiếu tên file");
 
-  const safeName = input.fileName.replace(/[^\w.\-]+/g, "_");
-  const r2Key = `videos/${randomUUID()}/${safeName}`;
+  // Dò máy: ưu tiên ô mã máy, không có thì thử từ tên video
+  let { match, suggestions } = await resolveMachine(input.machineCode);
+  if (!match && input.title) {
+    const byTitle = await resolveMachine(input.title);
+    match = byTitle.match;
+    if (!suggestions.length) suggestions = byTitle.suggestions;
+  }
+
+  // Máy mới chưa có trong danh mục: lấy mã model trong tên nếu có, không thì dùng chính tên gõ
+  const typed = input.machineCode?.trim() || "";
+  const isNewMachine = !match && !!input.newMachine && typed.length >= 2;
+  const newCode = isNewMachine ? modelFromName(typed) || typed : null;
+
+  if (!match && !isNewMachine && input.strictMachine) {
+    throw httpError(
+      422,
+      "Không tìm thấy máy khớp với tên đã nhập. Chọn 1 máy trong gợi ý, hoặc bấm \"Dùng làm máy mới\".",
+      { suggestions }
+    );
+  }
+  if (!input.title?.trim() && !match && !isNewMachine) throw httpError(400, "Thiếu tên video");
+
+  const mimeType = input.mimeType || "application/octet-stream";
+  const { r2Key, niceName } = buildVideoKey(
+    match?.code ?? newCode,
+    input.category,
+    input.fileName,
+    mimeType,
+    new Date(),
+    isNewMachine
+  );
 
   const created = await prisma.machineVideo.create({
     data: {
-      title: input.title.trim(),
-      machineCode: input.machineCode?.trim() || null,
+      title: input.title?.trim() || match?.name || typed,
+      // Khớp được thì lưu MÃ CHUẨN, không lưu nguyên chữ người gõ
+      machineCode: match?.code ?? (typed || null), // máy mới: lưu đúng tên/mã đã gõ để sau gắn mã chuẩn
       category: input.category?.trim() || null,
       note: input.note?.trim() || null,
-      fileName: input.fileName,
-      mimeType: input.mimeType || "application/octet-stream",
+      fileName: niceName, // tên khi tải về cũng theo mã máy
+      mimeType,
       fileSize: input.fileSize || 0,
       r2Key,
       status: MachineVideoStatus.PENDING,
@@ -135,9 +239,15 @@ export async function initMachineVideoUpload(
     select: LIST_SELECT,
   });
 
-  const uploadUrl = await getUploadUrl(r2Key, input.mimeType || "application/octet-stream");
+  const uploadUrl = await getUploadUrl(r2Key, mimeType);
 
-  return { id: created.id, uploadUrl };
+  return {
+    id: created.id,
+    uploadUrl,
+    r2Key,
+    machine: match, // null nếu chưa xác định -> FE có thể hiện "chưa rõ máy" + suggestions
+    suggestions: match ? [] : suggestions,
+  };
 }
 
 /** BƯỚC 2 của upload: FE báo đã PUT xong lên R2 -> xác nhận & đổi trạng thái READY */
@@ -197,13 +307,54 @@ export async function updateMachineVideoMeta(
   const existing = await prisma.machineVideo.findUnique({ where: { id } });
   if (!existing) throw httpError(404, "Không tìm thấy video");
 
+  const nextCategory = input.category !== undefined ? input.category?.trim() || null : existing.category;
+  let nextMachineCode =
+    input.machineCode !== undefined ? input.machineCode?.trim() || null : existing.machineCode;
+
+  // Mã máy gõ tay -> đổi về mã chuẩn nếu khớp danh mục (chỉ khi người dùng có sửa ô mã máy)
+  const { match } = input.machineCode !== undefined ? await resolveMachine(nextMachineCode) : { match: null };
+  if (match) nextMachineCode = match.code;
+
+  // ✅ Chỉ áp dụng cho video MỚI (đã nằm trong videos/raw/ hoặc videos/huong-dan/):
+  // đổi loại video (thô <-> hướng dẫn) hoặc đổi máy -> chuyển file sang ĐÚNG thư mục,
+  // để video hướng dẫn không bao giờ nằm lẫn trong khu video thô mà AI được đọc.
+  // ⛔ Video CŨ (thư mục UUID, file có tên sẵn...) KHÔNG BAO GIỜ bị di chuyển.
+  const isNewLayout =
+    existing.r2Key.startsWith(VIDEO_PREFIX_RAW) || existing.r2Key.startsWith(VIDEO_PREFIX_MANUAL);
+  let moved: { r2Key: string; fileName: string } | null = null;
+  if (existing.status === "READY" && isNewLayout) {
+    const prefix = isManual(nextCategory) ? VIDEO_PREFIX_MANUAL : VIDEO_PREFIX_RAW;
+    const curPrefix = existing.r2Key.startsWith(VIDEO_PREFIX_RAW) ? VIDEO_PREFIX_RAW : VIDEO_PREFIX_MANUAL;
+    // Thư mục hiện tại: "JL-1000"  |  "_chua-ro"  |  "_may-moi/May-dong-goi-tu-dong"
+    const parts = existing.r2Key.slice(curPrefix.length).split("/");
+    const curIsNew = parts[0] === MACHINE_NEW_FOLDER;
+    const currentFolder = curIsNew ? `${parts[0]}/${parts[1]}` : parts[0];
+    // Có khớp máy trong danh mục -> về thư mục máy chuẩn (máy mới đã được thêm vào danh mục cũng đi đường này).
+    // Không đổi máy -> giữ nguyên thư mục máy hiện tại, chỉ đổi khu raw/huong-dan nếu đổi loại.
+    const folder = `${prefix}${match ? keySafe(match.code) : currentFolder}/`;
+    if (!existing.r2Key.startsWith(folder)) {
+      const keepCode = curIsNew ? parts[1] : currentFolder !== "_chua-ro" ? currentFolder : null;
+      const { r2Key, niceName } = buildVideoKey(
+        match?.code ?? keepCode,
+        nextCategory,
+        existing.fileName,
+        existing.mimeType,
+        existing.createdAt,
+        !match && curIsNew
+      );
+      await moveObject(existing.r2Key, r2Key, existing.mimeType);
+      moved = { r2Key, fileName: niceName };
+    }
+  }
+
   const updated = await prisma.machineVideo.update({
     where: { id },
     data: {
       ...(input.title !== undefined ? { title: input.title.trim() } : {}),
-      ...(input.machineCode !== undefined ? { machineCode: input.machineCode?.trim() || null } : {}),
-      ...(input.category !== undefined ? { category: input.category?.trim() || null } : {}),
+      ...(input.machineCode !== undefined || match ? { machineCode: nextMachineCode } : {}),
+      ...(input.category !== undefined ? { category: nextCategory } : {}),
       ...(input.note !== undefined ? { note: input.note?.trim() || null } : {}),
+      ...(moved ?? {}),
     },
     select: LIST_SELECT,
   });
