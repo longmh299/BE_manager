@@ -836,3 +836,59 @@ model MachineImage {
      @@index([createdById, createdAt])
      @@index([createdAt])
    }
+
+   model MktSourceJob {
+  id          String   @id @default(cuid())
+  videoId     String   @unique
+  r2Key       String
+  machineCode String?
+  status      String   @default("dang_xu_ly")
+  attempts    Int      @default(1)
+  clipCount   Int      @default(0)
+  note        String?
+  aiCost      Float    @default(0)
+  claimedAt   DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+}
+
+model MktClip {
+  id          String    @id @default(cuid())
+  jobId       String
+  videoId     String
+  machineCode String?
+  machineName String?
+  status      String    @default("cho_duyet")
+  clipKey     String
+  previewKey  String?
+  thumbKey    String?
+  durationSec Float     @default(0)
+  startSec    Float     @default(0)
+  endSec      Float     @default(0)
+  hook        String
+  captions    Json
+  channels    String[]  @default(["facebook", "tiktok", "youtube"])
+  scheduledAt DateTime?
+  postedAt    DateTime?
+  results     Json?
+  aiNote      String?
+  aiCost      Float     @default(0)
+  telegram    Json?
+  reviewedBy  String?
+  reviewedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, scheduledAt])
+  @@index([createdAt])
+  @@index([machineCode])
+}
+   /// Cài đặt MKT (bật/tắt chế độ tự động...) — key/value
+   model MktSetting {
+     key       String   @id
+     value     String
+     updatedBy String?
+     updatedAt DateTime @updatedAt
+   }

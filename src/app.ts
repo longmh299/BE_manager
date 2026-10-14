@@ -38,6 +38,7 @@ import machineVideosRoutes from './routes/machineVideos.routes';
 import publicMachineVideosRoutes from './routes/publicMachineVideos.routes'; // ✅ share link công khai, không auth
 import machineImagesRoutes from './routes/machineImages.routes';
 import translateRoutes from './routes/translate.routes'; // ✅ dịch tài liệu Trung/Anh -> Việt
+import mktRoutes from './routes/mkt.routes';
 import analyticsRoutes from './routes/analytics.routes'; // ✅ NEW: thống kê truy cập web (GA4)
 const app = express();
 
@@ -104,7 +105,7 @@ api.use('/partners', partnersRoutes);
 app.use("/api/assistant/alerts", assistantAlertsRoute);
 api.use("/invoices-status", invoiceStatusRoutes);
 api.use('/customers', customersRoutes);
-
+app.use('/api/mkt', mktRoutes);  
 // ✅ Reports: mount chung prefix /reports
 api.use('/reports', reportsRouter);
 api.use('/reports', stockInOutReportRoutes); // ✅ ADD (endpoint /api/reports/stock-inout)
