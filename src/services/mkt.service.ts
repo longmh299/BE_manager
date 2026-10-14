@@ -70,8 +70,10 @@ function httpError(status: number, message: string) {
 // ------------------------------------------------------------ TIẾT KIỆM NEON
 // Máy công ty hỏi /worker/ping vài phút 1 lần — trả lời từ BỘ NHỚ, KHÔNG đụng database, để Neon được ngủ
 // (Neon tính tiền theo giờ database thức; cứ < 5 phút hỏi DB 1 lần thì Neon thức 24/7).
-// Chỉ hỏi DB khi: có việc thật (video mới / bấm Cho AI làm / tới giờ đăng) hoặc 3 tiếng kiểm tra lại 1 lần.
-const HINT_REFRESH_MS = 3 * 3600 * 1000;
+// Chỉ hỏi DB khi: có việc thật (video mới / bấm Cho AI làm / tới giờ đăng) hoặc 12 tiếng kiểm tra lại 1 lần.
+// Mọi việc mới (upload xong, Cho AI làm, duyệt, đổi giờ...) đều báo thẳng vào bộ nhớ, nên chỉ cần soát lại DB rất thưa
+// để bắt trường hợp hiếm (vd máy công ty sập giữa chừng). Mặc định 12 tiếng, đổi bằng MKT_HINT_REFRESH_HOURS.
+const HINT_REFRESH_MS = (Number(process.env.MKT_HINT_REFRESH_HOURS) || 12) * 3600 * 1000;
 const hint = { checkedAt: 0, pending: true, nextDueAt: null as Date | null };
 /** Báo có việc mới cho máy công ty (video thô mới upload, Cho AI làm, Làm lại từ đầu) */
 export const mktPoke = () => {
