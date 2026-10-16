@@ -8,7 +8,7 @@ import { PrismaClient } from "@prisma/client";
 import { draftQuote, buildQuoteDocx, quoteFileName } from "../services/quote.service";
 import { createQuoteDocument } from "../services/Quotedocuments.service";
 import { patchDocxContact } from "../lib/docxContactPatch";
-import { translateDocument, translateBlocks, streamDocChat, Meter } from "../services/translate.service";
+import { translateDocument, translateBlocks, translateDocx, streamDocChat, Meter } from "../services/translate.service";
 import { createDoc, markUploaded, listDocs, getDoc, updateDoc, sourceUrls, deleteDoc } from "../services/translateHistory.service";
 
 const prisma = new PrismaClient();
@@ -46,7 +46,27 @@ r.post("/blocks", async (req, res, next) => {
 });
 
 /**
- * POST /api/translate/chat   (trả lời chạy dần từng chữ — text/plain stream)
+ * POST /api/translate/docx
+ * Body: { data: base64 (.docx), fileName?, context?, quality?: "fast" | "deep" }
+ * -> file .docx TIẾNG VIỆT giữ nguyên bố cục (hình ảnh, đánh số, bảng, header/footer...)
+ *    Header X-Translate-Usage: JSON { usage, stats } (URL-encoded) để FE hiện chi phí / cảnh báo câu sót.
+ */
+r.post("/docx", async (req, res, next) => {
+  try {
+    const out = await translateDocx(req.body ?? {});
+    const base = String(req.body?.fileName || "tai-lieu").replace(/\.docx?$/i, "");
+    res.setHeader("Content-Type", DOCX_MIME);
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(`${base} (VI).docx`)}`);
+    res.setHeader("X-Translate-Usage", encodeURIComponent(JSON.stringify({ usage: out.usage, stats: out.stats })));
+    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, X-Translate-Usage");
+    res.send(out.buffer);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/translate/chat  (trả lời chạy dần từng chữ — text/plain stream)
  * Body: { doc: string, docName?, messages: [{ role: "user"|"assistant", content, image?: { data, mediaType } }] }
  */
 r.post("/chat", async (req, res, next) => {

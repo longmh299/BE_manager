@@ -17,6 +17,8 @@
 //   2. Sau khi dịch, tự quét đoạn nào bản dịch vẫn y nguyên chữ gốc -> gửi dịch lại 1 lần
 //   3. Vẫn còn sót -> đánh dấu `untranslated: true` để FE hiện cảnh báo, không giấu đi
 
+import { loadDocx, saveDocx, hasWords } from "../lib/docxTranslate";
+
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 
 // ---------------------------------------------------------------- ĐO CHI PHÍ THẬT
@@ -447,6 +449,78 @@ ${JSON.stringify(payload)}`,
     ),
     usage: meter.summary(),
   };
+}
+
+// ---------------------------------------------------------------- Word -> file Word tiếng Việt (giữ bố cục)
+const DOCX_BATCH_CHARS = Number(process.env.DOCX_BATCH_CHARS || 5000);
+const DOCX_BATCH_ITEMS = 60;
+const DOCX_CONCURRENCY = Number(process.env.DOCX_CONCURRENCY || 4);
+const DOCX_MAX_CHARS = Number(process.env.DOCX_MAX_CHARS || 600_000); // ~250-300 trang
+
+/**
+ * Nhận file .docx (base64) -> trả file .docx tiếng Việt: CHỈ thay chữ, giữ nguyên hình ảnh,
+ * đánh số, bảng, text box, header/footer, định dạng. Xem src/lib/docxTranslate.ts.
+ */
+export async function translateDocx(
+  input: { data: string; context?: string; quality?: Quality },
+  meter = new Meter()
+): Promise<{ buffer: Buffer; stats: { segments: number; translated: number; untranslated: number }; usage: ReturnType<Meter["summary"]> }> {
+  if (!input?.data) throw httpError(400, "Thiếu dữ liệu file");
+  if (input.data.length > 30 * 1024 * 1024) throw httpError(413, "File quá lớn (tối đa ~22MB)", "TOO_LARGE");
+
+  const doc = await loadDocx(Buffer.from(input.data, "base64"));
+
+  const texts = Array.from(new Set(doc.segments.map((s) => s.text.trim()).filter(hasWords)));
+  const total = texts.reduce((n, t) => n + t.length, 0);
+  if (total > DOCX_MAX_CHARS) {
+    throw httpError(413, `Tài liệu quá dài (${total.toLocaleString("vi-VN")} ký tự), hãy tách file nhỏ hơn.`, "TOO_LARGE");
+  }
+
+  // Gom lô theo số ký tự / số câu
+  const batches: string[][] = [];
+  let cur: string[] = [];
+  let len = 0;
+  for (const t of texts) {
+    if (cur.length && (len + t.length > DOCX_BATCH_CHARS || cur.length >= DOCX_BATCH_ITEMS)) {
+      batches.push(cur);
+      cur = [];
+      len = 0;
+    }
+    cur.push(t);
+    len += t.length;
+  }
+  if (cur.length) batches.push(cur);
+
+  const dict = new Map<string, string>();
+  let untranslated = 0;
+  const run = async (batch: string[]): Promise<void> => {
+    try {
+      const out = await translateBlocks({ items: batch.map((text) => ({ text })), context: input.context, mode: "doc", quality: input.quality }, meter);
+      out.items.forEach((it, i) => {
+        if (it.vi != null) dict.set(batch[i], it.vi);
+        if (it.untranslated) untranslated++;
+      });
+    } catch (e: any) {
+      // Lô quá dài cho 1 lần trả lời -> chia đôi rồi dịch lại
+      if ((e?.data?.code === "TOO_LONG" || e?.data?.code === "TOO_LARGE") && batch.length > 1) {
+        const mid = Math.ceil(batch.length / 2);
+        await run(batch.slice(0, mid));
+        await run(batch.slice(mid));
+        return;
+      }
+      throw e;
+    }
+  };
+
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(DOCX_CONCURRENCY, batches.length) }, async () => {
+      while (next < batches.length) await run(batches[next++]);
+    })
+  );
+
+  const buffer = await saveDocx(doc, (src) => dict.get(src));
+  return { buffer, stats: { segments: texts.length, translated: dict.size, untranslated }, usage: meter.summary() };
 }
 
 // ---------------------------------------------------------------- Hỏi đáp AI về tài liệu (stream)
