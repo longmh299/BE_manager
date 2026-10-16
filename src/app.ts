@@ -12,6 +12,7 @@ import stockCountRoutes from './routes/stockcounts.routes';
 import stockRoutes from './routes/stocks.routes';
 import assetRoutes from './routes/assets.routes';
 import invoiceRoutes from './routes/invoices.routes';
+import invoiceImportRoutes from './routes/invoiceImport.routes'; // ✅ MỚI: nhập hoá đơn từ file XML / Excel
 import invoiceTraceRoutes from './routes/Invoicetrace.routes'; // ✅ ADD: truy xuất hoá đơn theo mã sản phẩm
 import stockImportRoutes from './routes/stocks_import.routes';
 import partnersRoutes from './routes/partners.routes';
@@ -38,7 +39,8 @@ import machineVideosRoutes from './routes/machineVideos.routes';
 import publicMachineVideosRoutes from './routes/publicMachineVideos.routes'; // ✅ share link công khai, không auth
 import machineImagesRoutes from './routes/machineImages.routes';
 import translateRoutes from './routes/translate.routes'; // ✅ dịch tài liệu Trung/Anh -> Việt
-import mktRoutes from './routes/mkt.routes';
+import mktRoutes from './routes/mkt.routes'; // ✅ MKT tự động: video thô -> clip + bài viết -> duyệt -> đăng
+import { mktPoke } from './services/mkt.service';
 import analyticsRoutes from './routes/analytics.routes'; // ✅ NEW: thống kê truy cập web (GA4)
 const app = express();
 
@@ -73,6 +75,14 @@ app.use(
 app.use(helmet());
 // ✅ Dịch tài liệu gửi file lớn (PDF/ảnh base64) -> body parser riêng 32MB, gắn TRƯỚC express.json() mặc định 100KB
 app.use('/api/translate', translateRoutes);
+app.use('/api/mkt', mktRoutes); // có webhook Telegram + API máy công ty (tự kiểm tra khoá riêng)
+// Video thô upload xong -> báo máy công ty có việc (để máy công ty không phải hỏi database liên tục, Neon được ngủ)
+app.post('/api/machine-videos/:id/complete', (_req, res, next) => {
+  res.on('finish', () => {
+    if (res.statusCode < 300) mktPoke();
+  });
+  next();
+});
 app.use(express.json());
 app.use(morgan('dev'));
 
@@ -99,13 +109,14 @@ api.use('/stock-counts', stockCountRoutes);
 api.use('/stocks', stockRoutes);
 api.use('/assets', assetRoutes);
 api.use('/invoices', invoiceRoutes);
+api.use('/invoice-import', invoiceImportRoutes); // ✅ MỚI: nhập hoá đơn từ file (analyze / confirm / template)
 api.use('/invoice-trace', invoiceTraceRoutes); // ✅ ADD: GET /api/invoice-trace?code=&type=PURCHASE|SALES
 api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
 app.use("/api/assistant/alerts", assistantAlertsRoute);
 api.use("/invoices-status", invoiceStatusRoutes);
 api.use('/customers', customersRoutes);
-app.use('/api/mkt', mktRoutes);  
+
 // ✅ Reports: mount chung prefix /reports
 api.use('/reports', reportsRouter);
 api.use('/reports', stockInOutReportRoutes); // ✅ ADD (endpoint /api/reports/stock-inout)

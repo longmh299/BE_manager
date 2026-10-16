@@ -892,3 +892,36 @@ model MktClip {
      updatedBy String?
      updatedAt DateTime @updatedAt
    }
+   // =====================================================================
+// ✅ MỚI (nhập hoá đơn từ file) — chỉ THÊM bảng, không sửa bảng cũ
+// =====================================================================
+// Ghi nhớ: "dòng này trong file" = "mã hàng này" (kế toán/admin đã xác nhận) -> lần sau tự khớp
+model ItemAlias {
+  id          String   @id @default(cuid())
+  supplierKey String   @default("") // partnerId NCC; "" = dùng chung mọi NCC
+  rawKey      String // mã|tên trong file đã chuẩn hoá (không dấu, thường)
+  rawText     String // nguyên văn để xem lại
+  itemId      String // Item.id (không đặt khoá ngoại để không đụng bảng Item; hàng bị xoá thì bỏ qua)
+  hits        Int      @default(1)
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([supplierKey, rawKey])
+  @@index([itemId])
+}
+
+// Nhật ký file đã nhập -> chống nhập trùng 1 file / 1 hoá đơn điện tử 2 lần
+model InvoiceImportLog {
+  id          String   @id @default(cuid())
+  fileHash    String
+  invoiceKey  String   @default("") // HĐĐT: ký hiệu + số + MST người bán
+  fileName    String
+  type        String
+  invoiceId   String?
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  @@index([fileHash])
+  @@index([invoiceKey])
+}
