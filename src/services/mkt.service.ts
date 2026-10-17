@@ -58,6 +58,62 @@ export async function setAutoMode(on: boolean, by: string) {
   else hint.checkedAt = 0; // tắt -> lần hỏi tới tính lại có việc hay không
   return { auto: on };
 }
+// ✅ MỚI: GIỌNG ĐỌC AI (tuỳ chọn) — admin gạt trên trang Hàng chờ MKT; từng video có thể chọn riêng khi "Cho AI làm" / "Làm lại"
+export type VoiceStyle = "nu-bac" | "nam-bac" | "nu-nam" | "nam-nam";
+export type VoiceSetting = { enabled: boolean; provider: "google" | "fpt"; style: VoiceStyle };
+const VOICE_STYLES: VoiceStyle[] = ["nu-bac", "nam-bac", "nu-nam", "nam-nam"];
+let voiceSetting: VoiceSetting | null = null;
+async function getVoice(): Promise<VoiceSetting> {
+  if (voiceSetting) return voiceSetting;
+  const row = await prisma.mktSetting.findUnique({ where: { key: "voice" } }).catch(() => null);
+  let v: any = {};
+  try {
+    v = row ? JSON.parse(row.value) : {};
+  } catch {
+    v = {};
+  }
+  voiceSetting = {
+    enabled: !!v.enabled,
+    provider: v.provider === "fpt" ? "fpt" : v.provider === "google" ? "google" : process.env.MKT_VOICE_PROVIDER === "fpt" ? "fpt" : "google",
+    style: VOICE_STYLES.includes(v.style) ? v.style : "nu-bac",
+  };
+  return voiceSetting;
+}
+export async function setVoice(body: any, by: string) {
+  const cur = await getVoice();
+  const next: VoiceSetting = {
+    enabled: body?.enabled !== undefined ? !!body.enabled : cur.enabled,
+    provider: body?.provider === "fpt" ? "fpt" : body?.provider === "google" ? "google" : cur.provider,
+    style: VOICE_STYLES.includes(body?.style) ? body.style : cur.style,
+  };
+  await prisma.mktSetting.upsert({ where: { key: "voice" }, create: { key: "voice", value: JSON.stringify(next), updatedBy: by }, update: { value: JSON.stringify(next), updatedBy: by } });
+  voiceSetting = next;
+  return { voice: next };
+}
+/** Chọn riêng cho 1 video: "co" | "khong" | "mac-dinh" (theo cài đặt chung) */
+async function setVideoVoice(videoId: string, choice: any, style?: any) {
+  const key = `voice:${videoId}`;
+  if (choice !== "co" && choice !== "khong") {
+    await prisma.mktSetting.delete({ where: { key } }).catch(() => undefined);
+    return;
+  }
+  const value = JSON.stringify({ enabled: choice === "co", ...(VOICE_STYLES.includes(style) ? { style } : {}) });
+  await prisma.mktSetting.upsert({ where: { key }, create: { key, value }, update: { value } });
+}
+async function voiceFor(videoId: string): Promise<VoiceSetting> {
+  const base = await getVoice();
+  const row = await prisma.mktSetting.findUnique({ where: { key: `voice:${videoId}` } }).catch(() => null);
+  if (!row) return base;
+  try {
+    const o = JSON.parse(row.value);
+    return { ...base, enabled: !!o.enabled, ...(VOICE_STYLES.includes(o.style) ? { style: o.style } : {}) };
+  } catch {
+    return base;
+  }
+}
+const CLIP_MIN_SEC = () => Math.max(15, Number(process.env.MKT_CLIP_MIN_SEC) || 30);
+const CLIP_MAX_SEC = () => Math.max(CLIP_MIN_SEC() + 5, Number(process.env.MKT_CLIP_MAX_SEC) || 45);
+
 const STALE_CLAIM_MS = 3 * 3600 * 1000; // máy công ty nhận việc mà 3 tiếng không báo -> cho nhận lại
 const STALE_POST_MS = 2 * 3600 * 1000;
 
@@ -150,11 +206,102 @@ export async function nextSlot(excludeId?: string): Promise<Date> {
   throw httpError(500, "Không tìm được khung giờ trống");
 }
 
+// ------------------------------------------------------------ ✅ MỚI: thông tin máy lấy từ WEB SALE (mcbrother.com.vn)
+// Dùng API công khai của web: /api/products?q=<mã>. KHÔNG cần quyền vào database web, không sửa gì bên web.
+const WEB_URL = () => (process.env.MKT_WEB_URL || "https://mcbrother.com.vn").replace(/\/+$/, "");
+const normKey = (s: any) =>
+  String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/[^a-z0-9]/g, "");
+const stripHtml = (s: any) =>
+  String(s || "")
+    .replace(/<(br|\/p|\/li|\/h\d)[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n")
+    .trim();
+const absUrl = (u: any) => (!u ? null : /^https?:\/\//i.test(u) ? String(u) : `${WEB_URL()}${String(u).startsWith("/") ? "" : "/"}${u}`);
+
+async function webSearch(q: string): Promise<any[]> {
+  try {
+    const res = await fetch(`${WEB_URL()}/api/products?q=${encodeURIComponent(q)}&size=20`, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const j: any = await res.json();
+    return Array.isArray(j?.items) ? j.items : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Tìm sản phẩm trên web: trùng MÃ (sku) trước; không có mã thì chỉ nhận khi TRÙNG TÊN (không đoán gần đúng) */
+async function webProduct(code: string | null, name: string | null) {
+  if (code) {
+    const hit = (await webSearch(code)).find((p) => p?.sku && normKey(p.sku) === normKey(code));
+    if (hit) return hit;
+  }
+  // tên file kiểu "Máy chào (New)_20261013_101500.mp4" -> "Máy chào"
+  const clean = String(name || "")
+    .replace(/\.[a-z0-9]{2,4}$/i, "")
+    .replace(/_+/g, " ")
+    .replace(/\b\d{8}\s?\d{6}\b/g, "")
+    .replace(/\((new|mới|moi)\)/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (clean.length >= 6) {
+    const hit = (await webSearch(clean.slice(0, 60))).find((p) => normKey(p?.name) === normKey(clean));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function webSpecs(p: any) {
+  const out: { ten: string; giaTri: string }[] = [];
+  const t = p?.specTable;
+  if (t && Array.isArray(t.rows)) {
+    const cols: string[] = Array.isArray(t.columns) ? t.columns : [];
+    for (const r of t.rows) {
+      const vals: string[] = (r?.values || []).map((v: any) => String(v ?? "").trim());
+      if (!r?.label || !vals.some(Boolean)) continue;
+      out.push({ ten: String(r.label), giaTri: vals.length > 1 && cols.length === vals.length ? vals.map((v, i) => `${cols[i]}: ${v}`).join("; ") : vals.join(" / ") });
+    }
+  }
+  const extra: [string, string][] = [
+    ["Công suất", p?.power],
+    ["Điện áp", p?.voltage],
+    ["Trọng lượng", p?.weight],
+    ["Kích thước", p?.dimensions],
+    ["Vật liệu", p?.material],
+    ["Bảo hành", p?.warranty],
+  ];
+  for (const [k, v] of extra) if (v && !out.some((o) => normKey(o.ten) === normKey(k))) out.push({ ten: k, giaTri: String(v) });
+  return out.slice(0, 20);
+}
+
+/** "Máy chiết rót đặc 1 vòi (New)_20261017_135300.mp4" -> "Máy chiết rót đặc 1 vòi" */
+const cleanTitle = (t: any) =>
+  String(t || "")
+    .replace(/\.[a-z0-9]{2,4}$/i, "")
+    .replace(/_+/g, " ")
+    .replace(/\b\d{8}\s?\d{6}\b/g, "")
+    .replace(/\((new|mới|moi)\)/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim() || null;
+
 // ------------------------------------------------------------ thông tin máy cho AI viết bài
 async function machineInfo(code: string | null, title: string) {
-  const m = await resolveMachine(code || title).catch(() => ({ match: null }));
-  const match = (m as any).match as { id: string; sku: string; name: string; code: string } | null;
-  const finalCode = match?.code || code || null;
+  // ✅ SỬA: chỉ tin danh mục CRM khi khớp đúng MÃ MODEL thật (có chữ số, vd DZ-400, SSDZD-66).
+  //    Mã kiểu tên thư mục "may-chiet" / "_may-moi" không phải model -> KHÔNG đoán theo tên gần giống
+  //    (trước đây "may-chiet" bị khớp nhầm sang "Máy chiết và đóng viên nang"). Tên máy lấy theo tên đặt khi upload.
+  const realCode = code && /\d/.test(code) && !code.startsWith("_") ? code : null;
+  const m = realCode ? await resolveMachine(realCode).catch(() => ({ match: null })) : { match: null };
+  const cand = (m as any).match as { id: string; sku: string; name: string; code: string } | null;
+  const match = cand && [cand.code, cand.sku].some((c) => normKey(c) === normKey(realCode)) ? cand : null;
+  const finalCode = match?.code || realCode || null;
   const item = match ? await prisma.item.findUnique({ where: { id: match.id }, select: { note: true } }) : null;
   // Thông số / đặc điểm đã có trong nháp báo giá của tài liệu dịch (nếu có) -> AI viết đúng số liệu, không bịa
   let quote: any = null;
@@ -169,13 +316,24 @@ async function machineInfo(code: string | null, title: string) {
     });
     quote = (doc?.quoteDraft as any)?.q ?? null;
   }
+  // ✅ ưu tiên dữ liệu trên web sale (tên chuẩn, điểm nổi bật, thông số, link, ảnh); thiếu thì dùng dữ liệu CRM như cũ
+  const web = await webProduct(finalCode, title || match?.name || null).catch(() => null);
+  const webFeatures = web
+    ? [...(Array.isArray(web.highlights) ? web.highlights : []), ...String(web.functions || "").split(/\n+/)].map((x: any) => stripHtml(x)).filter(Boolean)
+    : [];
   return {
-    code: finalCode,
-    name: match?.name || title || null,
+    code: web?.sku || finalCode,
+    // tên: web (khớp đúng mã / đúng tên) > tên người dùng đặt khi upload > tên trong danh mục CRM
+    name: web?.name || cleanTitle(title) || match?.name || null,
     note: item?.note || null,
+    short: web ? stripHtml(web.short || "").slice(0, 400) || null : null,
+    description: web ? stripHtml(web.description || "").slice(0, 1200) || null : null,
+    url: web?.slug ? `${WEB_URL()}/san-pham/${web.slug}` : null,
+    images: web ? [web.coverImage, ...(web.images || []).map((i: any) => i?.url)].map(absUrl).filter(Boolean).slice(0, 3) : [],
     process: quote?.quyTrinh || null,
-    features: Array.isArray(quote?.dacDiem) ? quote.dacDiem.slice(0, 10) : [],
-    specs: Array.isArray(quote?.thongSo) ? quote.thongSo.slice(0, 15) : [],
+    features: webFeatures.length ? webFeatures.slice(0, 10) : Array.isArray(quote?.dacDiem) ? quote.dacDiem.slice(0, 10) : [],
+    specs: web && webSpecs(web).length ? webSpecs(web) : Array.isArray(quote?.thongSo) ? quote.thongSo.slice(0, 15) : [],
+    source: web ? "web" : "crm",
   };
 }
 
@@ -239,6 +397,8 @@ export async function claimSource() {
     },
     downloadUrl: await getDownloadUrl(video.r2Key, video.fileName, 6 * 3600),
     machine: await machineInfo(video.machineCode, video.title),
+    // ✅ MỚI: cài đặt dựng (máy công ty bản cũ bỏ qua trường này, không lỗi)
+    settings: { voice: await voiceFor(video.id), minSec: CLIP_MIN_SEC(), maxSec: CLIP_MAX_SEC() },
   };
 }
 
@@ -433,7 +593,7 @@ export async function summary() {
   const jobs = await prisma.mktSourceJob.findMany({ where: { videoId: { in: vids.map((v) => v.id) } } });
   const byVideo = new Map(jobs.map((j) => [j.videoId, j]));
   const waiting = vids.filter((v) => byVideo.get(v.id)?.status !== "dang_xu_ly" && isPending(byVideo.get(v.id))).length;
-  return { counts, processing, waitingVideos: waiting, totalRaw: vids.length, auto: AUTO(), workerSeenAt, telegram: telegramReady() };
+  return { counts, processing, waitingVideos: waiting, totalRaw: vids.length, auto: AUTO(), voice: await getVoice(), clipSec: { min: CLIP_MIN_SEC(), max: CLIP_MAX_SEC() }, workerSeenAt, telegram: telegramReady() };
 }
 
 export async function getClip(id: string) {
@@ -564,8 +724,9 @@ export async function listSources(q?: string) {
 }
 
 /** "Cho AI làm": đưa video thô lên đầu hàng chờ (kể cả khi đã tắt tự động) */
-export async function queueSources(videoIds: string[]) {
+export async function queueSources(videoIds: string[], voice?: any, voiceStyle?: any) {
   const ids = (Array.isArray(videoIds) ? videoIds : []).map(String).slice(0, 50);
+  if (voice !== undefined) for (const id of ids) await setVideoVoice(id, voice, voiceStyle); // ✅ giọng đọc riêng cho lần làm này
   let queued = 0;
   for (const id of ids) {
     const v = await prisma.machineVideo.findUnique({ where: { id } });
@@ -594,7 +755,8 @@ export async function retrySource(videoId: string) {
  * rồi đưa video về hàng chờ để máy công ty dựng lại. Clip đã đăng / đang đăng giữ nguyên làm lịch sử.
  * Video thô gốc trên R2 KHÔNG bị đụng tới.
  */
-export async function resetSource(videoId: string) {
+export async function resetSource(videoId: string, voice?: any, voiceStyle?: any) {
+  if (voice !== undefined) await setVideoVoice(videoId, voice, voiceStyle); // ✅ giọng đọc riêng cho lần làm lại này
   const v = await prisma.machineVideo.findUnique({ where: { id: videoId } });
   if (!v || !isAiEligible(v)) throw httpError(400, "Video này không phải video thô AI được dùng");
   const job = await prisma.mktSourceJob.findUnique({ where: { videoId } });

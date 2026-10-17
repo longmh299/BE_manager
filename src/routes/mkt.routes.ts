@@ -32,6 +32,7 @@ import {
   sendReview,
   ping,
   setAutoMode,
+  setVoice,
 } from "../services/mkt.service";
 
 const r = Router();
@@ -92,10 +93,12 @@ r.delete("/clips/:id", run((req) => deleteClip(pid(req))));
 r.get("/next-slot", run(async () => ({ at: await nextSlot() })));
 /** Admin: bật / tắt chế độ TỰ ĐỘNG (tắt = bán tự động: chỉ làm video được bấm "Cho AI làm") */
 r.post("/settings/auto", requireRole("admin"), run((req) => setAutoMode(!!req.body?.auto, who(req))));
+/** ✅ MỚI — Admin: giọng đọc AI cho clip { enabled, provider: google|fpt, style: nu-bac|nam-bac|nu-nam|nam-nam } */
+r.post("/settings/voice", requireRole("admin"), run((req) => setVoice(req.body ?? {}, who(req))));
 r.get("/sources", run((req) => listSources(String(req.query.q || ""))));
-r.post("/sources/queue", run((req) => queueSources(req.body?.videoIds)));
+r.post("/sources/queue", run((req) => queueSources(req.body?.videoIds, req.body?.voice, req.body?.voiceStyle)));
 r.post("/sources/:id/retry", run((req) => retrySource(pid(req))));
-r.post("/sources/:id/reset", run((req) => resetSource(pid(req))));
+r.post("/sources/:id/reset", run((req) => resetSource(pid(req), req.body?.voice, req.body?.voiceStyle)));
 
 /** Admin: nối bot Telegram vào server (chạy 1 lần sau khi đặt biến môi trường) */
 r.post(
