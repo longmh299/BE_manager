@@ -11,8 +11,10 @@
 //      các run còn lại của khúc để trống.
 // Đánh số tự động của Word nằm trong <w:numPr> (không phải chữ) nên luôn giữ nguyên.
 // Ảnh nằm trong <w:drawing>/<w:pict> và word/media/* -> không bị sửa.
+// Ảnh đã crop trong Word được cắt hẳn (docxCropImages.ts) để app điện thoại hiển thị đúng.
 // Giới hạn: chữ nằm TRONG ảnh (ảnh chụp/scan), biểu đồ (charts) và SmartArt không được dịch.
 import JSZip from "jszip";
+import { bakeImageCrops } from "./docxCropImages";
 
 /** Các phần XML có chữ cần dịch */
 export const DOCX_TEXT_PARTS = /^word\/(document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml$/;
@@ -138,6 +140,13 @@ export async function saveDocx(
   for (const [name, xml] of doc.xmls) {
     const segs = doc.segments.filter((s) => s.file === name);
     doc.zip.file(name, applySegments(xml, segs, tr));
+  }
+  // Cắt hẳn ảnh đã crop -> mở trên điện thoại cũng đúng như trên máy tính (lỗi thì giữ nguyên ảnh)
+  try {
+    const n = await bakeImageCrops(doc.zip);
+    if (n) console.log(`[DOCX] đã cắt hẳn ${n} ảnh crop`);
+  } catch (e) {
+    console.warn("[DOCX] bỏ qua bước cắt ảnh:", (e as Error)?.message);
   }
   return doc.zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }

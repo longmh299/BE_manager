@@ -18,6 +18,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1101.0",
     "@aws-sdk/s3-request-presigner": "^3.1101.0",
+    "@google-analytics/data": "^7.0.0",
     "@prisma/client": "^6.19.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
@@ -26,12 +27,12 @@
     "express": "^5.2.1",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "jszip": "^3.10.1",
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
     "nodemailer": "^9.0.3",
-    "xlsx": "^0.18.5",
-    "jszip": "^3.10.1",
-    "@google-analytics/data": "^7.0.0"
+    "sharp": "^0.35.5",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/bcrypt": "^6.0.0",
