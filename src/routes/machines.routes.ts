@@ -1,7 +1,7 @@
 // src/routes/machines.routes.ts
 import { Router } from "express";
 import { PrismaClient, ItemKind, Prisma } from "@prisma/client";
-import { requireAuth } from "../middlewares/auth";
+import { requireAuth, requireRole, getUser } from "../middlewares/auth";
 
 const prisma = new PrismaClient();
 const r = Router();
@@ -222,7 +222,7 @@ r.put("/:id", async (req, res, next) => {
 // ----------------------------------------------------
 // DELETE /api/machines/:id
 // ----------------------------------------------------
-r.delete("/:id", async (req, res, next) => {
+r.delete("/:id", requireRole("admin"), async (req, res, next) => { // ✅ bảo mật: chỉ admin xoá máy
   try {
     const id = String(req.params.id);
     await prisma.machine.delete({ where: { id } });

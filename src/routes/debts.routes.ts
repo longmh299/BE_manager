@@ -1,6 +1,6 @@
 // src/routes/debts.routes.ts
 import { Router } from "express";
-import { requireAuth } from "../middlewares/auth";
+import { requireAuth, requireRole, getUser } from "../middlewares/auth";
 import {
   getDebtsBySale,
   getDebtsSummaryBySale,
@@ -11,6 +11,7 @@ import ExcelJS from "exceljs";
 const r = Router();
 
 r.use(requireAuth);
+r.use(requireRole("admin", "accountant")); // ✅ bảo mật: công nợ / phải thu toàn công ty chỉ admin + kế toán (menu cũng chỉ 2 quyền này thấy)
 
 function getUserId(req: any): string | undefined {
   return req.user?.id || req.userId;

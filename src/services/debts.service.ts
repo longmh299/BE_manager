@@ -130,7 +130,7 @@ export async function getDebtsBySale(params: DebtsBySaleParams) {
   const invoices = await prisma.invoice.findMany({
     where: whereInvoice,
     orderBy: { issueDate: "asc" },
-    include: { partner: true, saleUser: true, lines: true },
+    include: { partner: true, saleUser: { select: { id: true, username: true, role: true, email: true, phone: true } }, lines: true },
   });
 
   const rows: any[] = [];
@@ -256,7 +256,7 @@ export async function getDebtsSummaryBySale(params: DebtsSummaryBySaleParams) {
 
   const invoices = await prisma.invoice.findMany({
     where: whereInvoice,
-    include: { saleUser: true, lines: true },
+    include: { saleUser: { select: { id: true, username: true, role: true, email: true, phone: true } }, lines: true },
   });
 
   const map: Record<

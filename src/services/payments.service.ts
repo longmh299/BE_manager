@@ -800,7 +800,7 @@ export async function createPaymentWithAllocations(input: CreatePaymentInput, au
     include: {
       partner: true,
       account: true,
-      createdBy: true,
+      createdBy: { select: { id: true, username: true, role: true, email: true, phone: true } },
       allocations: {
         include: {
           invoice: {
@@ -817,6 +817,7 @@ export async function createPaymentWithAllocations(input: CreatePaymentInput, au
               warrantyDueDate: true,
               refInvoiceId: true,
               status: true,
+              saleUserId: true, // ✅ bảo mật: để lọc phiếu thu theo sale phụ trách
             },
           },
         },
@@ -857,7 +858,7 @@ export async function listPayments(params: ListPaymentsParams) {
     include: {
       partner: true,
       account: true,
-      createdBy: true,
+      createdBy: { select: { id: true, username: true, role: true, email: true, phone: true } },
       allocations: {
         include: {
           invoice: {
@@ -874,6 +875,7 @@ export async function listPayments(params: ListPaymentsParams) {
               warrantyDueDate: true,
               refInvoiceId: true,
               status: true,
+              saleUserId: true, // ✅ bảo mật: để lọc phiếu thu theo sale phụ trách
             },
           },
         },
@@ -888,7 +890,7 @@ export async function getPaymentById(id: string) {
     include: {
       partner: true,
       account: true,
-      createdBy: true,
+      createdBy: { select: { id: true, username: true, role: true, email: true, phone: true } },
       allocations: {
         include: {
           invoice: {
@@ -905,6 +907,7 @@ export async function getPaymentById(id: string) {
               warrantyDueDate: true,
               refInvoiceId: true,
               status: true,
+              saleUserId: true, // ✅ bảo mật: để lọc phiếu thu theo sale phụ trách
             },
           },
         },

@@ -1034,9 +1034,9 @@ async function getInvoiceByIdTx(tx: Prisma.TransactionClient | PrismaClient, id:
     where: { id },
     include: {
       partner: true,
-      saleUser: true,
-      techUser: true,
-      approvedBy: true,
+      saleUser: { select: { id: true, username: true, role: true, email: true, phone: true } },
+      techUser: { select: { id: true, username: true, role: true, email: true, phone: true } },
+      approvedBy: { select: { id: true, username: true, role: true, email: true, phone: true } },
       receiveAccount: true,
       lines: { include: { item: true } },
       movements: { include: { lines: true } },
@@ -1046,7 +1046,7 @@ async function getInvoiceByIdTx(tx: Prisma.TransactionClient | PrismaClient, id:
           payment: {
             include: {
               account: true,
-              createdBy: true,
+              createdBy: { select: { id: true, username: true, role: true, email: true, phone: true } },
               partner: true,
             },
           },
@@ -1530,9 +1530,9 @@ export async function listInvoices(
       orderBy: { issueDate: "desc" },
       include: {
         partner: true,
-        saleUser: true,
-        techUser: true,
-        approvedBy: true,
+        saleUser: { select: { id: true, username: true, role: true, email: true, phone: true } },
+        techUser: { select: { id: true, username: true, role: true, email: true, phone: true } },
+        approvedBy: { select: { id: true, username: true, role: true, email: true, phone: true } },
         receiveAccount: true,
         lines: { include: { item: true } },
         movements: true,

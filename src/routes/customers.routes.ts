@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth } from "../middlewares/auth";
+import { requireAuth, getUser } from "../middlewares/auth";
 import {
   getCustomers,
   getCustomerDetail,
@@ -13,6 +13,23 @@ const r = Router();
 
 r.use(requireAuth);
 
+// ✅ bảo mật: nhân viên sale chỉ xem / sửa khách của MÌNH (khách có hoá đơn bán do mình phụ trách).
+// Trước đây thêm ?onlyMine=false hoặc gọi thẳng /customers/<id> là xem & sửa được khách của sale khác.
+const isStaffReq = (req: any) => String(getUser(req)?.role || "") === "staff";
+async function staffOwnsCustomer(userId: string, partnerId: string) {
+  const inv = await prisma.invoice.findFirst({ where: { partnerId, saleUserId: userId, type: "SALES" }, select: { id: true } });
+  return !!inv;
+}
+r.use("/:id", async (req: any, res, next) => {
+  try {
+    if (!isStaffReq(req)) return next();
+    if (await staffOwnsCustomer(String(getUser(req)!.id), String(req.params.id))) return next();
+    return res.status(403).json({ ok: false, message: "Khách hàng này không thuộc bạn phụ trách." });
+  } catch (e) {
+    next(e);
+  }
+});
+
 /**
  * ===============================
  * GET /api/customers (LIST)
@@ -22,7 +39,7 @@ r.get("/", async (req: any, res, next) => {
   try {
     const userId = req.user?.id;
 
-    const onlyMine = req.query.onlyMine !== "false";
+    const onlyMine = isStaffReq(req) ? true : req.query.onlyMine !== "false"; // ✅ staff luôn chỉ thấy khách của mình
     const page = Number(req.query.page) || 1;
     const pageSize = Number(req.query.pageSize) || 20;
 

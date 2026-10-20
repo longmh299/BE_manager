@@ -1,13 +1,14 @@
 // src/routes/stockInOutReport.routes.ts
 import { Router } from "express";
-import { requireAuth } from "../middlewares/auth";
+import { requireAuth, requireRole } from "../middlewares/auth";
 import { getStockInOutReport } from "../services/stockInOutReport.service";
 
 const r = Router();
 r.use(requireAuth);
 
 // GET /api/reports/stock-inout
-r.get("/stock-inout", async (req, res) => {
+// ✅ bảo mật: báo cáo xuất nhập tồn (có giá trị tồn) chỉ admin + kế toán — menu cũng chỉ 2 quyền này thấy
+r.get("/stock-inout", requireRole("admin", "accountant"), async (req, res) => {
   try {
     const { from, to, q, warehouseId } = req.query as any;
 

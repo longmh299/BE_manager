@@ -502,8 +502,8 @@ export async function getSalesLedger(params: {
     where,
     orderBy: { issueDate: "desc" },
     include: {
-      saleUser: true,
-      techUser: true,
+      saleUser: { select: { id: true, username: true, role: true, email: true, phone: true } },
+      techUser: { select: { id: true, username: true, role: true, email: true, phone: true } },
       lines: true,
     },
   });

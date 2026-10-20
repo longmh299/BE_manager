@@ -6,20 +6,30 @@ import {
   requireRole,
   getUser,
 } from "../middlewares/auth";
+import { hashPassword, verifyPassword } from "../lib/password"; // ✅ bảo mật: mật khẩu mã hoá bcrypt
+import { lockedSeconds, recordFail, recordSuccess, clientIp } from "../lib/loginLimiter"; // ✅ bảo mật: chặn dò mật khẩu
 
 const prisma = new PrismaClient();
 export const authRouter = Router();
 
-/** Đăng ký tài khoản mới (tùy bạn: có thể mở tạm thời, hoặc yêu cầu admin) */
+/** Tạo tài khoản mới — ✅ bảo mật: CHỈ ADMIN đang đăng nhập (trước đây ai trên mạng cũng tự tạo được tài khoản admin) */
 authRouter.post(
   "/register",
-  /*requireRole('admin'),*/ async (req, res) => {
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
     try {
       const { username, password, role } = req.body ?? {};
       if (!username || !password) {
         return res
           .status(400)
           .json({ message: "Missing username/password" });
+      }
+      if (typeof username !== "string" || typeof password !== "string") {
+        return res.status(400).json({ message: "Username / mật khẩu không hợp lệ." });
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ message: "Mật khẩu phải có ít nhất 6 ký tự." });
       }
 
       // role mặc định staff nếu không truyền
@@ -33,9 +43,9 @@ authRouter.post(
         return res.status(409).json({ message: "Username already exists" });
       }
 
-      // NOTE: hiện password đang plaintext theo schema của bạn
+      // ✅ lưu bản mã hoá, không lưu chữ thường
       const user = await prisma.user.create({
-        data: { username, password, role: userRole as any },
+        data: { username, password: await hashPassword(password), role: userRole as any },
       });
 
       return res
@@ -59,11 +69,33 @@ authRouter.post("/login", async (req, res) => {
         .json({ message: "Missing username/password" });
     }
 
+    if (typeof username !== "string" || typeof password !== "string") {
+      return res.status(400).json({ message: "Missing username/password" });
+    }
+
+    // ✅ sai quá 5 lần -> khoá 15 phút
+    const ip = clientIp(req);
+    const wait = lockedSeconds(username, ip);
+    if (wait > 0) {
+      res.setHeader("Retry-After", String(wait));
+      return res.status(429).json({ message: `Đăng nhập sai quá nhiều lần. Thử lại sau ${Math.ceil(wait / 60)} phút.` });
+    }
+
     const user = await prisma.user.findUnique({ where: { username } });
-    if (!user || user.password !== password) {
+    const check = await verifyPassword(user?.password, password);
+    if (!user || !check.ok) {
+      recordFail(username, ip);
       return res
         .status(401)
         .json({ message: "Sai tài khoản hoặc mật khẩu" });
+    }
+    recordSuccess(username, ip);
+
+    // ✅ mật khẩu cũ còn lưu chữ thường -> đổi sang bản mã hoá ngay (người dùng không phải làm gì)
+    if (check.needsUpgrade) {
+      await prisma.user
+        .update({ where: { id: user.id }, data: { password: await hashPassword(password) } })
+        .catch((e) => console.error("Upgrade password hash error:", e));
     }
 
     const token = signJwt({
@@ -146,14 +178,14 @@ authRouter.post("/change-password", requireAuth, async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Hiện tại bạn đang lưu password dạng plaintext
-    if (dbUser.password !== oldPassword) {
+    // ✅ so sánh được cả mật khẩu cũ dạng chữ thường lẫn bản mã hoá
+    if (!(await verifyPassword(dbUser.password, String(oldPassword))).ok) {
       return res
         .status(400)
         .json({ message: "Mật khẩu hiện tại không đúng." });
     }
 
-    if (newPassword.length < 6) {
+    if (typeof newPassword !== "string" || newPassword.length < 6) {
       return res
         .status(400)
         .json({ message: "Mật khẩu mới phải có ít nhất 6 ký tự." });
@@ -162,7 +194,7 @@ authRouter.post("/change-password", requireAuth, async (req, res) => {
     await prisma.user.update({
       where: { id: user.id },
       data: {
-        password: newPassword,
+        password: await hashPassword(newPassword),
       },
     });
 

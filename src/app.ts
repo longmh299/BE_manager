@@ -27,6 +27,8 @@ import paymentAccountsRoutes from './routes/paymentAccounts.routes';
 import revenueRoutes from './routes/revenue.routes';
 import receivablesReportRoute from'./routes/receivables_report.route';
 import { errorHandler } from './middlewares/errorHandler';
+import { requireAuth, requireRole } from './middlewares/auth'; // ✅ bảo mật
+import { stripSecretsMiddleware } from './middlewares/stripSecrets'; // ✅ bảo mật
 import meSalesDashboardRoutes from'./routes/me_sales_dashboard.routes';
 import auditLogsRouter from'./routes/auditLogs.routes';
 import invoiceStatusRoutes from'./routes/Invoice.Status'
@@ -73,6 +75,7 @@ app.use(
 
 // Middlewares khác
 app.use(helmet());
+app.use(stripSecretsMiddleware); // ✅ bảo mật: không API nào được trả trường mật khẩu ra ngoài
 // ✅ Dịch tài liệu gửi file lớn (PDF/ảnh base64) -> body parser riêng 32MB, gắn TRƯỚC express.json() mặc định 100KB
 app.use('/api/translate', translateRoutes);
 app.use('/api/mkt', mktRoutes); // có webhook Telegram + API máy công ty (tự kiểm tra khoá riêng)
@@ -113,7 +116,7 @@ api.use('/invoice-import', invoiceImportRoutes); // ✅ MỚI: nhập hoá đơn
 api.use('/invoice-trace', invoiceTraceRoutes); // ✅ ADD: GET /api/invoice-trace?code=&type=PURCHASE|SALES
 api.use('/imports/stocks', stockImportRoutes);
 api.use('/partners', partnersRoutes);
-app.use("/api/assistant/alerts", assistantAlertsRoute);
+app.use("/api/assistant/alerts", requireAuth, assistantAlertsRoute); // ✅ bảo mật: trước đây không cần đăng nhập
 api.use("/invoices-status", invoiceStatusRoutes);
 api.use('/customers', customersRoutes);
 
@@ -167,7 +170,8 @@ function listRoutes(router: any) {
   return rts;
 }
 
-app.get('/api/__routes', (_req, res) =>
+// ✅ bảo mật: danh sách API chỉ admin xem (trước đây ai cũng xem được -> lộ "bản đồ" hệ thống)
+app.get('/api/__routes', requireAuth, requireRole('admin'), (_req, res) =>
   res.json({ base: listRoutes(app), api: listRoutes(api) })
 );
 

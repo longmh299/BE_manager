@@ -1,11 +1,12 @@
 // src/routes/receivables_report.route.ts
 import { Router } from "express";
-import { requireAuth } from "../middlewares/auth";
+import { requireAuth, requireRole, getUser } from "../middlewares/auth";
 import { getReceivablesReport } from "../services/receivables_report.service";
 
 const router = Router();
 
 router.use(requireAuth);
+router.use(requireRole("admin", "accountant")); // ✅ bảo mật: công nợ / phải thu toàn công ty chỉ admin + kế toán (menu cũng chỉ 2 quyền này thấy)
 
 function isValidDateString(s: any) {
   if (!s) return true; // optional

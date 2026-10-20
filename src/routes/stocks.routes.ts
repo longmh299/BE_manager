@@ -1,11 +1,26 @@
 // src/routes/stocks.routes.ts
 import { Router } from "express";
-import { requireAuth } from "../middlewares/auth";
+import { requireAuth, getUser } from "../middlewares/auth";
 import { getStocks, getStockSummaryByItem } from "../services/stocks.service";
 import * as XLSX from "xlsx";
 
 const r = Router();
 r.use(requireAuth);
+
+// ✅ bảo mật: giá vốn / giá nhập / giá trị tồn CHỈ admin + kế toán thấy.
+// Trước đây giao diện chỉ ẨN cột với nhân viên, nhưng API vẫn trả về -> bấm F12 (tab Network) là thấy.
+const canSeeCost = (req: any) => ["admin", "accountant"].includes(String(getUser(req)?.role || ""));
+const COST_KEYS = ["avgCost", "stockValue", "totalValue", "price", "monthlyAvgCosts"];
+function hideCost<T>(row: T): T {
+  if (!row || typeof row !== "object") return row;
+  const o: any = { ...(row as any) };
+  for (const k of COST_KEYS) delete o[k];
+  if (o.item && typeof o.item === "object") {
+    o.item = { ...o.item };
+    for (const k of COST_KEYS) delete o.item[k];
+  }
+  return o;
+}
 
 // ✅ tránh 304 cache -> đôi khi browser báo CORS error dù BE vẫn chạy
 r.use((req, res, next) => {
@@ -32,7 +47,7 @@ r.get("/", async (req, res, next) => {
       pageSize: sizeNum,
     });
 
-    res.json({ ok: true, data: rows, total });
+    res.json({ ok: true, data: canSeeCost(req) ? rows : rows.map(hideCost), total });
   } catch (e) {
     next(e);
   }
@@ -60,7 +75,7 @@ r.get("/export", async (req, res, next) => {
       unit: s.item?.unit?.code ?? "pcs",
       location: s.location?.code ?? "",
       qty: (s.qty as any)?.toString?.() ?? "0",
-      avgCost: (s.avgCost as any)?.toString?.() ?? "0",
+      ...(canSeeCost(req) ? { avgCost: (s.avgCost as any)?.toString?.() ?? "0" } : {}),
     }));
 
     const ws = XLSX.utils.json_to_sheet(excelRows);
@@ -96,7 +111,7 @@ r.get("/summary-by-item", async (req, res, next) => {
       pageSize: sizeNum,
     });
 
-    res.json({ ok: true, data: rows, total });
+    res.json({ ok: true, data: canSeeCost(req) ? rows : rows.map(hideCost), total });
   } catch (e) {
     next(e);
   }
@@ -123,8 +138,12 @@ r.get("/summary-by-item/export", async (req, res, next) => {
       kind: r.kind ?? "",
       sellPrice: r.sellPrice == null ? "" : (r.sellPrice as any)?.toString?.() ?? "",
       totalQty: (r.totalQty as any)?.toString?.() ?? "0",
-      avgCost: r.avgCost == null ? "" : String(r.avgCost),
-      stockValue: r.stockValue == null ? "" : String(r.stockValue),
+      ...(canSeeCost(req)
+        ? {
+            avgCost: r.avgCost == null ? "" : String(r.avgCost),
+            stockValue: r.stockValue == null ? "" : String(r.stockValue),
+          }
+        : {}),
     }));
 
     const ws = XLSX.utils.json_to_sheet(exportRows);

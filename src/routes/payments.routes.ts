@@ -1,7 +1,7 @@
 
 // src/routes/payments.routes.ts
 import { Router } from "express";
-import { requireAuth } from "../middlewares/auth";
+import { requireAuth, requireRole, getUser } from "../middlewares/auth";
 import {
   createPaymentWithAllocations,
   getPaymentById,
@@ -10,6 +10,15 @@ import {
 
 const r = Router();
 r.use(requireAuth);
+
+// ✅ bảo mật: nhân viên sale chỉ xem phiếu thu / chi do mình lập hoặc gắn với hoá đơn của mình
+// (trước đây gọi /api/payments là thấy toàn bộ thu chi của công ty).
+const isStaffReq = (req: any) => String(getUser(req)?.role || "") === "staff";
+function staffCanSeePayment(p: any, userId: string) {
+  if (!p) return false;
+  if (String(p.createdById || p.createdBy?.id || "") === userId) return true;
+  return (p.allocations || []).some((a: any) => String(a?.invoice?.saleUserId || "") === userId);
+}
 
 function getUserId(req: any): string | undefined {
   return req.user?.id || req.userId;
@@ -225,6 +234,10 @@ r.get("/", async (req, res, next) => {
       from: req.query.from as string | undefined,
       to: req.query.to as string | undefined,
     });
+    if (isStaffReq(req)) {
+      const me = String(getUser(req)!.id);
+      return res.json((data as any[]).filter((p) => staffCanSeePayment(p, me)));
+    }
     res.json(data);
   } catch (err) {
     next(err);
@@ -235,6 +248,9 @@ r.get("/:id", async (req, res, next) => {
   try {
     const payment = await getPaymentById(req.params.id);
     if (!payment) {
+      return res.status(404).json({ message: "Không tìm thấy phiếu" });
+    }
+    if (isStaffReq(req) && !staffCanSeePayment(payment, String(getUser(req)!.id))) {
       return res.status(404).json({ message: "Không tìm thấy phiếu" });
     }
     res.json(payment);
