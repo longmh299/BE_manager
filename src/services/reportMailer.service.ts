@@ -344,7 +344,7 @@ function buildStockInOutWorkbook(
   headerRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   headerRow.height = 20;
   headerRow.eachCell((c) => {
-    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1E3A5F" } };
     c.border = cellBorder;
   });
 
@@ -427,7 +427,7 @@ function buildReorderWorkbook(
     headerRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
     headerRow.height = 20;
     headerRow.eachCell((c) => {
-      c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+      c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1E3A5F" } };
       c.border = cellBorder;
     });
     ws.autoFilter = "A3:E3";

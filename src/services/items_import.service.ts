@@ -23,9 +23,14 @@ function norm(s: any) {
     .replace(/[._-]/g, "");
 }
 
+/** ✅ thêm: bỏ dấu tiếng Việt để nhận cả tên cột "Mã hàng", "Tên hàng", "Giá bán"... của file xuất mới */
+function noAccent(s: string) {
+  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d");
+}
+
 function parseKind(raw: any): ItemKind {
-  const t = String(raw ?? "").trim().toUpperCase();
-  return t === "MACHINE" ? "MACHINE" : "PART";
+  const t = noAccent(String(raw ?? "").trim().toLowerCase()).toUpperCase();
+  return t === "MACHINE" || t === "MAY" ? "MACHINE" : "PART"; // ✅ nhận thêm "Máy" (file xuất mới ghi tiếng Việt)
 }
 
 /**
@@ -52,16 +57,21 @@ export async function importItemsFromBuffer(buf: Buffer) {
 
   const headers = (table[0] || []).map(norm);
 
+  const headersNA = headers.map((h: string) => noAccent(h)); // ✅ thêm: so khớp cả khi bỏ dấu
   const pickCol = (...cands: string[]) => {
     for (const c of cands) {
       const i = headers.indexOf(norm(c));
+      if (i >= 0) return i;
+    }
+    for (const c of cands) {
+      const i = headersNA.indexOf(noAccent(norm(c)));
       if (i >= 0) return i;
     }
     return -1;
   };
 
   const colSku = pickCol("sku", "skud", "code", "mahang", "mãhàng");
-  const colName = pickCol("name", "ten", "tên", "ten_goc", "tengoc");
+  const colName = pickCol("name", "ten", "tên", "ten_goc", "tengoc", "tenhang");
   const colSell = pickCol("sellprice", "sell_price", "giaban", "gia_ban", "price");
   const colNote = pickCol("note", "ghichu", "ghi_chu");
   const colKind = pickCol("kind", "loai", "loại");

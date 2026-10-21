@@ -9,6 +9,8 @@ import {
   postStockCount,
 } from "../services/stockcounts.service";
 import * as XLSX from "xlsx";
+import { buildReport, sendXlsx, exportSubtitle, stampName, KIND_VN } from "../lib/excelReport"; // ✅ khuôn Excel dùng chung
+import { getUser } from "../middlewares/auth";
 import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -256,27 +258,43 @@ r.get("/:id/export", async (req, res, next) => {
       lines = lines.filter((line) => line.item?.kind === kind);
     }
 
+    // ✅ cùng dữ liệu như trước, chỉ trình bày lại (thêm tên ĐVT — trước đây cột ĐVT luôn trống)
+    const units = await prisma.unit.findMany({ select: { id: true, name: true, code: true } }).catch(() => []);
+    const unitName = new Map(units.map((u: any) => [u.id, u.name || u.code]));
     const excelRows = lines.map((line: any) => ({
       sku: line.item?.sku ?? "",
       name: line.item?.name ?? "",
-      unit: line.item?.unit ?? "",
-      kind: line.item?.kind ?? "",
+      unit: unitName.get(line.item?.unitId) ?? "",
+      kind: KIND_VN[line.item?.kind] ?? line.item?.kind ?? "",
       bookQty: line.bookQty ?? "0",
       countedQty: line.countedQty?.toString?.() ?? "0",
       diff: line.diff ?? "0",
     }));
-
-    const ws = XLSX.utils.json_to_sheet(excelRows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "StockCount");
-    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-
-    res.setHeader("Content-Disposition", 'attachment; filename="stock_count.xlsx"');
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-    res.send(buf);
+    const d: any = detail;
+    const posted = String(d.status || "").toLowerCase() === "posted";
+    const buf = await buildReport({
+      sheetName: "Kiểm kê",
+      title: `PHIẾU KIỂM KÊ ${d.refNo ?? ""}`.trim(),
+      subtitle: exportSubtitle(
+        getUser(req),
+        d.location ? `Kho: ${d.location.name || d.location.code}` : "",
+        posted ? "Đã chốt" : "Nháp",
+        kind === "PART" ? "Chỉ phụ tùng" : kind === "MACHINE" ? "Chỉ máy" : ""
+      ),
+      columns: [
+        { header: "Mã hàng", key: "sku", width: 14 },
+        { header: "Tên hàng", key: "name", width: 46, wrap: true },
+        { header: "ĐVT", key: "unit", width: 8, type: "center" },
+        { header: "Loại", key: "kind", width: 11, type: "center" },
+        { header: "Tồn sổ sách", key: "bookQty", width: 13, type: "qty", total: true },
+        { header: "Thực đếm", key: "countedQty", width: 12, type: "qty", total: true },
+        { header: "Chênh lệch", key: "diff", width: 12, type: "qty", total: true, redIfNegative: true },
+      ],
+      rows: excelRows,
+      stt: true,
+      totals: true,
+    });
+    sendXlsx(res, buf, stampName(`kiem-ke-${d.refNo || req.params.id}`));
   } catch (e) {
     next(e);
   }

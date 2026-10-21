@@ -196,7 +196,7 @@ export async function exportLedgerExcel(params: {
   headerRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   headerRow.height = 18;
   headerRow.eachCell((c) => {
-    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1E3A5F" } };
     c.border = {
       top: { style: "thin", color: { argb: "FFCBD5E1" } },
       left: { style: "thin", color: { argb: "FFCBD5E1" } },
@@ -718,7 +718,7 @@ export async function exportSalesLedgerExcel(params: {
   headerRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   headerRow.height = 18;
   headerRow.eachCell((c) => {
-    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1E3A5F" } };
     c.border = {
       top: { style: "thin", color: { argb: "FFCBD5E1" } },
       left: { style: "thin", color: { argb: "FFCBD5E1" } },

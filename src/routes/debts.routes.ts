@@ -169,7 +169,7 @@ r.get("/by-sale/export", async (req, res, next) => {
       cell.fill = {
         type: "pattern",
         pattern: "solid",
-        fgColor: { argb: "FF2563EB" },
+        fgColor: { argb: "FF1E3A5F" },
       };
       cell.border = {
         top: { style: "thin", color: { argb: "FFCBD5F5" } },

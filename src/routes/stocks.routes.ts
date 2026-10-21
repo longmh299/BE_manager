@@ -3,6 +3,7 @@ import { Router } from "express";
 import { requireAuth, getUser } from "../middlewares/auth";
 import { getStocks, getStockSummaryByItem } from "../services/stocks.service";
 import * as XLSX from "xlsx";
+import { buildReport, sendXlsx, exportSubtitle, stampName, KIND_VN, type ReportCol } from "../lib/excelReport"; // ✅ khuôn Excel dùng chung
 
 const r = Router();
 r.use(requireAuth);
@@ -69,26 +70,40 @@ r.get("/export", async (req, res, next) => {
       pageSize: 10_000,
     });
 
+    // ✅ cùng dữ liệu như trước, chỉ trình bày lại (tên cột tiếng Việt, số định dạng, dòng tổng)
+    const cost = canSeeCost(req);
     const excelRows = rows.map((s: any) => ({
       sku: s.item?.sku ?? "",
       name: s.item?.name ?? "",
-      unit: s.item?.unit?.code ?? "pcs",
-      location: s.location?.code ?? "",
-      qty: (s.qty as any)?.toString?.() ?? "0",
-      ...(canSeeCost(req) ? { avgCost: (s.avgCost as any)?.toString?.() ?? "0" } : {}),
+      unit: s.item?.unit?.name || s.item?.unit?.code || "Cái",
+      location: s.location?.name || s.location?.code || "",
+      qty: s.qty,
+      avgCost: s.avgCost,
+      value: Number(s.qty || 0) * Number(s.avgCost || 0),
     }));
-
-    const ws = XLSX.utils.json_to_sheet(excelRows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Stocks");
-    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-
-    res.setHeader("Content-Disposition", 'attachment; filename="stocks.xlsx"');
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-    res.send(buf);
+    const cols: ReportCol[] = [
+      { header: "Mã hàng", key: "sku", width: 14 },
+      { header: "Tên hàng", key: "name", width: 46, wrap: true },
+      { header: "ĐVT", key: "unit", width: 8, type: "center" },
+      { header: "Kho", key: "location", width: 16 },
+      { header: "Tồn", key: "qty", width: 10, type: "qty", total: true, redIfZero: true },
+      ...(cost
+        ? ([
+            { header: "Giá vốn TB", key: "avgCost", width: 15, type: "money" },
+            { header: "Giá trị tồn", key: "value", width: 17, type: "money", total: true },
+          ] as ReportCol[])
+        : []),
+    ];
+    const buf = await buildReport({
+      sheetName: "Tồn kho",
+      title: "BÁO CÁO TỒN KHO THEO KHO",
+      subtitle: exportSubtitle(getUser(req), q ? `Tìm: "${q}"` : "", `${rows.length} dòng`),
+      columns: cols,
+      rows: excelRows,
+      stt: true,
+      totals: true,
+    });
+    sendXlsx(res, buf, stampName("ton-kho-theo-kho"));
   } catch (e) {
     next(e);
   }
@@ -131,35 +146,45 @@ r.get("/summary-by-item/export", async (req, res, next) => {
       pageSize: 10_000,
     });
 
+    // ✅ cùng dữ liệu như trước, chỉ trình bày lại
+    const cost = canSeeCost(req);
     const exportRows = rows.map((r: any) => ({
       sku: r.sku ?? "",
       name: r.name ?? "",
-      unit: r.unit ?? "",
-      kind: r.kind ?? "",
-      sellPrice: r.sellPrice == null ? "" : (r.sellPrice as any)?.toString?.() ?? "",
-      totalQty: (r.totalQty as any)?.toString?.() ?? "0",
-      ...(canSeeCost(req)
-        ? {
-            avgCost: r.avgCost == null ? "" : String(r.avgCost),
-            stockValue: r.stockValue == null ? "" : String(r.stockValue),
-          }
-        : {}),
+      unit: r.unitName || r.unit || "",
+      kind: KIND_VN[r.kind] ?? r.kind ?? "",
+      sellPrice: r.sellPrice,
+      totalQty: r.totalQty,
+      avgCost: r.avgCost,
+      stockValue: r.stockValue,
+      note: r.note ?? "",
     }));
-
-    const ws = XLSX.utils.json_to_sheet(exportRows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "SummaryByItem");
-    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="stocks_summary_by_item.xlsx"'
-    );
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-    res.send(buf);
+    const cols: ReportCol[] = [
+      { header: "Mã hàng", key: "sku", width: 14 },
+      { header: "Tên hàng", key: "name", width: 46, wrap: true },
+      { header: "ĐVT", key: "unit", width: 8, type: "center" },
+      { header: "Loại", key: "kind", width: 11, type: "center" },
+      { header: "Giá bán", key: "sellPrice", width: 15, type: "money" },
+      { header: "Tồn", key: "totalQty", width: 10, type: "qty", total: true, redIfZero: true },
+      ...(cost
+        ? ([
+            { header: "Giá vốn TB", key: "avgCost", width: 15, type: "money" },
+            { header: "Giá trị tồn", key: "stockValue", width: 17, type: "money", total: true },
+          ] as ReportCol[])
+        : []),
+      { header: "Ghi chú", key: "note", width: 24, wrap: true },
+    ];
+    const what = kind === "MACHINE" ? "MÁY" : kind === "PART" ? "PHỤ TÙNG" : "HÀNG HOÁ";
+    const buf = await buildReport({
+      sheetName: kind === "MACHINE" ? "Tồn máy" : kind === "PART" ? "Tồn phụ tùng" : "Tồn kho",
+      title: `BÁO CÁO TỒN KHO ${what}`,
+      subtitle: exportSubtitle(getUser(req), q ? `Tìm: "${q}"` : "", `${rows.length} mặt hàng`),
+      columns: cols,
+      rows: exportRows,
+      stt: true,
+      totals: true,
+    });
+    sendXlsx(res, buf, stampName(kind === "MACHINE" ? "ton-kho-may" : kind === "PART" ? "ton-kho-phu-tung" : "ton-kho"));
   } catch (e) {
     next(e);
   }

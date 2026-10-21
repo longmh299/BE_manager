@@ -2,6 +2,7 @@
 import { Router } from "express";
 import multer from "multer";
 import * as XLSX from "xlsx";
+import { buildReport, sendXlsx, exportSubtitle, stampName, KIND_VN } from "../lib/excelReport"; // ✅ khuôn Excel dùng chung
 import { PrismaClient, Prisma } from "@prisma/client";
 
 import { requireAuth, requireRole, getUser } from "../middlewares/auth";
@@ -162,37 +163,48 @@ r.post(
 );
 
 /** EXPORT items (xlsx) (accountant|admin) */
-r.get("/export", requireRole("accountant", "admin"), async (_req, res, next) => {
+r.get("/export", requireRole("accountant", "admin"), async (req, res, next) => {
   try {
     const items = await prisma.item.findMany({
       orderBy: { createdAt: "desc" },
       include: { unit: true },
     });
 
+    // ✅ trình bày lại nhưng VẪN NHẬP LẠI ĐƯỢC: tiêu đề cột ở dòng 1, tên cột trình nhập (/items/import) đọc được
     const data = items.map((i) => ({
       sku: i.sku,
       name: i.name,
-      unitCode: i.unit?.code ?? "",
-      unitName: i.unit?.name ?? "",
-      unitId: i.unitId,
-      price: i.price?.toString?.() ?? "0",
-      sellPrice: (i.sellPrice as any)?.toString?.() ?? "0",
+      kind: KIND_VN[(i as any).kind] ?? (i as any).kind ?? "",
+      unit: i.unit?.name || i.unit?.code || "",
+      sellPrice: i.sellPrice,
+      price: i.price,
       note: i.note ?? "",
-      kind: (i as any).kind ?? "",
-      isSerialized: (i as any).isSerialized ?? false,
+      serial: (i as any).isSerialized ? "Có" : "",
     }));
-
-    const ws = XLSX.utils.json_to_sheet(data);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Items");
-    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-
-    res.setHeader("Content-Disposition", 'attachment; filename="items.xlsx"');
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-    res.send(buf);
+    const buf = await buildReport({
+      sheetName: "Danh mục hàng",
+      columns: [
+        { header: "Mã hàng", key: "sku", width: 14 },
+        { header: "Tên hàng", key: "name", width: 48, wrap: true },
+        { header: "Loại", key: "kind", width: 11, type: "center" },
+        { header: "ĐVT", key: "unit", width: 8, type: "center" },
+        { header: "Giá bán", key: "sellPrice", width: 15, type: "money" },
+        { header: "Giá vốn (tham khảo)", key: "price", width: 15, type: "money" },
+        { header: "Ghi chú", key: "note", width: 30, wrap: true },
+        { header: "Theo serial", key: "serial", width: 10, type: "center" },
+      ],
+      rows: data,
+      notes: {
+        sheetName: "Hướng dẫn",
+        lines: [
+          ["Danh mục hàng hoá", exportSubtitle(getUser(req), `${items.length} mã hàng`)],
+          ["Nhập lại", "Sửa ở sheet \"Danh mục hàng\" rồi tải lên bằng nút Nhập Excel. GIỮ NGUYÊN tên cột ở dòng 1."],
+          ["Được cập nhật", "Mã hàng, Giá bán, Ghi chú, Loại (Máy / Phụ tùng). Hàng được nhận diện theo Tên hàng."],
+          ["Không nhập", "Giá vốn, ĐVT, Theo serial chỉ để xem — hệ thống bỏ qua các cột này khi nhập."],
+        ],
+      },
+    });
+    sendXlsx(res, buf, stampName("danh-muc-hang"));
   } catch (e) {
     next(e);
   }
